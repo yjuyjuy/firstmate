@@ -513,7 +513,7 @@ classify_rows() {
       split(cmd, a, " ")
       exe = a[1]
       b = basename(exe)
-      if (b ~ /^(claude|codex|opencode|grok)$/ || b == "pi") return "agent"
+      if (b ~ /^(claude|codex|opencode|grok|jcode)$/ || b == "pi") return "agent"
       if (cmd ~ /typescript-language-server|tsserver|\/tsgo|vtsls|rust-analyzer|gopls|pyright|pylsp|clangd|jdtls|lua-language-server|eslint_d|language-server/) return "lsp"
       if (exe ~ /^\/System\// || exe ~ /^\/usr\/libexec\// || exe ~ /^\/usr\/sbin\// || exe ~ /^\/sbin\// || exe ~ /^\/Library\/Apple\//) return "system"
       if (cmd ~ /Visual Studio Code|Code Helper|Cursor|Electron|Zed|Xcode|Sublime Text|JetBrains|Warp|iTerm/) return "editor"
