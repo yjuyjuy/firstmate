@@ -36,12 +36,28 @@
 # crewmates being unblocked at once and all starting a suite before the next
 # reading is ever taken.
 #
-# LEASE RECORDS. state/heavy-runs/q/<seq>.entry, one per participant, each with
-# seq, pid, a PID identity (start time plus command line), state=waiting or
-# state=running, started, task, label, and a truncated command string. The
-# admission lock is held only while records are read and rewritten, never while
-# a command runs. Records are written to a temp file and renamed, so an
-# unlocked --status never reads a half-written record.
+# WHY THE LEDGER IS HOST-GLOBAL, NOT PER-HOME. The machine is the resource being
+# protected, and a fleet runs several operational homes (a primary plus one or
+# more secondmate homes) on one host. A per-home queue would give each home its
+# own N slots, so the host-wide count would be N times the number of homes -
+# exactly the multiplication this cap exists to prevent. The default queue
+# therefore lives at a fixed host-global path outside any home
+# (/tmp/fm-heavy-runs-<uid>, one per operating user so a shared box cannot cross-
+# contaminate or be hijacked), and every home's runs share one running count.
+# FM_HEAVY_RUN_DIR still overrides it (a test seam, and the way to scope a queue
+# to something other than the whole host). The ceiling VALUE is read from the
+# primary home's config so the homes sharing the ledger also share one cap:
+# FM_HEAVY_SLOTS_FILE points at that authoritative config, and when it is unset
+# or unreadable the resolver falls back to this home's own config, then to 1.
+#
+# LEASE RECORDS. <queue>/<seq>.entry, one per participant, each with seq, pid, a
+# PID identity (start time plus command line), state=waiting or state=running,
+# started, the operational home that owns the run, task, label, and a truncated
+# command string. The home field is attribution only, so --status and firstmate
+# can see which home each shared-ledger run belongs to. The admission lock is
+# held only while records are read and rewritten, never while a command runs.
+# Records are written to a temp file and renamed, so an unlocked --status never
+# reads a half-written record.
 #
 # FAIRNESS AND VISIBILITY. Sequence numbers are monotonic and the lowest waiting
 # sequence is admitted first, so a queued run cannot be starved by later
@@ -57,6 +73,22 @@
 # The one process it does signal is its own child, which it forwards TERM, INT,
 # and HUP to, so a killed requester does not orphan a running suite.
 #
+# HOST-PRESSURE GUARD. Admission also reads the watcher's CACHED sustained
+# pressure verdict (state/.resource-status, the word the resource probe already
+# published on its own cadence). A free slot is NOT granted while that cached
+# verdict is a fresh `critical`, because starting new heavy work into a host that
+# is already thrashing is the second failure mode this control exists to prevent.
+# It reads the cache only and never samples afresh at acquire time, so it honours
+# the sustained-sampling rule rather than reacting to a momentary spike. It fails
+# OPEN: an absent, stale, unreadable, or non-critical verdict lets admission
+# proceed normally, so a home with no resource monitor is never wedged by it.
+#
+# RELEASE NUDGE. When a run that HELD a slot releases it and a waiter is still
+# queued, the releasing process enqueues one `check heavy-run-slot-free` wake, so
+# firstmate nudges a waiter parked on `paused: awaiting test slot` to retry.
+# Firstmate is the nudger, never the granter: the waiter still re-acquires
+# through ordinary admission, and there is no separate FIFO ticket queue.
+#
 # REFUSALS. An unusable queue directory, an unobtainable admission lock, a
 # vanished own record, or an exceeded --max-wait all refuse WITHOUT running the
 # command: proceeding unserialized is exactly the failure this exists to
@@ -67,7 +99,11 @@
 #   64  usage error
 #   69  refused: the queue could not be brought to a safe state; nothing ran
 #   75  refused: --max-wait elapsed while still queued; nothing ran
+#   76  refused: the host is under sustained critical pressure; nothing ran
 #
+# ADRs docs/adr/0001-heavy-run-refuse-by-default-admission.md and
+# docs/adr/0002-heavy-run-host-global-ledger.md record why admission refuses by
+# default and why the ledger deliberately lives outside home isolation.
 # docs/configuration.md owns the config/heavy-run-slots knob and the FM_HEAVY_*
 # environment variables; this header owns the mechanism.
 set -u
@@ -81,11 +117,23 @@ CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
 
-HEAVY_DIR="${FM_HEAVY_RUN_DIR:-$STATE/heavy-runs}"
+# The default ledger is host-global (see the header): one queue for the whole
+# machine, scoped per operating user so a shared host cannot cross-contaminate.
+# FM_HEAVY_RUN_DIR overrides it, which is also how the tests isolate.
+HEAVY_GLOBAL_DEFAULT="${TMPDIR:-/tmp}/fm-heavy-runs-$(id -u 2>/dev/null || printf '%s' 0)"
+HEAVY_DIR="${FM_HEAVY_RUN_DIR:-$HEAVY_GLOBAL_DEFAULT}"
 QUEUE="$HEAVY_DIR/q"
 LOCK="$HEAVY_DIR/admit.lock"
 SEQ_FILE="$HEAVY_DIR/seq"
+# This home's own ceiling file, and the authoritative pointer that overrides it
+# so every home sharing the host-global ledger resolves one cap (see the header).
 SLOTS_FILE="$CONFIG/heavy-run-slots"
+SLOTS_POINTER="${FM_HEAVY_SLOTS_FILE:-}"
+
+# Cached sustained host-pressure verdict the resource probe publishes, and the
+# freshness bound the heartbeat annotation already uses (2 * probe interval).
+RESOURCE_STATUS_FILE="${FM_HEAVY_RESOURCE_STATUS:-$STATE/.resource-status}"
+RESOURCE_INTERVAL_OVERRIDE="${FM_HEAVY_RESOURCE_INTERVAL:-}"
 
 POLL=${FM_HEAVY_POLL:-2}
 NOTICE_EVERY=${FM_HEAVY_NOTICE:-30}
@@ -113,6 +161,11 @@ refuse() {
   exit 69
 }
 
+refuse_pressure() {
+  log "refusing without running the command: $*"
+  exit 76
+}
+
 # One line, no tabs or newlines, bounded length: lease records are line-oriented
 # key=value and are read by --status without a lock.
 one_line() {
@@ -121,16 +174,22 @@ one_line() {
 
 # --- ceiling ----------------------------------------------------------------
 #
-# FM_HEAVY_SLOTS (operator override and test seam), then the first non-empty
-# line of config/heavy-run-slots, then 1. A malformed value falls back to 1
-# rather than to a permissive number: the failure mode of guessing high is the
-# host thrash this exists to prevent.
+# FM_HEAVY_SLOTS (operator override and test seam), then the authoritative
+# ceiling file, then 1. The authoritative file is FM_HEAVY_SLOTS_FILE (the
+# primary home's config/heavy-run-slots) when it is set and readable, so every
+# home sharing the host-global ledger resolves ONE cap; otherwise this home's own
+# config/heavy-run-slots. A malformed value falls back to 1 rather than to a
+# permissive number: the failure mode of guessing high is the host thrash this
+# exists to prevent.
 resolve_slots() {
-  local raw=
+  local raw='' source_file=$SLOTS_FILE
+  if [ -n "$SLOTS_POINTER" ] && [ -f "$SLOTS_POINTER" ] && [ -r "$SLOTS_POINTER" ]; then
+    source_file=$SLOTS_POINTER
+  fi
   if [ -n "${FM_HEAVY_SLOTS:-}" ]; then
     raw=$FM_HEAVY_SLOTS
-  elif [ -f "$SLOTS_FILE" ]; then
-    raw=$(grep -v '^[[:space:]]*$' "$SLOTS_FILE" 2>/dev/null | head -n 1 | tr -d '[:space:]')
+  elif [ -f "$source_file" ]; then
+    raw=$(grep -v '^[[:space:]]*$' "$source_file" 2>/dev/null | head -n 1 | tr -d '[:space:]')
   fi
   [ -n "$raw" ] || { printf '1\n'; return 0; }
   case "$raw" in
@@ -160,10 +219,10 @@ identity_of() {  # <pid>
   one_line "$(fm_pid_identity "$1" 2>/dev/null || true)"
 }
 
-E_SEQ=; E_PID=; E_IDENTITY=; E_STATE=; E_STARTED=; E_TASK=; E_LABEL=; E_CMD=
+E_SEQ=; E_PID=; E_IDENTITY=; E_STATE=; E_STARTED=; E_HOME=; E_TASK=; E_LABEL=; E_CMD=
 entry_read() {  # <file>: populate E_*; non-zero when the record is unusable
   local file=$1 line
-  E_SEQ=; E_PID=; E_IDENTITY=; E_STATE=; E_STARTED=; E_TASK=; E_LABEL=; E_CMD=
+  E_SEQ=; E_PID=; E_IDENTITY=; E_STATE=; E_STARTED=; E_HOME=; E_TASK=; E_LABEL=; E_CMD=
   [ -f "$file" ] || return 1
   while IFS= read -r line; do
     case "$line" in
@@ -172,6 +231,7 @@ entry_read() {  # <file>: populate E_*; non-zero when the record is unusable
       identity=*) E_IDENTITY=${line#identity=} ;;
       state=*) E_STATE=${line#state=} ;;
       started=*) E_STARTED=${line#started=} ;;
+      home=*) E_HOME=${line#home=} ;;
       task=*) E_TASK=${line#task=} ;;
       label=*) E_LABEL=${line#label=} ;;
       cmd=*) E_CMD=${line#cmd=} ;;
@@ -191,6 +251,7 @@ entry_write() {  # <file> <state>: atomic rewrite preserving this run's fields
     printf 'identity=%s\n' "$MY_IDENTITY"
     printf 'state=%s\n' "$state"
     printf 'started=%s\n' "$MY_STARTED"
+    printf 'home=%s\n' "$MY_HOME"
     printf 'task=%s\n' "$TASK"
     printf 'label=%s\n' "$LABEL"
     printf 'cmd=%s\n' "$CMD_TEXT"
@@ -278,11 +339,11 @@ cmd_status() {
     entry_read "$f" || continue
     if [ "$E_STATE" = running ]; then
       running=$(( running + 1 ))
-      run_lines+=("run  seq=$E_SEQ pid=$E_PID task=$E_TASK started=$E_STARTED label=$E_LABEL cmd=$E_CMD")
+      run_lines+=("run  seq=$E_SEQ pid=$E_PID home=$E_HOME task=$E_TASK started=$E_STARTED label=$E_LABEL cmd=$E_CMD")
     else
       waiting=$(( waiting + 1 ))
       pos=$(( pos + 1 ))
-      wait_lines+=("wait seq=$E_SEQ pid=$E_PID task=$E_TASK position=$pos queued=$E_STARTED label=$E_LABEL cmd=$E_CMD")
+      wait_lines+=("wait seq=$E_SEQ pid=$E_PID home=$E_HOME task=$E_TASK position=$pos queued=$E_STARTED label=$E_LABEL cmd=$E_CMD")
     fi
   done < <(entry_files)
   printf 'ceiling=%s\n' "$slots"
@@ -337,17 +398,75 @@ CMD_TEXT=$(one_line "$*")
 MY_PID=${BASHPID:-$$}
 MY_IDENTITY=$(identity_of "$MY_PID")
 MY_STARTED=$(date +%s)
+MY_HOME=$(one_line "$FM_HOME")
 MY_SEQ=
 MY_ENTRY=
+MY_ADMITTED=0
+
+# The freshness bound for the cached host-pressure verdict, resolved ONCE here:
+# two probe intervals, the same bound the heartbeat annotation uses. Resolving it
+# per admission pass would re-fork the resolver every poll for no gain. This is a
+# config read, not a probe, so it never samples the host afresh.
+resolve_resource_bound() {
+  local interval=$RESOURCE_INTERVAL_OVERRIDE
+  if [ -z "$interval" ]; then
+    interval=$("$SCRIPT_DIR/fm-resource-check.sh" --interval 2>/dev/null || printf '')
+  fi
+  case "$interval" in ''|*[!0-9]*) interval=900 ;; esac
+  [ "$interval" -ge 1 ] || interval=900
+  printf '%s\n' "$(( interval * 2 ))"
+}
+RESOURCE_STALE_BOUND=$(resolve_resource_bound)
+
+# True (0) only when the watcher's CACHED verdict is a FRESH `critical`. Reads
+# the published cache and never samples afresh, honouring the sustained-sampling
+# rule. Fails OPEN - absent, unreadable, stale, or non-critical all return 1 - so
+# a home with no resource monitor is never wedged by this guard.
+host_under_sustained_critical() {
+  local status age
+  [ -f "$RESOURCE_STATUS_FILE" ] && [ -r "$RESOURCE_STATUS_FILE" ] || return 1
+  status=$(cat "$RESOURCE_STATUS_FILE" 2>/dev/null || true)
+  [ "$status" = critical ] || return 1
+  [ "$RESOURCE_STALE_BOUND" -gt 0 ] || return 1
+  age=$(fm_path_age "$RESOURCE_STATUS_FILE" 2>/dev/null || printf '%s' "$RESOURCE_STALE_BOUND")
+  case "$age" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$age" -lt "$RESOURCE_STALE_BOUND" ] || return 1
+  return 0
+}
 
 # --- register ---------------------------------------------------------------
 
 ensure_queue
 
+# Emit exactly one release nudge when THIS run held a slot and a waiter is still
+# queued, so firstmate wakes a crewmate parked on `paused: awaiting test slot`.
+# Firstmate is the nudger, never the granter: the waiter re-acquires through
+# ordinary admission. Lock-free on purpose - it runs from the exit trap, where
+# re-entering the admission lock could deadlock against a lock this same process
+# still holds, and it only needs to know whether ANY waiting record exists, which
+# a lockless scan answers well enough for a best-effort nudge. A failed enqueue
+# is swallowed: a missed nudge only delays a retry the waiter's own poll already
+# covers, and must never turn a clean command exit into a failure.
+# shellcheck disable=SC2329 # Invoked indirectly by cleanup() from the traps.
+release_nudge() {
+  local f saw_waiter=0
+  [ "$MY_ADMITTED" -eq 1 ] || return 0
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    [ "$f" = "$MY_ENTRY" ] && continue
+    entry_read "$f" || continue
+    if [ "$E_STATE" = waiting ]; then saw_waiter=1; break; fi
+  done < <(entry_files)
+  [ "$saw_waiter" -eq 1 ] || return 0
+  fm_wake_append check heavy-run-slot-free \
+    "check: heavy-run slot freed, a waiter may retry" 2>/dev/null || true
+}
+
 # shellcheck disable=SC2329 # Invoked indirectly by the traps below.
 cleanup() {
   [ -n "$MY_ENTRY" ] && rm -f "$MY_ENTRY"
   lock_drop
+  release_nudge
 }
 trap cleanup EXIT
 # Until the command starts, a signalled requester should drop its own record
@@ -400,8 +519,16 @@ try_admit() {
   done < <(entry_files)
   WAIT_AHEAD=$running
   if [ "$running" -lt "$SLOTS" ] && [ "$first_waiting" = "$MY_ENTRY" ]; then
+    # DELTA 4: a slot is free and this run is the oldest waiter, but do NOT start
+    # new heavy work into a host the watcher already calls sustained-critical.
+    # This reads the published cache only (no fresh sample) and fails open.
+    if host_under_sustained_critical; then
+      lock_drop
+      refuse_pressure "host is under sustained critical pressure ($RESOURCE_STATUS_FILE); append 'paused: awaiting test slot' and retry when it recovers"
+    fi
     if entry_write "$MY_ENTRY" running; then
       admitted=0
+      MY_ADMITTED=1
     else
       lock_drop
       return 3

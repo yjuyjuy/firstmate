@@ -495,11 +495,24 @@ bin/fm-heavy-run.sh --status
 ```
 
 It prints `ceiling=`, `running=`, `waiting=`, then one line per run and per waiter in queue order.
-The runner's state lives under `state/heavy-runs/`; these are runtime records, not files to edit by hand.
+Each line also carries `home=`, the operational home that owns the run, because the ledger is shared across homes (below).
+The runner's state lives in the ledger directory; these are runtime records, not files to edit by hand.
 
-The queue is per operational home, because it lives under that home's `state/`.
-A fleet whose secondmate homes share one physical host therefore gets one queue per home, not one for the machine.
-Set the same ceiling in each home, or point every home at one queue by exporting `FM_HEAVY_RUN_DIR` to a shared directory, when the machine rather than the home is the thing being protected.
+The ledger is host-global by default, not per home.
+The machine is the resource being protected, and a fleet runs a primary home plus one or more secondmate homes on one host, so a per-home queue would give each home its own N slots and the host-wide count would be N times the number of homes - exactly the multiplication the cap exists to prevent.
+The default ledger therefore lives at a fixed path outside any home, `${TMPDIR:-/tmp}/fm-heavy-runs-<uid>`, one directory per operating user so a shared host neither cross-contaminates nor can be hijacked through a world-writable `/tmp`.
+Every home's runs share that one running count, and each record carries its owning home for attribution.
+`FM_HEAVY_RUN_DIR` still overrides the path, which is how the tests isolate and how a queue can deliberately be scoped to something other than the whole host.
+So that the homes sharing the ledger also share one ceiling, set `FM_HEAVY_SLOTS_FILE` to the authoritative `config/heavy-run-slots` (the primary home's); when it is unset or unreadable the resolver falls back to this home's own `config/heavy-run-slots`, then to `1`.
+[ADR 0002](adr/0002-heavy-run-host-global-ledger.md) records this deliberate, contained exception to home isolation, and [ADR 0001](adr/0001-heavy-run-refuse-by-default-admission.md) records why admission refuses by default through a lease wrapper.
+
+Admission also reads the host-resource monitor's cached verdict as a second gate.
+It is not coupled to the monitor's cadence: it reads only the word the resource probe already published in `state/.resource-status` and never samples the host afresh, so it honours the sustained-sampling rule rather than reacting to a momentary spike.
+A free slot is refused (exit `76`) only while that cached verdict is a fresh `critical`, because starting new heavy work into a host that is already thrashing is the second failure mode this control exists to prevent.
+It fails open: an absent, stale, unreadable, or non-critical verdict lets admission proceed normally, so a home with no resource monitor is never wedged by it.
+
+When a run that held a slot releases it and a waiter is still queued, the releasing process enqueues one `check heavy-run-slot-free` wake, so firstmate can nudge a crewmate parked on `paused: awaiting test slot` to retry.
+Firstmate is the nudger, never the granter: the waiter still re-acquires through ordinary admission, and there is no separate FIFO ticket queue.
 
 ## Watcher cadence (config/watcher-cadence)
 
@@ -689,8 +702,11 @@ FM_HOURLY_REVIEW_INTERVAL=3600   # seconds between hourly session-review passes;
 FM_HOURLY_CLEANUP_INTERVAL=3600  # seconds between hourly cleanup sweeps; same 0/malformed rules
 FM_RESOURCE_SWEEP_BUDGET=30   # seconds one sweep may spend on crew-liveness checks in total; 0 or malformed falls back to the default
 FM_RESOURCE_PROBE_TIMEOUT=5   # seconds allowed per crew-liveness check inside a sweep; 0 or malformed falls back to the default
-FM_HEAVY_SLOTS=         # heavy-run ceiling override; wins over config/heavy-run-slots, malformed or below-floor values fall back to 1 (see the heavy-run serialization section above)
-FM_HEAVY_RUN_DIR=       # alternate heavy-run queue dir, default state/heavy-runs; point several homes at one dir to cap a whole host
+FM_HEAVY_SLOTS=         # heavy-run ceiling override; wins over the authoritative and local config, malformed or below-floor values fall back to 1 (see the heavy-run serialization section above)
+FM_HEAVY_SLOTS_FILE=    # path to the authoritative heavy-run ceiling file (the primary home's config/heavy-run-slots); when set and readable it overrides this home's own config so every home sharing the host-global ledger resolves one cap, otherwise the local config is used
+FM_HEAVY_RUN_DIR=       # alternate heavy-run queue dir; the default is host-global ($TMPDIR/fm-heavy-runs-<uid>, one queue for the whole machine), and this override scopes the queue elsewhere (the tests use it to isolate)
+FM_HEAVY_RESOURCE_STATUS=   # path to the cached host-pressure verdict the admission guard reads, default state/.resource-status; a fresh `critical` verdict refuses a free slot (exit 76), absent/stale/non-critical fails open
+FM_HEAVY_RESOURCE_INTERVAL= # override for the resource-probe interval used to bound the cached verdict's freshness (2 * interval); default resolves from bin/fm-resource-check.sh --interval, then 900
 FM_HEAVY_POLL=2         # seconds between admission attempts while a heavy run is queued
 FM_HEAVY_NOTICE=30      # seconds between "still queued" notices printed by a waiting heavy run
 FM_HEAVY_LOCK_WAIT=30   # seconds a heavy run waits for the admission lock before refusing without running
