@@ -22,6 +22,10 @@ HR="$ROOT/bin/fm-heavy-run.sh"
 
 export FM_STATE_OVERRIDE="$HOME_DIR/state"
 export FM_CONFIG_OVERRIDE="$HOME_DIR/config"
+# The default ledger is now host-global (DELTA 2); pin it to this home's own dir
+# so the suite is isolated from the real /tmp ledger and $QUEUE stays accurate.
+# The one test that exercises the host-global default overrides this with env -u.
+export FM_HEAVY_RUN_DIR="$HOME_DIR/state/heavy-runs"
 # Poll fast and notice often so waiting states are observable within a test.
 export FM_HEAVY_POLL=0.2
 export FM_HEAVY_NOTICE=1
@@ -317,7 +321,158 @@ test_killed_requester_does_not_orphan_its_run() {
   pass "fm-heavy-run.sh: a terminated requester takes its run down and frees its slot"
 }
 
+# --- DELTA 2: host-global ledger and home attribution -----------------------
+
+test_default_ledger_is_host_global_not_per_home() {
+  # With FM_HEAVY_RUN_DIR unset, the queue must NOT live under this home's state,
+  # because a per-home queue multiplies slots across homes and defeats the cap.
+  local out global
+  reset_queue
+  global="$TMP_ROOT/global-ledger"
+  rm -rf "$global"
+  # Point the host-global default at a temp dir via TMPDIR, and drop the per-home
+  # override so the default path is exercised.
+  out=$(env -u FM_HEAVY_RUN_DIR -u FM_STATE_OVERRIDE FM_CONFIG_OVERRIDE="$HOME_DIR/config" \
+    TMPDIR="$global" HOME="$HOME_DIR" "$HR" --status 2>/dev/null)
+  assert_contains "$out" "ceiling=" "--status must work against the host-global default"
+  [ -d "$global/fm-heavy-runs-$(id -u)/q" ] \
+    || fail "the default ledger must live at the host-global \$TMPDIR/fm-heavy-runs-<uid>, not under a home"
+  pass "fm-heavy-run.sh: the default ledger is host-global, not per-home"
+}
+
+test_record_carries_home_attribution() {
+  local holder status
+  reset_queue
+  printf '1\n' > "$HOME_DIR/config/heavy-run-slots"
+  FM_HOME="$HOME_DIR" "$HR" --task attributed -- sleep 4 & holder=$!
+  STRAYS+=("$holder")
+  wait_status running 1 10 || fail "the holding run never showed as running"
+  status=$("$HR" --status)
+  assert_contains "$status" "home=$HOME_DIR" "--status must attribute a running record to its home"
+  assert_contains "$status" "task=attributed" "--status must still name the task"
+  kill "$holder" 2>/dev/null
+  wait "$holder" 2>/dev/null || true
+  pass "fm-heavy-run.sh: a lease record carries its owning home for attribution"
+}
+
+test_slots_pointer_overrides_local_ceiling() {
+  # FM_HEAVY_SLOTS_FILE (the authoritative/primary ceiling) must win over this
+  # home's own config, so homes sharing the host-global ledger share one cap.
+  local primary
+  reset_queue
+  primary="$TMP_ROOT/primary-heavy-run-slots"
+  printf '1\n' > "$HOME_DIR/config/heavy-run-slots"
+  printf '3\n' > "$primary"
+  [ "$(FM_HEAVY_SLOTS_FILE="$primary" "$HR" --slots 2>/dev/null)" = 3 ] \
+    || fail "the authoritative ceiling pointer must override the local config"
+  # An unreadable/missing pointer falls back to the local config, never failing.
+  [ "$(FM_HEAVY_SLOTS_FILE="$TMP_ROOT/nonexistent" "$HR" --slots 2>/dev/null)" = 1 ] \
+    || fail "a missing ceiling pointer must fall back to the local config"
+  pass "fm-heavy-run.sh: the authoritative ceiling pointer wins, and falls back safely"
+}
+
+# --- DELTA 3: release-wake nudge --------------------------------------------
+
+test_release_emits_a_nudge_when_a_waiter_is_queued() {
+  # A slot-holder that exits while a waiter is still queued must enqueue exactly
+  # one check wake, so firstmate nudges a crewmate parked on 'awaiting test slot'.
+  local queue_file holder waiter before after
+  reset_queue
+  export FM_HEAVY_RUN_DIR="$HOME_DIR/state/heavy-runs"
+  printf '1\n' > "$HOME_DIR/config/heavy-run-slots"
+  queue_file="$HOME_DIR/state/.wake-queue"
+  rm -f "$queue_file"
+  "$HR" --task nudge-holder -- sleep 2 & holder=$!
+  STRAYS+=("$holder")
+  wait_status running 1 10 || fail "the holding run never showed as running"
+  # A waiter that stays queued THROUGH the holder's exit: its record is present
+  # at the moment the holder releases, which is what triggers the nudge. It is
+  # then admitted and runs to completion.
+  "$HR" --task nudge-waiter --max-wait 20 -- true & waiter=$!
+  STRAYS+=("$waiter")
+  wait_status waiting 1 10 || fail "the waiter never showed as queued"
+  before=$(grep -c 'heavy-run-slot-free' "$queue_file" 2>/dev/null || printf '0')
+  wait "$holder" 2>/dev/null || true
+  wait "$waiter" 2>/dev/null || true
+  after=$(grep -c 'heavy-run-slot-free' "$queue_file" 2>/dev/null || printf '0')
+  [ "$after" -gt "$before" ] \
+    || fail "releasing a slot with a waiter queued must enqueue a heavy-run-slot-free check wake"
+  pass "fm-heavy-run.sh: slot release nudges a queued waiter with a check wake"
+}
+
+test_release_emits_no_nudge_with_no_waiter() {
+  # A lone run that never had a waiter must not spam the wake queue on exit.
+  local queue_file count
+  reset_queue
+  printf '1\n' > "$HOME_DIR/config/heavy-run-slots"
+  queue_file="$HOME_DIR/state/.wake-queue"
+  rm -f "$queue_file"
+  "$HR" --task lonely -- true
+  count=$(grep -c 'heavy-run-slot-free' "$queue_file" 2>/dev/null || printf '0')
+  [ "$count" -eq 0 ] \
+    || fail "a run with no waiter behind it must not enqueue a release nudge"
+  pass "fm-heavy-run.sh: no waiter means no release nudge"
+}
+
+# --- DELTA 4: cached-critical guard -----------------------------------------
+
+test_free_slot_refused_under_sustained_critical() {
+  # A free slot must NOT be granted when the watcher's cached verdict is a fresh
+  # 'critical'. The guard reads the published cache; it never samples afresh.
+  local marker rc out
+  reset_queue
+  printf '2\n' > "$HOME_DIR/config/heavy-run-slots"
+  marker="$TMP_ROOT/critical-ran"
+  printf 'critical\n' > "$HOME_DIR/state/.resource-status"
+  out=$("$HR" --task under-pressure -- touch "$marker" 2>&1); rc=$?
+  expect_code 76 "$rc" "a fresh critical verdict must refuse a free slot with its own status"
+  assert_absent "$marker" "a critical refusal must never run the command"
+  assert_contains "$out" "sustained critical pressure" "the refusal must name the pressure"
+  pass "fm-heavy-run.sh: a free slot is refused under sustained critical pressure"
+}
+
+test_pressure_guard_fails_open_when_status_absent_or_stale() {
+  # No cached verdict, or a stale one, must let admission proceed: a home with no
+  # resource monitor is never wedged by the guard.
+  local rc marker
+  reset_queue
+  printf '2\n' > "$HOME_DIR/config/heavy-run-slots"
+  rm -f "$HOME_DIR/state/.resource-status"
+  "$HR" --task no-monitor -- true; rc=$?
+  expect_code 0 "$rc" "an absent resource verdict must fail open, not refuse"
+  # A critical verdict older than the freshness bound (2 * interval) must be
+  # ignored. Force interval 1 so the bound is 2s, write critical, then age it
+  # past 2s before the run, so the guard sees it as stale and fails open.
+  marker="$TMP_ROOT/stale-critical-ran"
+  printf 'critical\n' > "$HOME_DIR/state/.resource-status"
+  sleep 3
+  FM_HEAVY_RESOURCE_INTERVAL=1 "$HR" --task stale-crit -- touch "$marker"; rc=$?
+  expect_code 0 "$rc" "a stale critical verdict must fail open, not refuse"
+  assert_present "$marker" "a stale critical verdict must let the command run"
+  pass "fm-heavy-run.sh: the pressure guard fails open on an absent or stale verdict"
+}
+
+test_symlinked_ledger_dir_is_refused() {
+  # A ledger root the operating uid does not own (here, a symlink standing in for
+  # an attacker pre-created dir on a sticky world-writable tmp) must be refused
+  # without running the command.
+  local target ledger marker rc out
+  target="$TMP_ROOT/attacker-ledger"
+  ledger="$TMP_ROOT/symlinked-ledger"
+  mkdir -p "$target"
+  rm -rf "$ledger"
+  ln -s "$target" "$ledger"
+  marker="$TMP_ROOT/symlink-ledger-ran"
+  out=$(FM_HEAVY_RUN_DIR="$ledger" "$HR" --task hijack -- touch "$marker" 2>&1); rc=$?
+  expect_code 69 "$rc" "a symlinked ledger root must be refused, not used"
+  assert_absent "$marker" "a refused ledger must never run the command"
+  assert_contains "$out" "$ledger" "the refusal must name the offending path"
+  rm -f "$ledger"
+  pass "fm-heavy-run.sh: a symlinked ledger directory is refused"
+}
+
 test_script_parses
+test_symlinked_ledger_dir_is_refused
 test_help_includes_entire_header
 test_usage_error_runs_nothing
 test_passes_through_output_and_status
@@ -331,3 +486,10 @@ test_dead_holder_does_not_wedge_the_queue
 test_reap_removes_the_record_but_never_the_process
 test_killed_waiter_does_not_wedge_the_queue
 test_killed_requester_does_not_orphan_its_run
+test_default_ledger_is_host_global_not_per_home
+test_record_carries_home_attribution
+test_slots_pointer_overrides_local_ceiling
+test_release_emits_a_nudge_when_a_waiter_is_queued
+test_release_emits_no_nudge_with_no_waiter
+test_free_slot_refused_under_sustained_critical
+test_pressure_guard_fails_open_when_status_absent_or_stale
