@@ -24,7 +24,7 @@ set -u
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 AGENTS="$ROOT/AGENTS.md"
-AGENTS_BYTES_FLOOR=66200
+AGENTS_BYTES_FLOOR=66350
 
 test_five_prime_directives_survive_verbatim() {
   local contents
