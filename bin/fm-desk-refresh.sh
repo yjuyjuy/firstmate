@@ -103,9 +103,14 @@
 # plus a reading note. An account with no windows (unavailable or needs sign-in)
 # renders a dash in its runway cell, never a confident zero. The sticky KPI strip
 # carries the lowest runway across all accounts as its headline. The per-pane
-# attribution half - which worker pane runs on which account and its throttle
-# flags - is a labeled gap pending the visibility layer (PR3), by design and
-# never silently missing.
+# attribution half - which worker pane runs on which account, its runway at last
+# reading, and its throttle flags - is a real table composed UNDER the per-account
+# table, read from each live pane's state/<id>.telemetry (the shared per-task
+# artifact bin/fm-telemetry-lib.sh writes and this desk only consumes). It is
+# plain key=value, the SAME shape as .meta, so it is read with the same parser and
+# never as JSON; every key is optional and an absent key renders a gap dash, never
+# a confident zero. render_pane_telemetry near its own source loads owns that half
+# in full; this line points there, it does not restate the mechanics.
 #
 # LANGUAGE. The page is captain-facing, so AGENTS.md section 9 applies in full.
 # Free text lifted from fleet records is passed through desk_plain(), which
@@ -183,6 +188,8 @@
 # producer's own seam) and FM_DESK_TRANSCRIPT_READ bounds how many feed lines
 # are read. FM_DESK_QUOTA_BIN overrides the quota-axi command the accounts panel
 # reads, so a test can drive that panel through an absent tool or a fixture.
+# FM_DESK_TELEMETRY_MAX_AGE overrides the per-pane telemetry staleness bound (in
+# seconds) so a test can drive a record across the fresh/stale boundary.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -211,9 +218,11 @@ case "$DESK_TIMEOUT" in ''|*[!0-9]*) DESK_TIMEOUT=120 ;; esac
 DESK_MAX_DECISIONS=${FM_DESK_MAX_DECISIONS:-12}
 
 # The header comment IS the help text: from the description line down to the
-# last comment line before the first executable line.
+# last comment line before the first executable line. The stop point is found
+# dynamically (the `set -u` that opens the body) so the header can grow without
+# a hand-maintained line number drifting out of date.
 usage() {
-  sed -n '2,176p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  awk 'NR>=2 { if ($0 ~ /^set -u/) exit; sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]}"
 }
 
 # --- internal-vocabulary translation ----------------------------------------
@@ -1405,6 +1414,201 @@ desk_iso_time() {  # <iso8601>
   printf '%s' "$iso" | sed -n -E 's/^[0-9]{4}-([0-9]{2})-([0-9]{2})[T ]([0-9]{2}:[0-9]{2}).*/\1-\2 \3/p'
 }
 
+# desk_bar_class: the DaisyUI progress tone for a 0-100 runway percent. A
+# non-numeric value is treated as the worst case so it can never read as full.
+# ONE owner for the runway threshold, shared by the per-account table and the
+# per-pane telemetry table so the two colorings never drift apart.
+desk_bar_class() {  # <pct>
+  case "$1" in
+    ''|*[!0-9]*) printf 'progress-error' ;;
+    *)
+      if [ "$1" -ge 50 ]; then printf 'progress-success'
+      elif [ "$1" -ge 20 ]; then printf 'progress-warning'
+      else printf 'progress-error'; fi
+      ;;
+  esac
+}
+
+# --- per-pane telemetry: the CONSUMER half of the accounts panel (PR3) --------
+# One row per LIVE worker pane, read from that pane's state/<id>.telemetry - the
+# shared per-task artifact the visibility layer PRODUCES (bin/fm-telemetry-lib.sh)
+# and this desk only CONSUMES. That file is plain key=value, the SAME shape as
+# state/<id>.meta, so it is read with the same grep/tail/cut parser fm_meta_get
+# uses, NOT as JSON. The design report sketched a JSON telemetry shape, but the
+# producer that actually shipped writes key=value; the seam contract (the design's
+# section 4) is that the consumer matches the producer, so this reads the real
+# landed format. Keys consumed, all OPTIONAL: account, quota_pct, quota_window,
+# quota_reset_ts, count_429, last_429_ts, composer_stuck, and read_ts for
+# freshness. An absent key renders a gap dash, NEVER a confident zero. A live
+# pane whose telemetry file is absent or carries no parseable key renders a gap
+# row (no reading), never a fake-current line. NO live pane at all is a confident
+# empty. The desk NEVER writes a telemetry file - it is strictly read-only over
+# this input, so a build leaves every telemetry file byte-unchanged.
+#
+# Freshness: read_ts drives the record age when the producer writes it (an epoch
+# or an ISO-8601 stamp); when read_ts is absent the file mtime is the fallback. A
+# record older than TELEMETRY_MAX_AGE is marked stale, so an out-of-date pane
+# reading is flagged rather than shown as current. FM_DESK_TELEMETRY_MAX_AGE
+# overrides the bound (default 1800s, matching the desk's watcher-beat bound).
+TELEMETRY_MAX_AGE=${FM_DESK_TELEMETRY_MAX_AGE:-1800}
+case "$TELEMETRY_MAX_AGE" in ''|*[!0-9]*) TELEMETRY_MAX_AGE=1800 ;; esac
+
+# desk_tel_get: the LAST value of key= in a telemetry file, or empty when the
+# file or key is absent. Mirrors fm_meta_get (bin/fm-backend.sh) exactly, because
+# key=value is the producer's format; no JSON parser is introduced.
+desk_tel_get() {  # <telemetry-file> <key>
+  local file=$1 key=$2
+  [ -f "$file" ] || return 0
+  grep "^$key=" "$file" 2>/dev/null | tail -1 | cut -d= -f2- || true
+}
+
+# desk_tel_age: a telemetry record's age in whole seconds, preferring a read_ts
+# key (an epoch, or an ISO-8601 stamp converted on either platform) and falling
+# back to the file mtime. Prints nothing when neither resolves, so the caller
+# shows a dash rather than a fabricated age.
+desk_tel_age() {  # <telemetry-file>
+  local file=$1 rt ts mt age
+  [ -f "$file" ] || return 0
+  rt=$(desk_tel_get "$file" read_ts)
+  ts=""
+  case "$rt" in
+    '') ;;
+    *[!0-9]*)
+      ts=$(date -d "$rt" +%s 2>/dev/null \
+        || date -j -f '%Y-%m-%dT%H:%M:%S' "${rt%Z}" +%s 2>/dev/null || printf '')
+      ;;
+    *) ts=$rt ;;
+  esac
+  if [ -z "$ts" ]; then
+    mt=$(date -r "$file" +%s 2>/dev/null || printf '')
+    ts=$mt
+  fi
+  case "$ts" in ''|*[!0-9]*) return 0 ;; esac
+  age=$(( NOW_EPOCH - ts ))
+  [ "$age" -lt 0 ] && age=0
+  printf '%s' "$age"
+}
+
+# render_pane_telemetry: the per-pane attribution table, composed UNDER the
+# per-account table inside the SAME sec-accounts section (never a duplicate of
+# the per-account view). The row set is the live panes from the single fleet
+# projection every other panel reads, so no new fleet read is added; each row's
+# columns come from that pane's own state/<id>.telemetry file read.
+render_pane_telemetry() {
+  local rows st
+  rows=$(desk_json '[.in_flight[] | select(.state != "done")][] | [.id, (.state|z)] | @tsv'); st=$?
+  echo '    <h3 class="text-sm font-medium opacity-70 mt-6 mb-2">Per-pane attribution</h3>'
+  echo '    <p class="text-xs opacity-60 mb-3">Which worker pane runs on which account, its runway at last reading, and its throttle flags. Read from each pane own telemetry record; a pane with no reading shows a gap, never a zero.</p>'
+  if [ "$st" -ne 0 ]; then
+    desk_section_gap "The list of worker panes could not be read, so per-pane attribution is unknown right now."
+    return 0
+  fi
+  if [ -z "$rows" ]; then
+    echo '    <p class="text-sm opacity-60">No worker panes are running right now.</p>'
+    return 0
+  fi
+  echo '    <div class="overflow-x-auto">'
+  echo '      <table class="table table-sm">'
+  echo '        <thead><tr class="text-xs uppercase tracking-wide opacity-60">'
+  echo '          <th class="w-48">Pane</th><th class="w-28">Account</th><th class="w-48">Runway</th><th class="w-32">Throttling</th><th class="w-24">Composer</th><th class="w-28">Reading</th>'
+  echo '        </tr></thead>'
+  echo '        <tbody>'
+  printf '%s\n' "$rows" | while IFS=$'\t' read -r id state; do
+    [ -n "$id" ] || continue
+    : "$state"
+    local tel has_any account pct c429 last429 stuck age
+    local acct_cell run_cell throttle_cell composer_cell read_cell
+    tel="$STATE/$id.telemetry"
+    # A gap row: the telemetry file is absent OR carries no parseable key= line
+    # (an unparseable record). Either way every data cell is a dash and the
+    # reading cell is a visible "no reading" gap, never a confident zero.
+    has_any=0
+    if [ -f "$tel" ] && grep -qE '^[A-Za-z0-9_]+=' "$tel" 2>/dev/null; then
+      has_any=1
+    fi
+    if [ "$has_any" -eq 0 ]; then
+      cat <<HTML
+          <tr>
+            <td class="font-medium align-top">$(desk_title "$id")</td>
+            <td class="align-top"><span class="opacity-50">-</span></td>
+            <td class="align-top"><span class="opacity-50">-</span></td>
+            <td class="align-top"><span class="opacity-50">-</span></td>
+            <td class="align-top"><span class="opacity-50">-</span></td>
+            <td class="align-top"><span class="badge badge-warning badge-xs">no reading</span></td>
+          </tr>
+HTML
+      continue
+    fi
+    account=$(desk_tel_get "$tel" account)
+    pct=$(desk_tel_get "$tel" quota_pct)
+    c429=$(desk_tel_get "$tel" count_429)
+    last429=$(desk_tel_get "$tel" last_429_ts)
+    stuck=$(desk_tel_get "$tel" composer_stuck)
+    age=$(desk_tel_age "$tel")
+    # Account: a stable human label, or a dash when unknown.
+    if [ -n "$account" ]; then
+      acct_cell=$(desk_text "$account")
+    else
+      acct_cell='<span class="opacity-50">-</span>'
+    fi
+    # Runway: a bar ONLY for a numeric reading; absent stays a dash, never a
+    # zero-value bar (the confident-zero failure mode this panel exists to avoid).
+    case "$pct" in
+      ''|*[!0-9]*) run_cell='<span class="opacity-50">-</span>' ;;
+      *) run_cell="<div class=\"flex items-center gap-2\"><progress class=\"progress $(desk_bar_class "$pct") w-24\" value=\"${pct}\" max=\"100\"></progress><span class=\"text-sm\">${pct}% left</span></div>" ;;
+    esac
+    # Throttling: a 429 count over zero is the signal; an epoch last_429_ts adds
+    # a clock. No 429s recorded is a muted dash, not an alarm.
+    case "$c429" in
+      ''|*[!0-9]*) throttle_cell='<span class="opacity-50">-</span>' ;;
+      0) throttle_cell='<span class="opacity-50">-</span>' ;;
+      *)
+        local clk=''
+        case "$last429" in
+          ''|*[!0-9]*) : ;;
+          *) clk=$(date -d "@$last429" '+%H:%M' 2>/dev/null || date -r "$last429" '+%H:%M' 2>/dev/null || printf '') ;;
+        esac
+        if [ -n "$clk" ]; then
+          throttle_cell="<span class=\"badge badge-warning badge-sm\">${c429} &times; (last ${clk})</span>"
+        else
+          throttle_cell="<span class=\"badge badge-warning badge-sm\">${c429} &times;</span>"
+        fi
+        ;;
+    esac
+    # Composer-stuck: forward-compatible with the not-yet-built producer. true is
+    # a warning, false is a muted ok, anything else (including absent) is a dash.
+    case "$stuck" in
+      true|True|TRUE|1) composer_cell='<span class="badge badge-warning badge-sm">stuck</span>' ;;
+      false|False|FALSE|0) composer_cell='<span class="opacity-60 text-sm">ok</span>' ;;
+      *) composer_cell='<span class="opacity-50">-</span>' ;;
+    esac
+    # Reading freshness: a record older than the bound is marked stale so it is
+    # never mistaken for current; a fresh record shows its age; no age is a dash.
+    if [ -n "$age" ]; then
+      if [ "$age" -gt "$TELEMETRY_MAX_AGE" ]; then
+        read_cell="<span class=\"badge badge-warning badge-xs\">stale (${age}s ago)</span>"
+      else
+        read_cell="<span class=\"opacity-60\">${age}s ago</span>"
+      fi
+    else
+      read_cell='<span class="opacity-50">-</span>'
+    fi
+    cat <<HTML
+          <tr>
+            <td class="font-medium align-top">$(desk_title "$id")</td>
+            <td class="align-top text-sm">${acct_cell}</td>
+            <td class="align-top">${run_cell}</td>
+            <td class="align-top">${throttle_cell}</td>
+            <td class="align-top">${composer_cell}</td>
+            <td class="align-top">${read_cell}</td>
+          </tr>
+HTML
+  done
+  echo '        </tbody>'
+  echo '      </table>'
+  echo '    </div>'
+}
+
 render_accounts() {
   local rows st runway win projected reset status label bar_cls
   echo '  <section id="sec-accounts" class="mb-10">'
@@ -1438,16 +1642,7 @@ render_accounts() {
       printf '%s\n' "$rows" | while IFS=$'\t' read -r label runway win reset projected status; do
         [ -n "$label" ] || continue
         if [ -n "$runway" ] && [ "$runway" != "-" ]; then
-          case "$runway" in
-            ''|*[!0-9]*) bar_cls='progress-error' ;;
-            *) if [ "$runway" -ge 50 ]; then
-                 bar_cls='progress-success'
-               elif [ "$runway" -ge 20 ]; then
-                 bar_cls='progress-warning'
-               else
-                 bar_cls='progress-error'
-               fi ;;
-          esac
+          bar_cls=$(desk_bar_class "$runway")
           runway="<div class=\"flex items-center gap-2\"><progress class=\"progress ${bar_cls} w-24\" value=\"${runway}\" max=\"100\"></progress><span class=\"text-sm font-medium\">${runway}% left</span></div>"
         else
           runway='<span class="opacity-50">-</span>'
@@ -1484,9 +1679,10 @@ HTML
       echo '    </div>'
     fi
   fi
-  # The per-pane attribution half is a deliberate labeled gap, never silent: the
-  # visibility layer produces that artifact and this panel only consumes it.
-  printf '%s\n' '    <p class="text-xs opacity-70 mt-3">Per-pane attribution - which worker pane runs on which account, with its throttle flags - is pending the visibility layer, so it does not appear here yet.</p>'
+  # The per-pane attribution half (PR3): now a real table read from each live
+  # pane's state/<id>.telemetry, composed UNDER the per-account table rather than
+  # duplicating it. render_pane_telemetry owns that half and fails closed.
+  render_pane_telemetry
   echo '  </section>'
 }
 
