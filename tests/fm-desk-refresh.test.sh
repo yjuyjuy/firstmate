@@ -251,6 +251,29 @@ SH
   else
     quotabin=$(make_quota "$home")
   fi
+  # Per-pane telemetry fixtures (PR3). FAKE_TELEMETRY, when set, is a set of
+  # records separated by ';;', each "id|key=value,key=value,...". The record is
+  # written to $home/state/<id>.telemetry as key=value lines - the SAME shape the
+  # producer (bin/fm-telemetry-lib.sh) writes, so the desk reads the real format.
+  # A record "id|@unparseable" writes a file with a line carrying no key= so the
+  # unparseable-record path is exercised; a live pane with NO record here leaves
+  # the file absent (the absent-telemetry gap path). The desk resolves STATE as
+  # $home/state, so the fixtures land exactly where the builder reads them.
+  if [ -n "${FAKE_TELEMETRY:-}" ]; then
+    mkdir -p "$home/state"
+    local rec rid rbody
+    printf '%s\n' "$FAKE_TELEMETRY" | tr ';;' '\n' | while IFS= read -r rec; do
+      [ -n "$rec" ] || continue
+      rid="${rec%%|*}"
+      rbody="${rec#*|}"
+      [ -n "$rid" ] || continue
+      if [ "$rbody" = "@unparseable" ]; then
+        printf 'this line has no key equals sign\n' > "$home/state/$rid.telemetry"
+      else
+        printf '%s\n' "$rbody" | tr ',' '\n' > "$home/state/$rid.telemetry"
+      fi
+    done
+  fi
   PATH="$fakebin:$PATH" \
   FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
   FM_DESK_SNAPSHOT_BIN="$SNAP" SEEN_HOME="$home/seen-home" \
@@ -259,6 +282,7 @@ SH
   FM_DESK_NOW_EPOCH="${FAKE_EPOCH:-1785225600}" \
   FM_DESK_OUT="$out" FM_DESK_NOW='2026-07-28 09:00' \
   FM_DESK_QUOTA_BIN="$quotabin" \
+  FM_DESK_TELEMETRY_MAX_AGE="${FAKE_TELEMETRY_MAX_AGE:-}" \
   FAKE_QUOTA_MODE="${FAKE_QUOTA_MODE:-json}" FAKE_QUOTA_JSON="${FAKE_QUOTA_JSON:-$QUOTA_FIXTURE}" \
     bash "$DESK"
 }
@@ -552,9 +576,12 @@ assert_grep 'lowest runway:' "$OUT11" 'accounts: the sticky strip carries a runw
 assert_grep 'Claude 30%' "$OUT11" 'accounts: the headline names the lowest-runway account'
 # The sticky nav carries the jump link to the new panel.
 assert_grep 'href="#sec-accounts"' "$OUT11" 'accounts: sticky-nav jump link present'
-# The per-pane attribution half is a labeled gap pending the visibility layer,
-# never silently missing.
-assert_grep 'pending the visibility layer' "$OUT11" 'accounts: the per-pane half is a labeled gap, not silently absent'
+# The per-pane attribution half is now a real table (PR3), composed under the
+# per-account table. With live panes but NO telemetry files here, every pane is a
+# visible "no reading" gap row - never a confident zero, never silently missing.
+assert_grep 'Per-pane attribution' "$OUT11" 'accounts: the per-pane table renders'
+assert_no_grep 'pending the visibility layer' "$OUT11" 'accounts: the old pending-gap placeholder is gone'
+assert_grep 'badge badge-warning badge-xs">no reading' "$OUT11" 'accounts: a live pane with no telemetry is a visible gap row'
 # The numbered spine stays stable: no existing section heading is renumbered.
 assert_grep '1. Decisions needed' "$OUT11" 'accounts: section 1 number unchanged'
 assert_grep '4. Slots and host' "$OUT11" 'accounts: section 4 number unchanged'
@@ -573,7 +600,9 @@ assert_no_grep 'value="0" max="100"' "$OUT12" 'quota-absent: no zero runway bar 
 assert_no_grep '% left' "$OUT12" 'quota-absent: no runway percent at all when the tool is absent'
 assert_grep 'lowest runway:' "$OUT12" 'quota-absent: the sticky headline is still present'
 assert_grep '<strong class="opacity-60">unknown</strong>' "$OUT12" 'quota-absent: the headline is unknown, never a zero'
-assert_grep 'pending the visibility layer' "$OUT12" 'quota-absent: the per-pane labeled gap still renders'
+# The per-pane table is INDEPENDENT of quota-axi (it reads state/<id>.telemetry),
+# so it still renders even when the per-account tool is absent.
+assert_grep 'Per-pane attribution' "$OUT12" 'quota-absent: the per-pane table is independent of quota-axi'
 
 # --- accounts/quota panel: UNPARSEABLE output also degrades to a gap, not a
 #     confident empty ----------------------------------------------------------
@@ -621,5 +650,118 @@ FAKE_MODE=json FAKE_JSON="$NO_CALLS" run_desk "$HOME16" "$OUT16"
 assert_grep 'id="sec-captains-call"' "$OUT16" 'captains-call-empty: the panel renders'
 assert_grep 'Nothing needs your action right now' "$OUT16" 'captains-call-empty: an empty call list is a confident empty'
 assert_no_grep 'could not be read' "$OUT16" 'captains-call-empty: no gap for a genuine empty call list'
+
+# --- per-pane telemetry (PR3): a POPULATED telemetry record renders a per-pane
+#     row with account, runway bar, 429 flag, and a fresh reading -------------
+# The three POPULATED in-flight panes are ship-one, ship-two, ship-stuck. Give
+# ship-one a full fresh record (account + 72% runway + no 429s), ship-two a
+# throttled record (account + 3 x 429 + a composer-stuck flag + low runway), and
+# leave ship-stuck with NO telemetry file so its row is a "no reading" gap. The
+# read_ts on both records is the injected epoch so they read as fresh.
+HOME17="$TMP_ROOT/home17"; mkdir -p "$HOME17"
+SNAP=$(make_snapshot "$HOME17")
+OUT17="$HOME17/desk.html"
+NOWTS=1785225600
+TEL17="ship-one|account=team-blue,quota_pct=72,read_ts=${NOWTS};;ship-two|account=team-red,quota_pct=8,count_429=3,last_429_ts=${NOWTS},composer_stuck=true,read_ts=${NOWTS}"
+FAKE_MODE=json FAKE_JSON="$POPULATED" FAKE_EPOCH="$NOWTS" FAKE_TELEMETRY="$TEL17" run_desk "$HOME17" "$OUT17"
+
+assert_grep 'Per-pane attribution' "$OUT17" 'telemetry: the per-pane table renders'
+assert_grep 'team-blue' "$OUT17" 'telemetry: a fresh record account label reaches the row'
+assert_grep 'team-red' "$OUT17" 'telemetry: the second record account label reaches the row'
+assert_grep '72% left' "$OUT17" 'telemetry: a numeric runway renders a percent'
+assert_grep '8% left' "$OUT17" 'telemetry: the low runway renders too'
+# ship-two carries 3 x 429 and a composer-stuck flag; both surface.
+assert_grep '3 &times;' "$OUT17" 'telemetry: a 429 count over zero is flagged'
+assert_grep 'stuck' "$OUT17" 'telemetry: the composer-stuck flag surfaces'
+# A fresh record is NOT marked stale.
+assert_no_grep 'stale (' "$OUT17" 'telemetry: a fresh record is not marked stale'
+# ship-stuck has NO telemetry file, so its row is a visible no-reading gap.
+assert_grep 'badge badge-warning badge-xs">no reading' "$OUT17" 'telemetry: a pane with no telemetry file is a visible gap row'
+# No confident-zero runway bar anywhere.
+assert_no_grep 'value="0" max="100"' "$OUT17" 'telemetry: no confident-zero runway bar renders'
+
+# --- per-pane telemetry: an ABSENT telemetry file for every live pane is a GAP
+#     row per pane, never a confident zero and never silently missing ---------
+HOME18="$TMP_ROOT/home18"; mkdir -p "$HOME18"
+SNAP=$(make_snapshot "$HOME18")
+OUT18="$HOME18/desk.html"
+FAKE_MODE=json FAKE_JSON="$POPULATED" run_desk "$HOME18" "$OUT18"
+assert_grep 'Per-pane attribution' "$OUT18" 'telemetry-absent: the table still renders'
+assert_grep 'badge badge-warning badge-xs">no reading' "$OUT18" 'telemetry-absent: every pane with no file is a visible gap row'
+assert_no_grep 'value="0" max="100"' "$OUT18" 'telemetry-absent: no confident-zero runway bar when no telemetry exists'
+assert_no_grep 'No worker panes are running' "$OUT18" 'telemetry-absent: live panes are not a confident empty'
+
+# --- per-pane telemetry: an UNPARSEABLE record (a file with no key= line) is a
+#     gap row, not a confident zero -------------------------------------------
+HOME19="$TMP_ROOT/home19"; mkdir -p "$HOME19"
+SNAP=$(make_snapshot "$HOME19")
+OUT19="$HOME19/desk.html"
+FAKE_MODE=json FAKE_JSON="$POPULATED" FAKE_TELEMETRY="ship-one|@unparseable" run_desk "$HOME19" "$OUT19"
+assert_grep 'Per-pane attribution' "$OUT19" 'telemetry-unparseable: the table still renders'
+assert_grep 'badge badge-warning badge-xs">no reading' "$OUT19" 'telemetry-unparseable: an unparseable record is a visible gap row'
+assert_no_grep 'value="0" max="100"' "$OUT19" 'telemetry-unparseable: no confident-zero runway bar from an unparseable record'
+
+# --- per-pane telemetry: NO live pane at all is a CONFIDENT empty, not a gap --
+NO_INFLIGHT=$(printf '%s' "$POPULATED" | jq -c '.in_flight = []')
+HOME20="$TMP_ROOT/home20"; mkdir -p "$HOME20"
+SNAP=$(make_snapshot "$HOME20")
+OUT20="$HOME20/desk.html"
+FAKE_MODE=json FAKE_JSON="$NO_INFLIGHT" run_desk "$HOME20" "$OUT20"
+assert_grep 'Per-pane attribution' "$OUT20" 'telemetry-nopanes: the table heading still renders'
+assert_grep 'No worker panes are running' "$OUT20" 'telemetry-nopanes: no live pane is a confident empty'
+assert_no_grep 'badge badge-warning badge-xs">no reading' "$OUT20" 'telemetry-nopanes: a confident empty is not a gap row'
+
+# --- per-pane telemetry: a STALE read_ts is MARKED stale, never shown current -
+# The record's read_ts is 2 hours before the injected now; the default staleness
+# bound is 1800s, so the row must be flagged stale.
+HOME21="$TMP_ROOT/home21"; mkdir -p "$HOME21"
+SNAP=$(make_snapshot "$HOME21")
+OUT21="$HOME21/desk.html"
+STALE_TS=$(( 1785225600 - 7200 ))
+FAKE_MODE=json FAKE_JSON="$POPULATED" FAKE_EPOCH=1785225600 \
+  FAKE_TELEMETRY="ship-one|account=team-blue,quota_pct=50,read_ts=${STALE_TS}" \
+  run_desk "$HOME21" "$OUT21"
+assert_grep 'stale (' "$OUT21" 'telemetry-stale: an out-of-date read_ts is marked stale'
+assert_grep 'team-blue' "$OUT21" 'telemetry-stale: the stale record still shows its data'
+
+# --- per-pane telemetry: a widened staleness bound makes the SAME record fresh
+#     (the seam is honored) -----------------------------------------------------
+HOME22="$TMP_ROOT/home22"; mkdir -p "$HOME22"
+SNAP=$(make_snapshot "$HOME22")
+OUT22="$HOME22/desk.html"
+FAKE_MODE=json FAKE_JSON="$POPULATED" FAKE_EPOCH=1785225600 FAKE_TELEMETRY_MAX_AGE=99999 \
+  FAKE_TELEMETRY="ship-one|account=team-blue,quota_pct=50,read_ts=${STALE_TS}" \
+  run_desk "$HOME22" "$OUT22"
+assert_no_grep 'stale (' "$OUT22" 'telemetry-freshbound: a widened bound reads the same record as fresh'
+
+# --- read-only invariant: building the desk must NOT mutate a telemetry file --
+# The desk is a strict consumer of state/<id>.telemetry; a build leaves the
+# fixture byte-unchanged.
+HOME23="$TMP_ROOT/home23"; mkdir -p "$HOME23"
+SNAP=$(make_snapshot "$HOME23")
+OUT23="$HOME23/desk.html"
+FAKE_MODE=json FAKE_JSON="$POPULATED" FAKE_EPOCH=1785225600 \
+  FAKE_TELEMETRY="ship-one|account=team-blue,quota_pct=72,read_ts=1785225600" \
+  run_desk "$HOME23" "$OUT23"
+tel_before=$(md5sum "$HOME23/state/ship-one.telemetry" | awk '{print $1}')
+FAKE_MODE=json FAKE_JSON="$POPULATED" FAKE_EPOCH=1785225600 \
+  FAKE_TELEMETRY="ship-one|account=team-blue,quota_pct=72,read_ts=1785225600" \
+  run_desk "$HOME23" "$OUT23"
+tel_after=$(md5sum "$HOME23/state/ship-one.telemetry" | awk '{print $1}')
+if [ "$tel_before" = "$tel_after" ]; then
+  pass 'read-only: the telemetry fixture is byte-unchanged after a build'
+else
+  fail 'read-only: the desk mutated a telemetry file'
+fi
+
+# --- spine stable: the per-pane table lives INSIDE sec-accounts and adds NO new
+#     numbered section, so the twelve-section spine is unchanged ---------------
+for n in \
+  '1. Decisions needed' '2. Blockers and failures' '3. Ready to merge' \
+  '4. Slots and host' '5. Progress - last 3 hours' '6. Progress - last 12 hours' \
+  '7. Most important upcoming progress' '8. Captain-held tickets' \
+  '9. Next queue tickets' '10. Stats' '11. Recent questions' '12. Recent conversation'; do
+  assert_grep "$n" "$OUT17" "spine stable with the per-pane table: $n"
+done
 
 echo "all fm-desk-refresh tests passed"
