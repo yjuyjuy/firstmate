@@ -74,6 +74,22 @@ or hand-edits the file.
   That fallback is reported with its own wording, `branch gone from origin, merge
   unverified`, so it never reads as a confirmed merge.
 
+### Bitbucket merge watch
+
+Product repositories on Bitbucket are now merged by the captain from real pull requests, and
+the queue only records the released branch.
+`bin/fm-merge-queue-poll.sh` is the registered custom check that closes the loop: it polls
+Bitbucket for each queued branch's pull request state and wakes firstmate when a pull request
+is `MERGED` or `DECLINED` (or left `SUPERSEDED` with no open replacement).
+A merged wake is the trigger to run the sweep, which clears the entry through the ordinary
+content-in-base check above.
+A declined or superseded entry is not cleared by the sweep (the branch may still exist on
+origin), so it keeps waking firstmate until firstmate resolves it with the captain: remove
+the entry, or delete the branch so the sweep's branch-gone check clears it.
+Arm the watch once per home with `bin/fm-merge-queue-poll.sh arm <id>`, which writes the
+registered shim and binds it with `bin/fm-check-register.sh`; `disarm <id>` removes it.
+The full contract and live verification record are in `docs/bitbucket-merge-watch.md`.
+
 ### Write safety
 
 Recording and removal take a queue-file mutex from `bin/fm-mutex-lib.sh`, a leaf lib
