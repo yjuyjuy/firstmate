@@ -23,6 +23,11 @@ jobs:
       # Single owner of the lint definition (file set + config + version). Do not
       # re-spell the shellcheck command here; keep CI and the pre-push gate on it.
       - run: bin/fm-lint.sh
+      # Exec-bit guard: bin scripts that lose +x lint clean but fail silently at
+      # spawn time. Single owner: bin/fm-check-exec-bits.sh. Separate step so the
+      # lint owner stays purely ShellCheck and the mode rule has its own owner.
+      - name: Exec bits on bin scripts
+        run: bin/fm-check-exec-bits.sh
 
   # Deterministic proof that portable parallel shards + portable serial + Herdr
   # equal the complete tests/*.test.sh inventory with no missing or duplicates.

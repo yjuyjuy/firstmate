@@ -66,6 +66,18 @@ test_nomistakes_invokes_the_owner() {
   pass "no-mistakes pre-push lint calls the one-owner script"
 }
 
+test_exec_bit_guard_owned_and_wired() {
+  # ShellCheck does not inspect file modes, so lost +x on a bin script lints
+  # clean and only fails silently at spawn time. The guard must exist, be
+  # runnable directly, and run in the same CI lint job as the lint owner.
+  local guard
+  guard="$ROOT/bin/fm-check-exec-bits.sh"
+  assert_present "$guard" "bin/fm-check-exec-bits.sh is missing"
+  [ -x "$guard" ] || fail "bin/fm-check-exec-bits.sh must be executable so CI can run it directly"
+  grep -Eq '^        run: bin/fm-check-exec-bits\.sh$' "$CI" || fail "CI lint job must run the exec-bit guard"
+  pass "exec-bit guard exists, is executable, and runs in the CI lint job"
+}
+
 test_pins_an_explicit_version() {
   [ -n "$REQUIRED" ] || fail "fm-lint.sh --required-version printed nothing"
   # The captain-agreed pin: adopt ShellCheck 0.11.0's rule set consistently,
@@ -642,6 +654,7 @@ test_owner_exists_and_executable
 test_owner_defines_canonical_set
 test_ci_invokes_the_owner
 test_nomistakes_invokes_the_owner
+test_exec_bit_guard_owned_and_wired
 test_pins_an_explicit_version
 test_ci_installs_and_logs_the_pinned_version
 test_installer_retries_transient_download_failure
