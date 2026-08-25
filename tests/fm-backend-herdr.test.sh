@@ -2397,7 +2397,7 @@ test_send_text_submit_send_failed() {
   pass "fm_backend_herdr_send_text_submit: reports 'send-failed' when the literal send-text call itself errors"
 }
 
-test_send_text_submit_unknown_on_capture_failure() {
+test_send_text_submit_unconfirmable_read_fails_closed() {
   local dir log resp fb out enter_count
   dir="$TMP_ROOT/submit-read-fail"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
   printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/2.out"
@@ -2405,10 +2405,97 @@ test_send_text_submit_unknown_on_capture_failure() {
   fb=$(make_herdr_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_BACKEND_HERDR_SUBMIT_POLLS=1 \
     bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_send_text_submit default:w1:p2 "x" 2 0.01 0.01' "$ROOT" )
-  [ "$out" = unknown ] || fail "send_text_submit should report unknown when the post-Enter agent-get read fails, got '$out'"
+  [ "$out" = pending ] || fail "send_text_submit must report pending (unconfirmed, non-zero via fm-send) when the post-Enter agent-get read fails - an unconfirmable read must never be claimed delivered, got '$out'"
   enter_count=$(grep -c $'\x1f''pane'$'\x1f''send-keys'$'\x1f''w1:p2'$'\x1f''enter' "$log")
   [ "$enter_count" -eq 1 ] || fail "send_text_submit must never retry past an unreadable target (that is a hard I/O failure, not a timing race), sent $enter_count Enter(s)"
-  pass "fm_backend_herdr_send_text_submit: reports 'unknown' when the post-Enter agent-get read fails (never retries past an unreadable target)"
+  pass "fm_backend_herdr_send_text_submit: an unconfirmable post-Enter read fails closed (pending) without retrying past an unreadable target"
+}
+
+# --- send_text_submit: jcode fail-closed composer confirmation ---------------
+# The herdr+jcode false-positive (task herdr-send-submit-gap, fleet lane
+# penny-rounding-row-autofold, documented in docs/herdr-backend.md "Incident
+# (2026-08-25)"): jcode is NOT herdr-integrated, so `agent get` reports
+# agent_not_found for every live jcode pane, the pre-Enter baseline is always
+# `unknown`, and confirmation runs through the composer path. When jcode is
+# mid-retry or rate-limited its Enter can be swallowed without the steer
+# leaving the composer; the confirmation must then retry Enter (bounded) and,
+# if the text is still there or the read is indeterminate, report `pending` so
+# fm-send exits non-zero - never a false `empty`. The fixtures below are the
+# real captured jcode row shapes (busy mid-turn "4…" with and without typed
+# text; the busy-empty row is also what a genuinely submitted steer's cleared
+# composer draws on this build, verified 2026-08-25 against jcode v0.75.46-dev).
+
+test_send_text_submit_jcode_swallowed_enter_retries_then_pending() {
+  local dir log resp fb out enter_count read_count
+  dir="$TMP_ROOT/submit-jcode-swallow"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  # 1: send-text (literal)  2: agent get FAILS (jcode -> unknown baseline)
+  printf '1\n' > "$resp/2.exit"
+  # 3: send-keys enter  4: pane read -> busy jcode row STILL holding the text
+  printf '\x1b[38;2;255;80;80m4\x1b[38;2;138;180;248m\xe2\x80\xa6 \x1b[39mhello captain        \x1b[38;2;255;193;7m\xe2\x8f\xb3\n' > "$resp/4.out"
+  # 5: send-keys enter (retry)  6: pane read -> still holding the text
+  printf '\x1b[38;2;255;80;80m4\x1b[38;2;138;180;248m\xe2\x80\xa6 \x1b[39mhello captain        \x1b[38;2;255;193;7m\xe2\x8f\xb3\n' > "$resp/6.out"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_send_text_submit default:w1:p2 "hello captain" 2 0.01 0.01' "$ROOT" )
+  [ "$out" = pending ] || fail "a jcode steer whose Enter was swallowed must retry and then report pending (never a false success), got '$out'"
+  enter_count=$(grep -c $'\x1f''pane'$'\x1f''send-keys'$'\x1f''w1:p2'$'\x1f''enter' "$log")
+  [ "$enter_count" -eq 2 ] || fail "a swallowed jcode Enter should be retried once (retries=2, Enter only, never retype), sent $enter_count Enter(s)"
+  read_count=$(grep -c $'\x1f''pane'$'\x1f''read' "$log")
+  [ "$read_count" -eq 2 ] || fail "each Enter attempt must re-verify the composer, made $read_count read(s)"
+  pass "fm_backend_herdr_send_text_submit: a swallowed jcode Enter is retried (Enter only) and reports pending when the text is still in the composer"
+}
+
+test_send_text_submit_jcode_swallowed_enter_retry_succeeds() {
+  local dir log resp fb out enter_count
+  dir="$TMP_ROOT/submit-jcode-swallow-recover"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '1\n' > "$resp/2.exit"
+  # 3: send-keys enter  4: pane read -> text still in the busy composer
+  printf '\x1b[38;2;255;80;80m4\x1b[38;2;138;180;248m\xe2\x80\xa6 \x1b[39mhello captain        \x1b[38;2;255;193;7m\xe2\x8f\xb3\n' > "$resp/4.out"
+  # 5: send-keys enter (retry)  6: pane read -> composer cleared (busy-empty row)
+  printf '\x1b[38;2;255;80;80m4\x1b[38;2;138;180;248m\xe2\x80\xa6 \x1b[39m        \x1b[38;2;255;193;7m\xe2\x8f\xb3\n' > "$resp/6.out"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_send_text_submit default:w1:p2 "hello captain" 2 0.01 0.01' "$ROOT" )
+  [ "$out" = empty ] || fail "a retried Enter that finally clears the jcode composer must confirm delivery, got '$out'"
+  enter_count=$(grep -c $'\x1f''pane'$'\x1f''send-keys'$'\x1f''w1:p2'$'\x1f''enter' "$log")
+  [ "$enter_count" -eq 2 ] || fail "the swallowed first Enter plus the successful retry should be exactly 2 Enters, sent $enter_count"
+  pass "fm_backend_herdr_send_text_submit: a swallowed jcode Enter whose retry clears the composer confirms delivery (exit zero through fm-send)"
+}
+
+test_send_text_submit_jcode_clean_first_try_submit_confirms() {
+  local dir log resp fb out enter_count
+  dir="$TMP_ROOT/submit-jcode-clean"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '1\n' > "$resp/2.exit"
+  # 3: send-keys enter  4: pane read -> busy-empty row (the submitted steer's
+  # cleared composer on a busy jcode pane, verified 2026-08-25 against real
+  # jcode v0.75.46-dev: the typed text leaves the composer and the busy row
+  # draws "4…  ⏳" with no text).
+  printf '\x1b[38;2;255;80;80m4\x1b[38;2;138;180;248m\xe2\x80\xa6 \x1b[39m        \x1b[38;2;255;193;7m\xe2\x8f\xb3\n' > "$resp/4.out"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_send_text_submit default:w1:p2 "hello captain" 2 0.01 0.01' "$ROOT" )
+  [ "$out" = empty ] || fail "a clean first-try jcode submit whose composer reads empty must confirm delivery, got '$out'"
+  enter_count=$(grep -c $'\x1f''pane'$'\x1f''send-keys'$'\x1f''w1:p2'$'\x1f''enter' "$log")
+  [ "$enter_count" -eq 1 ] || fail "a clean first-try jcode submit must not send a needless extra Enter, sent $enter_count"
+  pass "fm_backend_herdr_send_text_submit: a clean first-try jcode submit still exits confirmed (empty) with a single Enter"
+}
+
+test_send_text_submit_jcode_unconfirmable_composer_read_fails_closed() {
+  local dir log resp fb out enter_count read_count
+  dir="$TMP_ROOT/submit-jcode-unreadable"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '1\n' > "$resp/2.exit"
+  # 3: send-keys enter  4: ANSI pane read FAILS  5: plain pane read FAILS
+  printf '1\n' > "$resp/4.exit"
+  printf '1\n' > "$resp/5.exit"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_send_text_submit default:w1:p2 "hello captain" 2 0.01 0.01' "$ROOT" )
+  [ "$out" = pending ] || fail "an unconfirmable jcode composer read must fail closed (pending -> fm-send non-zero), never claim success, got '$out'"
+  enter_count=$(grep -c $'\x1f''pane'$'\x1f''send-keys'$'\x1f''w1:p2'$'\x1f''enter' "$log")
+  [ "$enter_count" -eq 1 ] || fail "send_text_submit must never retry Enter past an unreadable composer, sent $enter_count Enter(s)"
+  read_count=$(grep -c $'\x1f''pane'$'\x1f''read' "$log")
+  [ "$read_count" -eq 2 ] || fail "expected the ANSI read plus its plain fallback, made $read_count read(s)"
+  pass "fm_backend_herdr_send_text_submit: an unconfirmable jcode composer read fails closed (pending) - the exact false-success vector the fleet incident exposed"
 }
 
 # --- fm-backend.sh dispatch wiring -------------------------------------------
@@ -3144,7 +3231,11 @@ test_composer_state_codex_dynamic_idle_tip_reads_empty_when_faint
 test_composer_state_guard_still_refuses_real_pending_text_after_submit_confirmation_change
 test_send_text_submit_slow_transition_within_one_enter_needs_no_extra_enter
 test_send_text_submit_send_failed
-test_send_text_submit_unknown_on_capture_failure
+test_send_text_submit_unconfirmable_read_fails_closed
+test_send_text_submit_jcode_swallowed_enter_retries_then_pending
+test_send_text_submit_jcode_swallowed_enter_retry_succeeds
+test_send_text_submit_jcode_clean_first_try_submit_confirms
+test_send_text_submit_jcode_unconfirmable_composer_read_fails_closed
 test_dispatch_routes_herdr_backend
 test_dispatch_busy_state_unknown_for_tmux
 test_dispatch_composer_state_routes_by_backend

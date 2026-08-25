@@ -1800,13 +1800,36 @@ EOF
 #     re-invokes this function from scratch with the same text after seeing
 #     an error, which is a human/escalation decision, not an automatic
 #     retry).
-# Echoes empty|pending|unknown|send-failed, the SAME vocabulary fm-send.sh
-# already branches on for tmux ("empty" means "confirmed submitted" for every
-# backend; how each backend confirms it is an internal decision - herdr's is
-# no longer literally "the composer read empty").
+#
+# FAIL-CLOSED CONFIRMATION (task herdr-send-submit-gap, verified 2026-08-25,
+# docs/herdr-backend.md "Incident (2026-08-25): a jcode steer claimed
+# delivered while its text sat unsubmitted"): this function echoes ONLY
+#   empty       - delivery CONFIRMED (composer cleared, or native agent-state
+#                 observed a submit-active transition). The one success
+#                 verdict every caller (fm-send, the away/present daemons,
+#                 fm-spawn's jcode briefing, fm-liveness-watchdog) trusts.
+#   pending     - UNCONFIRMED: the composer still holds the text after the
+#                 bounded Enter budget, OR the confirmation genuinely could
+#                 not be determined (an unreadable pane / unrecognized
+#                 composer row / unparsable target). fm-send maps this to a
+#                 NON-ZERO exit, so a steer is never claimed delivered on an
+#                 indeterminate read - the false-positive this function used
+#                 to emit as `unknown`, which fm-send treated as success.
+#   send-failed - the literal send itself failed.
+# The `unknown` verdict vocabulary is retained ONLY inside the confirmation
+# reads (fm_backend_herdr_wait_for_working / fm_backend_herdr_composer_state
+# still return it to their direct callers); at THIS boundary it is folded into
+# `pending` so the caller-facing contract is a strict binary: confirmed, or
+# not confirmed. The daemon's behavior is byte-identical (it already treated
+# every non-empty verdict as "submit unconfirmed"), and fm-send.sh still needs
+# no backend-specific branching ("All implemented backends expose the
+# identical caller-facing verdict vocabulary", docs/herdr-backend.md). The
+# "never retry Enter past an unreadable target" invariant is preserved: an
+# unconfirmable read returns immediately rather than throwing more Enters at
+# a pane that cannot be read.
 fm_backend_herdr_send_text_submit() {  # <target> <text> <retries> <enter-sleep> <settle>
   local target=$1 text=$2 retries=$3 sleep_s=$4 settle=$5 i=0 verdict baseline confirm_sleep
-  fm_backend_herdr_parse_target "$target" || { printf 'unknown'; return 0; }
+  fm_backend_herdr_parse_target "$target" || { printf 'pending'; return 0; }
   fm_backend_herdr_send_literal "$target" "$text" || { printf 'send-failed'; return 0; }
   sleep "$settle"
   baseline=$(fm_backend_herdr_classify_submit_agent_status \
@@ -1824,7 +1847,7 @@ fm_backend_herdr_send_text_submit() {  # <target> <text> <retries> <enter-sleep>
     case "$verdict" in
       busy) printf 'empty'; return 0 ;;
       empty) printf 'empty'; return 0 ;;
-      unknown) printf 'unknown'; return 0 ;;
+      unknown) printf 'pending'; return 0 ;;
     esac
     i=$((i + 1))
     [ "$i" -lt "$retries" ] || { printf 'pending'; return 0; }

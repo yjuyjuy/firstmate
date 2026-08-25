@@ -622,6 +622,7 @@ Normal idle-baseline submit confirmation now uses herdr's native agent-state ins
 A dedicated composer-state or cursor-row/style primitive is still a candidate upstream Herdr feature request; it would let the guard/fallback classifier eventually reach tmux's cursor-row precision instead of relying on a structural approximation over captured tail rows and ANSI style.
 
 All implemented backends expose the identical caller-facing verdict vocabulary (`empty`, `pending`, `unknown`, `send-failed`), so `fm-send.sh` needs no backend-specific branching at all.
+One adapter-level note (after the 2026-08-25 jcode incident below): the herdr adapter's submit primitive itself fails closed, folding every indeterminate read into `pending`, so it no longer emits `unknown` from `fm_backend_herdr_send_text_submit`; the vocabulary stays identical and `fm-send.sh` remains backend-agnostic.
 
 ## Session targeting: the `--session` flag, not `HERDR_SESSION` alone
 
@@ -949,6 +950,64 @@ The composer-guard regression for the 2026-07-08 AFK delivery bug lives in `test
 The fix: the fixture now registers itself as a real herdr agent via `herdr pane report-agent <pane> --source <id> --agent <label> --state idle|working|blocked|unknown` (herdr's own documented integration-protocol primitive for a non-built-in-harness process to report its own agent state, verified empirically here) and reports an idle->working->idle cycle around each submission, exactly as a real harness would.
 With that fix, all four scenarios (A: partial-input deferral, B: swallowed-Enter retry, C: normal digest, D: max-defer wedge alarm) pass against the real binary.
 
+## Incident (2026-08-25): a steer claimed delivered while its text sat unsubmitted in the jcode composer
+
+Task herdr-send-submit-gap. Real fleet incident: `bin/fm-send.sh` reported success for a steer to lane `penny-rounding-row-autofold` (herdr pane `w41:p9`, jcode harness), while the steer text sat UNSUBMITTED in the jcode composer; a manual `herdr pane send-keys w41:p9 Enter` submitted it fine afterward.
+The observed context was jcode mid-retry or rate-limited: the Enter keystroke was issued, the harness never consumed it, and the confirmation logic still declared success - a false positive that strands the steer until a human or the watcher notices.
+
+Root cause. jcode is not in herdr's integration list, so `agent get <pane>` returns `agent_not_found` for every live jcode pane (see "jcode corroboration for the no-agent verdict" above).
+`fm_backend_herdr_send_text_submit` therefore never has a legible idle baseline for a jcode target, and confirmation runs through the composer-content path.
+Two false-positive directions existed in that path:
+- An indeterminate read declared success. A pane that cannot be read, a composer row the shared recognizers do not match, or a transient capture failure made the composer read report `unknown`, and `fm-send.sh`'s lenient policy ("an unreadable pane is assumed sent") treated `unknown` as delivered.
+- A busy-empty read is inherently ambiguous across jcode builds. jcode's busy composer row ("4…  ⏳") correctly reads `empty`, and on a jcode build where Enter-while-busy is accepted-and-queued that empty IS the cleared composer (verified below).
+  But on a build or state where the Enter is swallowed, the same observable cannot prove the steer left the composer: an empty read during a state where input events are dropped is indistinguishable from a genuinely cleared composer.
+
+The fix direction (the same strictness the away-mode daemon already used): a "delivered" verdict must be trustworthy, so when the confirmation genuinely cannot be determined, the delivery is reported UNCONFIRMED - never claimed success.
+This is the contract the sibling watch-429-liveness dead-turn tripwire in `bin/fm-watch.sh` depends on.
+
+Fix. `fm_backend_herdr_send_text_submit` now fails closed: its caller-facing verdicts are exactly two - `empty` (delivery CONFIRMED: the composer cleared, or native agent-state observed a submit-active transition) and `pending` (UNCONFIRMED).
+Every indeterminate read - an unreadable composer, an unrecognized row, a hard read failure, an unparsable target - is folded into `pending` instead of the old `unknown` verdict, so `fm-send.sh` exits NON-ZERO with its existing clear error line rather than claiming success.
+The retry loop keeps its bounded Enter-only budget (only the Enter keystroke is ever retried, never the text; `FM_SEND_RETRIES`, default 3 attempts = 2 retries, the same knob as the tmux path), re-verifying the composer after each Enter.
+The "never retry Enter past an unreadable target" invariant is preserved: an indeterminate read returns `pending` immediately rather than throwing more Enters at a pane the adapter cannot read.
+`fm-send.sh` needs no backend-specific branching: the herdr adapter quietly stopped emitting `unknown` from the submit primitive, and every other caller already treated any non-`empty` verdict as unconfirmed.
+The composer-state classifier itself is unchanged - the fix reuses the exact shared recognizers (`fm_composer_jcode_prompt_text`, `fm_composer_jcode_wrapped_tail`, `fm_composer_classify_content`) through `fm_backend_herdr_composer_state`; no parallel classifier was invented (one-owner rule).
+
+### Empirical evidence (2026-08-25, herdr 0.8.0, jcode v0.75.46-dev, Linux x86_64)
+
+Isolated never-default lab session via `bin/fm-herdr-lab.sh` guards (`tests/herdr-test-safety.sh`), with the default-session fleet-state tripwire byte-identical before and after teardown.
+A real jcode pane was created through the real adapter (`fm_backend_herdr_container_ensure` + `fm_backend_herdr_create_task`), and every composer state below was read through the REAL `fm_backend_herdr_composer_state` against a real `pane read --format ansi` capture.
+
+```text
+$ herdr --version
+herdr 0.8.0
+$ jcode --version
+jcode v0.75.46-dev (cebf81b62)
+target=fm-lab-submitgap-520082:w1:p2
+
+step1 boot:                 composer_state=empty     # idle row draws "1>  ⏳"
+step2 typed, no Enter:      composer_state=pending   # row draws "1> reply with exactly: probe one  ⏳"
+step3 after Enter:          composer_state=empty     # turn 1 entered; busy row draws "2…  ⏳"
+step4 busy-typed (no Enter): composer_state=pending  # while "sleep 6" runs, row draws "3… steer while busy  ⏳"
+       busy-after-enter:    composer_state=empty     # Enter while busy: composer clears instantly to "4…  ⏳"
+step5 settled transcript:   1› reply with exactly: probe one, 2› use the bash tool to run: sleep 6, 3› steer while busy
+```
+
+Facts the probe pins:
+- jcode's busy composer row draws the typed text: `N… <text>  ⏳`. A real in-composer draft therefore reads `pending` even while the pane is busy, and the busy-empty row `N…  ⏳` appears only when the composer actually cleared - so "composer reads empty" is an affirmative cleared signal, not coincidental with a hidden draft.
+- On jcode v0.75.46-dev, Enter while busy is ACCEPTED and queued: the composer clears immediately and the steer lands as the next turn (transcript row `3› steer while busy`).
+- The fleet incident's Enter was swallowed on the fleet build/state (jcode mid-retry or rate-limited). The observable the retry loop handles is the same in both cases: the composer still holding the text after Enter means the steer has not left the composer; only the composer actually clearing is confirmation.
+- Because Enter-while-busy is NOT always accepted (the fleet incident proved a swallow), the herdr confirmation must not accept "pane busy" as proof of delivery the way the tmux adapter's opencode fallback does. The only affirmative in-pane signal for jcode is the composer clearing.
+
+### Consistency with the opencode busy-queued-Enter gap
+
+The tmux adapter's `fm_tmux_submit_enter_core` falls back at budget end to `fm_pane_is_busy` and reports `empty` for a busy pane whose composer still shows text, because opencode 1.18.4 was verified to always accept Enter while mid-turn (queueing the send).
+That exception stays tmux+opencode-specific and must NOT be imported into herdr's composer path: the fleet incident above is direct evidence that on jcode, Enter-while-busy is not always accepted (it was swallowed), so "pane busy" proves nothing about the steer on herdr.
+The herdr adapter's confirmation therefore stays harness-invariant - composer cleared, or native agent-state observed a submit-active transition, else unconfirmed - so all harnesses on herdr share the same fail-closed logic, and the opencode-on-herdr busy-queued false-negative documented below (a queued Enter reported `pending`) remains open exactly as before, now consistent with the fail-closed direction rather than diverging toward a false positive.
+Closing that gap would require a harness-gated busy-fallback keyed on opencode's verified always-queues behavior; it is deliberately not added here because a blanket busy-fallback on the herdr path would recreate the jcode swallow false positive this incident fixes.
+
+Regression coverage: `tests/fm-backend-herdr.test.sh`'s jcode send_text_submit section pins swallowed-Enter-then-pending (text visible in the busy row across the bounded budget), swallowed-then-retry-clears (exactly two Enters), clean-first-try confirm (exactly one Enter, no needless retry), and the unconfirmable-read fail-closed (both the agent-get hard-read-failure path and the composer-read-failure path report `pending` with no extra Enters).
+`tests/fm-send-settle.test.sh`'s herdr+jcode section drives the real `bin/fm-send.sh` against the fake-herdr harness and pins the full caller contract: swallowed-and-stuck exits non-zero with the clear error line and no `last_steer_ts` stamp, swallowed-then-retry-clears exits zero, clean first-try exits zero and stamps `last_steer_ts`, and an unconfirmable read exits non-zero with the clear error line - never a false success.
+
 ## Composer-emptiness safety (2026-07-10, fleet-wide across all four backends)
 
 The structural composer-row read added for the incidents above lived here, in the herdr adapter, while tmux, orca, and cmux each kept their own copy of the "is this composer empty / pending / not an agent composer" decision.
@@ -1119,4 +1178,4 @@ Covered by the unit cases in `tests/fm-afk-launch.test.sh` (clear-on-fresh-entry
 - **Not implemented: mid-session secondmate liveness.** The `fm_backend_agent_alive`-driven respawn sweep (`bin/fm-bootstrap.sh`, see "Agent liveness probe reuses the husk classifier" above) only runs at session start.
   A secondmate dying mid-session is a harder follow-on: the watcher deliberately exempts secondmates from stale-pane detection (an idle secondmate pane is healthy by design), so catching a mid-session death would need a periodic liveness beacon distinct from that exemption, not implemented here.
   Deferred as a separate item - it changes the stale-classification/status vocabulary shared with `bin/fm-watch.sh` and `bin/fm-classify-lib.sh`, which is a bigger surface than this redelivery-loop fix should carry.
-- **OPEN: opencode 1.18.4 busy-queued Enter on the herdr backend.** Mirrors the tmux-backend fix (see "Submit acknowledgement" in [docs/tmux-backend.md](tmux-backend.md)): while opencode is mid-turn, the composer accepts Enter as a "send when the turn ends" keystroke but does not clear the typed text until the turn actually finishes, so the cleared-composer check alone false-positives on a swallowed Enter for every steer sent to a busy opencode pane. The shared `fm_tmux_submit_enter_core` (`bin/fm-tmux-lib.sh`) already handles this for the tmux backend by falling back to `fm_pane_is_busy` after the Enter-retry budget is spent, but the herdr adapter's own `fm_backend_herdr_send_text_submit` has no equivalent fallback. Needs a separate fix - a busy opencode pane still trips the existing submit-pending failure on herdr, even though the Enter was actually accepted.
+- **OPEN: opencode 1.18.4 busy-queued Enter on the herdr backend.** Mirrors the tmux-backend fix (see "Submit acknowledgement" in [docs/tmux-backend.md](tmux-backend.md)): while opencode is mid-turn, the composer accepts Enter as a "send when the turn ends" keystroke but does not clear the typed text until the turn actually finishes, so the cleared-composer check alone false-positives on a swallowed Enter for every steer sent to a busy opencode pane. The shared `fm_tmux_submit_enter_core` (`bin/fm-tmux-lib.sh`) already handles this for the tmux backend by falling back to `fm_pane_is_busy` after the Enter-retry budget is spent, but the herdr adapter's own `fm_backend_herdr_send_text_submit` deliberately has no equivalent fallback. After the 2026-08-25 jcode incident above, the herdr submit confirmation is fail-closed and harness-invariant: a busy pane is not accepted as proof of delivery because the fleet jcode evidence showed Enter-while-busy being swallowed, and a blanket busy-fallback would re-create that false positive. The cost is the documented false-negative: a busy opencode pane whose Enter was actually accepted (queued) trips the submit-pending failure on herdr. Closing this properly requires a harness-gated busy-fallback keyed on opencode's verified always-queues behavior, not a blanket herdr change.

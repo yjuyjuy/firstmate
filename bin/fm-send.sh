@@ -325,8 +325,15 @@ else
   esac
   retries=${FM_SEND_RETRIES:-3}
   sleep_s=${FM_SEND_SLEEP:-0.4}
-  # Type once, submit, verify. Lenient: only a positively-confirmed swallow
-  # (text still in the composer) is an error; an unreadable pane is assumed sent.
+  # Type once, submit, verify. Lenient by default: only a positively-confirmed
+  # swallow (text still in the composer) is an error; an unreadable pane is
+  # assumed sent. The one exception lives in the backend, not here: the herdr
+  # adapter folds an unconfirmable read into `pending` (fail-closed, task
+  # herdr-send-submit-gap), so a herdr steer whose confirmation cannot be
+  # determined exits non-zero instead of claiming success - the jcode
+  # false-positive that left a live steer unsubmitted in the composer while
+  # fm-send reported it delivered. The caller-facing verdict vocabulary stays
+  # backend-identical, so this branch remains backend-agnostic.
   if ! verdict=$(fm_backend_send_text_submit "$TARGET_BACKEND" "$T" "$MESSAGE" "$retries" "$sleep_s" "$settle" "$EXPECTED_LABEL"); then
     if [ "$PENDING_REPLY_CREATED" = 1 ] && [ -n "$PENDING_REPLY_CORR" ]; then
       fm_pending_reply_discard_undelivered "$STATE" "$PENDING_REPLY_CORR" || true
