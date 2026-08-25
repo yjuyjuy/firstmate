@@ -51,9 +51,13 @@ TMPROOT=$(fm_test_tmproot fm-switch-account)
 # sources fm-backend.sh from its own bin dir, so a fake fm-backend.sh next to it
 # controls every backend primitive.
 REPO="$TMPROOT/repo"
-mkdir -p "$REPO/bin" "$REPO/state"
+mkdir -p "$REPO/bin" "$REPO/state" "$REPO/data"
 cp "$SRC" "$REPO/bin/fm-switch-account.sh"
 chmod +x "$REPO/bin/fm-switch-account.sh"
+# The script now sources bin/fm-ff-lib.sh (for the registered-secondmate-home
+# walk); copy the real library so the walk and its validate_secondmate_home guard
+# run exactly as in production.
+cp "$ROOT/bin/fm-ff-lib.sh" "$REPO/bin/fm-ff-lib.sh"
 
 # Per-target scripted composer states. COMPOSER_DIR holds one file per target
 # (":"/"/" -> "_"); each line is one state, consumed one per composer_state call,
@@ -61,6 +65,13 @@ chmod +x "$REPO/bin/fm-switch-account.sh"
 # (stubborn). A missing file defaults to empty.
 COMPOSER_DIR="$TMPROOT/composer"
 BACKEND_LOG="$TMPROOT/backend.log"
+# SENTLABEL_DIR records, per target, the label the switch was last sent with, so
+# the capture stub can emit jcode's real "Switched to Anthropic account <label>"
+# acknowledgement for the verification pass. NOCONFIRM_DIR lists targets whose
+# switch is DROPPED after send (the delivery-miss case) so their capture never
+# confirms.
+SENTLABEL_DIR="$TMPROOT/sentlabel"
+NOCONFIRM_DIR="$TMPROOT/noconfirm"
 
 sanitize() { printf '%s' "$1" | tr ':/' '__'; }
 
@@ -117,15 +128,34 @@ fm_backend_send_key() {  # <backend> <target> <key>
 }
 fm_backend_send_text_submit() {  # <backend> <target> <text> ...
   printf 'send_text %s %s %s\n' "$1" "$2" "$3" >> "$BACKEND_LOG"
+  # Record the label this pane was switched to, so the capture stub below can
+  # emit jcode's real acknowledgement line ("Switched to Anthropic account
+  # <label>") for the verification pass. A target listed in NOCONFIRM_DIR never
+  # gets a recorded label, so its capture stays unconfirmed (the delivery-miss
+  # case). Text is "/account claude switch <label>".
+  local tgt=$2 text=$3 lbl san
+  lbl=${text##* }
+  san=$(_fst_san "$tgt")
+  mkdir -p "$SENTLABEL_DIR"
+  if [ ! -f "$NOCONFIRM_DIR/$san" ]; then
+    printf '%s' "$lbl" > "$SENTLABEL_DIR/$san"
+  fi
   printf 'empty'
 }
 fm_backend_capture() {  # <backend> <target> <lines>
   printf 'capture %s %s\n' "$1" "$2" >> "$BACKEND_LOG"
-  echo "stub pane content"
+  local san lbl
+  san=$(_fst_san "$2")
+  if [ -f "$SENTLABEL_DIR/$san" ]; then
+    lbl=$(cat "$SENTLABEL_DIR/$san")
+    echo "Switched to Anthropic account $lbl"
+  else
+    echo "stub pane content"
+  fi
 }
 SH
 
-export COMPOSER_DIR BACKEND_LOG
+export COMPOSER_DIR BACKEND_LOG SENTLABEL_DIR NOCONFIRM_DIR
 # Skip real waits.
 export FM_SWITCH_SEND_SETTLE=0 FM_SWITCH_CONFIRM_WAIT=0 FM_SWITCH_CLEAR_SETTLE=0
 
@@ -140,6 +170,7 @@ export FM_SWITCH_AUTH_JSON="$AUTH_JSON"
 
 run_switch() {  # <args...> -> sets OUT / RC
   : > "$BACKEND_LOG"
+  rm -rf "$SENTLABEL_DIR"; mkdir -p "$SENTLABEL_DIR"
   OUT=$(cd "$REPO" && ./bin/fm-switch-account.sh "$@" 2>&1)
   RC=$?
 }
@@ -249,6 +280,7 @@ mkdir -p "$EMPTY/bin" "$EMPTY/state"
 cp "$SRC" "$EMPTY/bin/fm-switch-account.sh"
 chmod +x "$EMPTY/bin/fm-switch-account.sh"
 cp "$REPO/bin/fm-backend.sh" "$EMPTY/bin/fm-backend.sh"
+cp "$ROOT/bin/fm-ff-lib.sh" "$EMPTY/bin/fm-ff-lib.sh"
 fm_write_meta "$EMPTY/state/.lavish-lan.meta" "port=4388" "bind=0.0.0.0"
 OUT=$(cd "$EMPTY" && ./bin/fm-switch-account.sh claude-2 2>&1); RC=$?
 expect_code 1 "$RC" "a state dir with no windowed metas must exit 1"
@@ -301,6 +333,75 @@ OUT=$(cd "$REPO" && FM_SWITCH_AUTH_JSON="$TMPROOT/nope.json" ./bin/fm-switch-acc
 expect_code 0 "$RC" "a missing auth file must not block a switch"
 assert_contains "$OUT" "in 2 pane(s)" "a missing auth file skips validation and still switches"
 pass "a missing auth file skips validation rather than blocking the switch"
+
+# --- case 11: no-args discovery ALSO walks registered secondmate homes ---------
+# The scout-switch-misses-secondmate-crews incident: a secondmate's crews are
+# recorded only in that secondmate home's OWN state/*.meta, never in the main
+# home, so a main-home-only enumeration left a live secondmate crew on the old
+# account SILENTLY through a fleet switch. Seed a valid secondmate home with a
+# live crew meta and a registry entry, and assert the switch reaches that crew's
+# pane too.
+seed_secondmate_home() {  # <home-dir> <id>
+  local home=$1 id=$2
+  mkdir -p "$home/bin" "$home/state" "$home/data" "$home/config" "$home/projects"
+  printf '%s' "$id" > "$home/.fm-secondmate-home"
+  : > "$home/AGENTS.md"
+  : > "$home/bin/.keep"
+}
+SM1="$TMPROOT/sm1-home"
+seed_secondmate_home "$SM1" "sm-alpha"
+# A live crew of the secondmate, recorded ONLY under the secondmate home.
+fm_write_meta "$SM1/state/crew-x.meta" "backend=herdr" "window=default:w9:pC" "project=sm-alpha"
+# Registry entry the walk reads (home= is what secondmate_registry_entries pulls).
+cat > "$REPO/data/secondmates.md" <<EOF
+- sm-alpha - a test secondmate (home: $SM1; scope: test; projects: ; added 2026-08-25)
+EOF
+
+run_switch claude-2
+expect_code 0 "$RC" "a fleet switch across a live secondmate crew must exit 0"
+assert_contains "$OUT" "default:w9:pC" "the secondmate crew pane must be enumerated (the enumeration-miss fix)"
+assert_grep "send_text herdr default:w9:pC /account claude switch claude-2" "$BACKEND_LOG" "the secondmate crew must actually receive the switch"
+assert_contains "$OUT" "[secondmate:sm-alpha] default:w9:pC: CONFIRMED" "the secondmate crew must report a home-labeled CONFIRMED verdict"
+pass "no-args discovery walks registered secondmate homes and switches their crews"
+
+# --- case 12: an unseeded/invalid secondmate home is skipped read-only ---------
+# A registry entry whose home is not a seeded secondmate home (no marker) must be
+# skipped with a note, never crash the switch and never touch that dir.
+cat > "$REPO/data/secondmates.md" <<EOF
+- sm-alpha - live (home: $SM1; scope: test; projects: ; added 2026-08-25)
+- sm-bogus - broken (home: $TMPROOT/does-not-exist; scope: test; projects: ; added 2026-08-25)
+EOF
+run_switch claude-2
+expect_code 0 "$RC" "a bogus secondmate home must not fail the switch"
+assert_contains "$OUT" "skipping secondmate 'sm-bogus'" "a bogus secondmate home must be reported skipped"
+assert_grep "send_text herdr default:w9:pC /account claude switch claude-2" "$BACKEND_LOG" "the valid secondmate crew must still be switched"
+pass "an invalid secondmate home is skipped read-only, valid crews still switch"
+
+# --- case 13: a delivery-miss pane is reported UNCONFIRMED and exits 3 ---------
+# The OTHER failure shape: a pane is enumerated and sent the switch, but the
+# queued switch never lands (dropped on turn end / wedge), so its capture never
+# shows the acknowledgement. The verification pass must catch this - retry once,
+# then report UNCONFIRMED and exit non-zero rather than assume success.
+rm -f "$REPO/data/secondmates.md"
+mkdir -p "$NOCONFIRM_DIR"
+: > "$NOCONFIRM_DIR/$(sanitize default:w1:p2)"   # alpha's switch is dropped
+run_switch claude-2
+expect_code 3 "$RC" "an unconfirmed pane must make the run exit 3"
+assert_contains "$OUT" "default:w1:p2: UNCONFIRMED" "a dropped switch must be reported UNCONFIRMED"
+assert_contains "$OUT" "w2:p3: CONFIRMED" "the landed pane must still be CONFIRMED"
+rm -f "$NOCONFIRM_DIR"/*
+pass "a delivery-miss pane is caught as UNCONFIRMED and exits 3"
+
+# --- case 14: an unconfirmed pane is retried exactly once ----------------------
+# The verification retry re-sends the switch once. Count the send_text lines for
+# a persistently-dropped pane: one first-pass send plus one retry send = 2.
+mkdir -p "$NOCONFIRM_DIR"
+: > "$NOCONFIRM_DIR/$(sanitize default:w1:p2)"
+run_switch claude-2
+n=$(grep -c "send_text herdr default:w1:p2 /account claude switch claude-2" "$BACKEND_LOG" || true)
+[ "$n" -eq 2 ] || fail "an unconfirmed pane must be retried exactly once (saw $n send(s), expected 2)"
+rm -f "$NOCONFIRM_DIR"/*
+pass "an unconfirmed pane is retried exactly once before the UNCONFIRMED verdict"
 
 # --- case 10: no stray e_* files left in the repo root ------------------------
 strays=""

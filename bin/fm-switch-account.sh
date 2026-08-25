@@ -31,7 +31,16 @@
 #               same value meta records in window=; if omitted, all live worker
 #               targets recorded in state/<id>.meta are targeted, each on the
 #               backend that meta records (defaulting to tmux per the P1
-#               compatibility contract in fm_backend_of_meta).
+#               compatibility contract in fm_backend_of_meta). No-args discovery
+#               also walks EVERY registered secondmate home's own state/*.meta
+#               (data/secondmates.md -> home= paths), because a secondmate's
+#               crews are recorded only in that secondmate home, never in the
+#               main home: without this walk a live secondmate crew keeps the old
+#               account silently through a fleet switch (task
+#               scout-switch-misses-secondmate-crews, live incident 2026-08-25).
+#               Each secondmate home is validated read-only through the same
+#               validate_secondmate_home guard the liveness sweep uses; the walk
+#               only READS meta files and never mutates a secondmate home.
 #
 # For each target it first checks the pane's composer state and refuses to
 # garble a half-typed prompt: if the composer already holds pending unsubmitted
@@ -64,6 +73,16 @@ cd "$here"
 
 # shellcheck source=bin/fm-backend.sh
 . "$script_dir/fm-backend.sh"
+
+# FM_ROOT/FM_HOME/DATA resolution mirrors bin/fm-bootstrap.sh so no-args
+# discovery can walk registered secondmate homes' state/*.meta. Overridable for
+# tests. validate_secondmate_home (fm-ff-lib.sh) reads FM_HOME and FM_ROOT.
+FM_ROOT="${FM_ROOT_OVERRIDE:-$here}"
+FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
+DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
+export FM_ROOT FM_HOME
+# shellcheck source=bin/fm-ff-lib.sh
+. "$script_dir/fm-ff-lib.sh"
 
 # Pacing between the send-text and Enter, and before reading confirmations.
 # Overridable so tests can run without the real multi-second waits.
@@ -159,9 +178,14 @@ shift || true
 panes=("$@")
 # target -> backend map. Explicit CLI panes default to herdr (see header).
 declare -A target_backends=()
+# target -> "home-label" for reporting which home each pane belongs to.
+declare -A target_homes=()
 
-if [ "${#panes[@]}" -eq 0 ]; then
-  # Derive live worker targets from task meta files, each on its recorded backend.
+# Add every windowed live worker meta under one state dir to the pane set. The
+# home_label is a human tag for the confirmation block. Read-only.
+collect_state_metas() {  # <state-dir> <home-label>
+  local state_dir=$1 home_label=$2 metafile backend target
+  [ -d "$state_dir" ] || return 0
   while IFS= read -r metafile; do
     [ -f "$metafile" ] || continue
     backend="$(fm_backend_of_meta "$metafile" 2>/dev/null || true)"
@@ -180,12 +204,43 @@ if [ "${#panes[@]}" -eq 0 ]; then
     # 2026-08-12). Every other fm_backend_* caller passes this same meta window=
     # value unchanged, so this script must too.
     [ -n "$target" ] || continue
-    panes+=("$target")
-    target_backends["$target"]="${backend:-tmux}"
-  done < <(find state -maxdepth 1 -name '*.meta' 2>/dev/null)
+    # First writer wins: never let a secondmate home overwrite a main-home
+    # target's recorded backend on a (pathological) duplicate window id.
+    if [ -z "${target_backends[$target]:-}" ]; then
+      panes+=("$target")
+      target_backends["$target"]="${backend:-tmux}"
+      target_homes["$target"]="$home_label"
+    fi
+  done < <(find "$state_dir" -maxdepth 1 -name '*.meta' 2>/dev/null)
+}
+
+if [ "${#panes[@]}" -eq 0 ]; then
+  # Derive live worker targets from this home's task meta files, each on its
+  # recorded backend.
+  collect_state_metas "$FM_HOME/state" main
+
+  # THEN walk every registered secondmate home's OWN state/*.meta. A secondmate's
+  # crews are recorded only in that secondmate home (its meta files live under its
+  # own FM_HOME/state), never in the main home, so without this walk a live
+  # secondmate crew keeps the OLD account silently through a fleet switch (task
+  # scout-switch-misses-secondmate-crews, live incident 2026-08-25: crew
+  # fix-429-dead-turn missed two claude-2 broadcasts and stayed 429-throttled an
+  # hour later). Each home is validated read-only through the same
+  # validate_secondmate_home guard the liveness sweep uses; we only READ its meta
+  # files. Skip the active home defensively (it is already swept above and the
+  # validator rejects it anyway).
+  while IFS=$'\t' read -r sm_id sm_home; do
+    [ -n "$sm_home" ] || continue
+    if validate_secondmate_home "$sm_id" "$sm_home" 2>/dev/null; then
+      collect_state_metas "$VALIDATED_HOME/state" "secondmate:$sm_id"
+    else
+      echo "  note: skipping secondmate '$sm_id' home ($VALIDATION_ERROR)" >&2
+    fi
+  done < <(secondmate_registry_entries "$DATA/secondmates.md")
 else
   for p in "${panes[@]}"; do
     target_backends["$p"]=herdr
+    target_homes["$p"]=explicit
   done
 fi
 
@@ -196,9 +251,24 @@ fi
 
 echo "switching to account '$label' in ${#panes[@]} pane(s): ${panes[*]}"
 
-for p in "${panes[@]}"; do
-  backend="${target_backends[$p]:-herdr}"
+# A pane is CONFIRMED switched when its captured tail shows jcode's own switch
+# acknowledgement carrying the target label. jcode prints
+# "Switched to Anthropic account <label>" on a successful `/account claude
+# switch`, and the account status line renders the active label as
+# "active account: <label>"; both satisfy this. Requiring the acknowledgement
+# phrase AND the label on the same line means the pane's own echo of the
+# "/account claude switch <label>" command we typed (which contains the label
+# but not the phrase) never counts as a false confirmation.
+confirmed_switched() {  # <capture-text> <label>
+  local cap=$1 lbl=$2
+  printf '%s\n' "$cap" | grep -Eq "(Switched to Anthropic account|active account:).*${lbl}"
+}
 
+# Send the switch to one pane after the composer guard. Prints the per-pane
+# outcome line. Returns 0 when the command was sent (so the caller verifies it),
+# 1 when the pane was skipped or the send failed (no verification needed).
+send_switch_to() {  # <backend> <target>
+  local backend=$1 p=$2 state verdict
   # Composer guard: never garble a half-typed prompt or blind-inject a dead pane.
   state="$(fm_backend_composer_state "$backend" "$p" 2>/dev/null || echo unknown)"
   if [ "$state" = pending ]; then
@@ -208,29 +278,70 @@ for p in "${panes[@]}"; do
     state="$(fm_backend_composer_state "$backend" "$p" 2>/dev/null || echo unknown)"
     if [ "$state" = pending ]; then
       echo "  $p: SKIPPED - composer still has pending text after Escape (not overwriting)"
-      continue
+      return 1
     fi
   fi
   if [ "$state" = unknown ]; then
     echo "  $p: SKIPPED - composer state unknown (dead/non-agent pane)"
-    continue
+    return 1
   fi
-
   # Send the slash command through the backend's verified submit path.
   verdict="$(fm_backend_send_text_submit "$backend" "$p" "/account claude switch $label" \
     3 "$send_settle" "$send_settle" 2>/dev/null)" || {
-    echo "  $p: send FAILED"; continue; }
+    echo "  $p: send FAILED"; return 1; }
   case "$verdict" in
     empty) echo "  $p: sent" ;;
     *) echo "  $p: sent (verdict=${verdict:-unknown})" ;;
   esac
+  return 0
+}
+
+# First pass: send to every target, remembering which panes to verify.
+sent_targets=()
+for p in "${panes[@]}"; do
+  backend="${target_backends[$p]:-herdr}"
+  if send_switch_to "$backend" "$p"; then
+    sent_targets+=("$p")
+  fi
 done
 
 echo "waiting for confirmations..."
 sleep "$confirm_wait"
 
-for p in "${panes[@]}"; do
+# Verification pass: confirm each SENT pane actually reports the switched
+# account, and retry ONCE for a pane that has not confirmed. Report a per-pane
+# verdict line (CONFIRMED / UNCONFIRMED) instead of a blind capture tail, so a
+# silent enumeration-or-delivery miss is visible instead of assumed switched.
+# The full capture tail still prints under each verdict as the evidence.
+unconfirmed=()
+for p in "${sent_targets[@]}"; do
   backend="${target_backends[$p]:-herdr}"
-  echo "=== $p ==="
-  fm_backend_capture "$backend" "$p" 6 2>/dev/null || echo "  (read failed)"
+  cap="$(fm_backend_capture "$backend" "$p" 8 2>/dev/null || true)"
+  if confirmed_switched "$cap" "$label"; then
+    continue
+  fi
+  # Retry once: re-send the switch, wait, re-capture.
+  echo "  $p: not confirmed on first read - retrying once"
+  send_switch_to "$backend" "$p" >/dev/null || true
+  sleep "$confirm_wait"
+  cap="$(fm_backend_capture "$backend" "$p" 8 2>/dev/null || true)"
+  confirmed_switched "$cap" "$label" || unconfirmed+=("$p")
 done
+
+echo "=== per-pane verdicts (account '$label') ==="
+for p in "${sent_targets[@]}"; do
+  backend="${target_backends[$p]:-herdr}"
+  home="${target_homes[$p]:-?}"
+  cap="$(fm_backend_capture "$backend" "$p" 8 2>/dev/null || true)"
+  if confirmed_switched "$cap" "$label"; then
+    echo "  [$home] $p: CONFIRMED"
+  else
+    echo "  [$home] $p: UNCONFIRMED"
+  fi
+  printf '%s\n' "$cap" | sed 's/^/      /'
+done
+
+if [ "${#unconfirmed[@]}" -gt 0 ]; then
+  echo "WARNING: ${#unconfirmed[@]} pane(s) NOT confirmed on account '$label': ${unconfirmed[*]}" >&2
+  exit 3
+fi

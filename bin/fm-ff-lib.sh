@@ -245,6 +245,29 @@ secondmate_registry_field() {
   printf '%s\n' "$value"
 }
 
+# List every registered secondmate's id and home from data/secondmates.md, one
+# "id<TAB>home" line per registry entry. Unlike live_secondmate_meta_records
+# (which reads the ACTIVE home's own state/*.meta), this reads the durable
+# registry so a caller can walk EACH secondmate home's own state/*.meta - the
+# scope the fleet account switch needs, since a secondmate's crews are recorded
+# only in that secondmate home, never in the main home. Read-only: it never
+# touches any secondmate home. Empty when the registry is absent or unreadable.
+secondmate_registry_entries() {
+  local reg=$1 line id home
+  [ -f "$reg" ] || return 0
+  while IFS= read -r line; do
+    case "$line" in
+      "- "*) : ;;
+      *) continue ;;
+    esac
+    id=$(printf '%s\n' "$line" | sed -n 's/^- \([^ ]*\) .*/\1/p')
+    [ -n "$id" ] || continue
+    home=$(printf '%s\n' "$line" | sed -n 's/.*(home:[[:space:]]*\([^;)]*\);.*/\1/p' | sed 's/[[:space:]]*$//')
+    [ -n "$home" ] || continue
+    printf '%s\t%s\n' "$id" "$home"
+  done < "$reg"
+}
+
 # List this home's LIVE secondmate direct reports from state/<id>.meta records.
 # The meta file is the liveness signal; data/secondmates.md is only the fallback
 # for durable fields such as home= when an older/incomplete meta lacks them.
