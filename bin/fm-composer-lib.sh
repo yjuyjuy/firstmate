@@ -264,6 +264,41 @@ fm_composer_jcode_prompt_text() {  # <trimmed-row-content> -> typed text on stdo
   printf '%s' "$rest"
 }
 
+# fm_composer_tail_has_jcode_dead_marker: the jcode TERMINAL-DEAD marker
+# catalog, the conclusive rows a frozen pane keeps on screen after its turn
+# died mid-stream (root cause: data/supervision-miss-rootcause/report.md, F2;
+# the strings are verified in the jcode binary, `strings /root/.local/bin/jcode`:
+# "Auto-retry limit reached after ", "Use `/poke` again to retry manually.").
+# A plain-row match has the same shape as the existing tripwire catalog
+# FM_ORCH_TRIPWIRE_RE_DEFAULT in bin/fm-account-orchestrator.sh.
+#
+# Which rows are conclusive, from the root-cause report:
+#   - "Auto-retry limit reached after N attempts. Use `/poke` again to retry
+#     manually." - jcode's own TERMINAL statement: the retry loop exhausted and
+#     the turn needs /poke; NO firstmate predicate recognized it before.
+#   - "Already processing a message" - jcode's rejection row for a steer sent
+#     while the app believes a turn is in flight; the lane LOOKS steered but the
+#     text was swallowed. When no content advance follows it, the turn is dead.
+#   - "Retryable stream error" alone is NOT decisive: jcode can legitimately
+#     retry and continue ("✓ Retrying continuation..." precedes recovery), so it
+#     is deliberately not in the catalog.
+#
+# The caller OWNS the corroboration that turns a marker into a verdict: a
+# marker row by itself only means the app REACHED that state; the watcher's
+# dead-turn check pairs it with a fresh 429 and a stale status file before
+# probing or escalating, and recovery on advancing content outranks it. An
+# overridden regex (callers: watcher check, future window_is_busy and
+# crew-state corrections) keeps the whole fleet on one catalog.
+FM_COMPOSER_JCODE_DEAD_MARKER_RE_DEFAULT='Auto-retry limit reached|Already processing a message'
+# shellcheck disable=SC2034 # Read by fm_composer_tail_has_jcode_dead_marker after this assignment.
+FM_COMPOSER_JCODE_DEAD_MARKER_RE=${FM_COMPOSER_JCODE_DEAD_MARKER_RE:-$FM_COMPOSER_JCODE_DEAD_MARKER_RE_DEFAULT}
+
+fm_composer_tail_has_jcode_dead_marker() {  # <tail> -> 0 when a dead marker is present, 1 otherwise
+  local tail=$1
+  [ -n "${FM_COMPOSER_JCODE_DEAD_MARKER_RE:-}" ] || return 1
+  printf '%s' "$tail" | grep -qE "$FM_COMPOSER_JCODE_DEAD_MARKER_RE"
+}
+
 # fm_composer_jcode_wrapped_tail: recognize the BOTTOM row of a jcode composer
 # whose typed text has grown tall enough that the leading "NNN>"/"NNN…" prompt
 # row has scrolled OFF the top of the visible pane, and print the real typed

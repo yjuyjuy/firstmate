@@ -72,10 +72,12 @@
 #                          turn-liveness tripwire (Visibility Gap-5): a lane
 #                          whose in-flight turn died after a reactive 429
 #                          account rotation already got exactly ONE automatic
-#                          resume steer and is STILL idle with no status append
-#                          since the 429, so its dead turn is escalated instead
-#                          of sitting silent and looking healthy (mechanism and
-#                          evidence: docs/design-visibility-improvements.md).
+#                          resume steer and is STILL content-frozen (or shows
+#                          a jcode terminal-dead marker) with no status append
+#                          since the 429, so its dead turn is escalated
+#                          instead of sitting silent and looking healthy
+#                          (mechanism and evidence:
+#                          docs/design-visibility-improvements.md).
 #   tick: <note>           env-gated proof-of-life close (FM_WATCH_ABSORB_TICK=1,
 #                          default off) for a benign-ABSORBED wake while work is
 #                          under way. Not an actionable wake: nothing is queued,
@@ -164,6 +166,13 @@ mkdir -p "$STATE"
 # producers own. No side effects on source.
 # shellcheck source=bin/fm-telemetry-lib.sh
 . "$SCRIPT_DIR/fm-telemetry-lib.sh"
+# The ONE fleet-wide owner of composer-content classification
+# (bin/fm-composer-lib.sh), which also owns the jcode terminal-dead marker
+# catalog (supervision-miss-rootcause F2). The dead-turn check below consumes
+# fm_composer_tail_has_jcode_dead_marker so the marker vocabulary cannot drift
+# between the watcher, the adapters, and any future busy-state correction.
+# shellcheck source=bin/fm-composer-lib.sh
+. "$SCRIPT_DIR/fm-composer-lib.sh"
 
 WATCH_LOCK="$STATE/.watch.lock"
 WATCH_PATH="$SCRIPT_DIR/fm-watch.sh"
@@ -1097,36 +1106,83 @@ steer_stuck_check() {  # <window> <task> <tail40> <hash> <prev-hash>
   return 0
 }
 
+# The ANIMATED FOOTER-ROW catalog for pane_content_hash below. Every verified
+# harness renders its busy indicator in the BOTTOM rows of the pane - the
+# spinner row, the elapsed-timer row, and the right-aligned composer /
+# indicator row (the same footer area the BUSY_REGEX scan scopes to: the last
+# 6 non-blank lines). jcode's frozen footer draws exactly these shapes
+# (`⠋ thinking… 15m 2s · https` and `6… ⏳`, supervision-miss-rootcause
+# evidence). Overridable; the comma-free alternation is one grep -E catalog.
+FM_WATCH_FOOTER_ROW_RE=${FM_WATCH_FOOTER_ROW_RE:-'⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏|[0-9]+m [0-9]+s|⏳|^[0-9]+…|·●·'}
+
+# pane_content_hash (F1 seam, supervision-miss-rootcause): hash the tail40
+# MINUS the animated footer rows. A dead jcode lane after a 429 rotation keeps
+# redrawing its footer (spinner chars, a growing elapsed timer, the busy
+# "NNN…" composer) while its CONTENT rows stay byte-identical, so the raw tail
+# hash never stabilizes and every downstream stale/hash classifier never sees
+# the freeze (`.count-<key>` stayed 0 on the incident lanes for 10 hours).
+# Stripping only TRAILING rows that match the footer catalog leaves content
+# rows untouched; content change then moves the hash exactly when it should.
+# A pane smaller than its footer hashes to a stable empty content, which is
+# the correct shape for the dead-turn check: an idle pane with no content is
+# exactly the dead-turn condition when a fresh 429 and no status append
+# accompany it. Zero backend calls: consumes the tail40 the loop already
+# captured.
+pane_content_hash() {  # <tail40>
+  printf '%s' "$1" | grep -v '^[[:space:]]*$' | awk -v re="$FM_WATCH_FOOTER_ROW_RE" '
+    { rows[NR] = $0 }
+    END {
+      n = NR
+      while (n > 0 && rows[n] ~ re) n--
+      for (i = 1; i <= n; i++) print rows[i]
+    }' | hash_pane
+}
+
 # Visibility Gap-5: the dead-turn liveness tripwire. A lane that reactively
 # rotated accounts on a 429 (rate limit) can have its in-flight turn die during
 # or after the rotation, with the harness never starting a new turn. The pane
-# stays present and may keep REDRAWING (a live-looking hash), so the stale loop
-# never fires, and telemetry already carries the 429 cue (last_429_ts, written
-# by quota_anomaly_scan above - Gap-2). The only reliable dead-turn signal is
-# the ABSENCE of a status append after the 429. Full state machine, axis
-# review, and verification: docs/design-visibility-improvements.md "Gap 5".
+# stays present and may keep REDRAWING (a live-looking hash) while its content
+# rows are frozen, so the stale loop never fires, and telemetry already
+# carries the 429 cue (last_429_ts, written by quota_anomaly_scan above -
+# Gap-2). The dead-turn signal is CONTENT-STALL (pane_content_hash unchanged
+# across polls) or a conclusive jcode terminal-dead marker, both with NO status
+# append after the 429. HARD-WON FACT (supervision-miss-rootcause F4): busy is
+# a LYING liveness signal on a dead jcode pane - herdr reports
+# agent_status=working forever, the frozen "NNN…" composer matches BUSY_REGEX,
+# and the footer animates - so this check NEVER consults window_is_busy for
+# probe, escalate, or recovery. Full state machine, axis review, and
+# verification: docs/design-visibility-improvements.md "Gap 5".
 #
 # Two-poll state machine (never a probe loop), driven by the same per-window
 # values this loop already holds (tail40 only; zero extra backend capture):
-#   1. First qualifying poll - recent last_429_ts + pane not busy + NO status
-#      append since last_429_ts + not paused/captain-held + episode not already
-#      spent - sends exactly ONE bounded automatic resume steer via fm-send
-#      (the seam FM_DEAD_TURN_SEND_BIN, default this repo's fm-send.sh,
-#      mirrors FM_STALE_NUDGE_BIN; tests stub it), records resume_probe_ts= in
+#   1. Each in-window poll observes the pane's content hash (footer stripped).
+#      A poll whose content hash MATCHES the previous poll's hash is a
+#      content-stall; the first poll of an observation baseline never probes.
+#   2. First qualifying poll - recent last_429_ts + CONTENT-STALL (or a jcode
+#      dead marker: "Auto-retry limit reached" / "Already processing a
+#      message", owned by bin/fm-composer-lib.sh) + NO status append since
+#      last_429_ts + not paused/captain-held + episode not already spent -
+#      sends exactly ONE bounded automatic resume steer via fm-send (the seam
+#      FM_DEAD_TURN_SEND_BIN, default this repo's fm-send.sh, mirrors
+#      FM_STALE_NUDGE_BIN; tests stub it), records resume_probe_ts= in
 #      telemetry, and persists the episode in state/.dead-turn-probe-<key>
 #      (holding the last_429_ts probed for, so one 429 burst = one probe).
-#   2. Next poll - STILL not busy AND STILL no status append since the 429 -
-#      escalates ONCE as `check: dead-turn <task>` via state/.dead-turn-
-#      escalated-<key> (same wake pattern as quota_anomaly_scan). A later fresh
-#      last_429_ts is a NEW episode and may probe once again.
-#   3. Recovery (pane busy, or a status append after the 429) clears the
-#      episode's ACTIVE markers and records it as spent in state/.dead-turn-
-#      resolved-<key>, so a later idle poll inside the same window stays SILENT
-#      (the lane is healthy, not a new dead turn). A recovered episode re-arms
-#      only on a genuinely new last_429_ts.
-#   4. Window expiry drops all three tracking files - no wake, no probe. Same
-#      marker lifecycle as steer_stuck_check, whose pause/expiry ordering is
-#      mirrored exactly.
+#   3. Next poll - STILL content-stalled (or dead marker) AND STILL no status
+#      append since the 429 - escalates ONCE as `check: dead-turn <task>` via
+#      state/.dead-turn-escalated-<key> (same wake pattern as
+#      quota_anomaly_scan). A later fresh last_429_ts is a NEW episode and may
+#      probe once again.
+#   4. Recovery - a status append after the 429, or ADVANCING content (the
+#      content hash differs from the previous poll - the lane produced a new
+#      row, which is liveness even when the app still draws a busy footer) -
+#      clears the episode's ACTIVE markers and records it as spent in
+#      state/.dead-turn-resolved-<key>, so a later idle poll inside the same
+#      window stays SILENT. A recovered episode re-arms only on a genuinely
+#      new last_429_ts. Busy-ness NEVER resolves an episode: the incident
+#      lanes read busy forever while dead (herdr native state + BUSY_REGEX).
+#   5. Window expiry drops the tracking files - no wake, no probe. Same marker
+#      lifecycle as steer_stuck_check, whose pause/expiry ordering is mirrored
+#      exactly.
 # A send that cannot be confirmed records the episode's single probe anyway and
 # escalates immediately: a failing sender must never swallow a stalled worker
 # (the same rule the stale nudge follows), and a failure does not retry into a
@@ -1157,8 +1213,8 @@ FM_DEAD_TURN_SEND_BIN=${FM_DEAD_TURN_SEND_BIN:-"$SCRIPT_DIR/fm-send.sh"}
 
 dead_turn_check() {  # <window> <task> <tail40>
   local w=$1 task=$2 tail=$3
-  local meta tel ts now age key probe_marker escalated_marker resolved_marker status_m
-  local out probe_ts probe_age reason last_steer
+  local meta tel ts now age key probe_marker escalated_marker resolved_marker content_file
+  local status_m cur prev stalled out probe_ts probe_age reason last_steer dead_desc
   [ -n "$task" ] || return 0
   meta=$(fm_backend_meta_for_window "$w" "$STATE" 2>/dev/null || true)
   [ -n "$meta" ] || return 0
@@ -1175,11 +1231,12 @@ dead_turn_check() {  # <window> <task> <tail40>
   probe_marker="$STATE/.dead-turn-probe-$key"
   escalated_marker="$STATE/.dead-turn-escalated-$key"
   resolved_marker="$STATE/.dead-turn-resolved-$key"
+  content_file="$STATE/.dead-turn-content-$key"
   if [ "$age" -gt "$FM_DEAD_TURN_WINDOW" ]; then
     # The 429 aged out of the episode window: not an active concern. Drop the
     # tracking files so a long-idle healthy pane with an OLD 429 never trips,
     # and a later fresh last_429_ts starts a new episode.
-    rm -f "$probe_marker" "$escalated_marker" "$resolved_marker"
+    rm -f "$probe_marker" "$escalated_marker" "$resolved_marker" "$content_file"
     return 0
   fi
   # A declared pause / captain-hold is a legitimate wait; never probed, never
@@ -1188,66 +1245,98 @@ dead_turn_check() {  # <window> <task> <tail40>
   if status_is_paused_or_captain_held "$(last_status_line "$STATE/$task.status")"; then
     return 0
   fi
-  # Recovery: a busy pane or a status append after the 429 means the lane is
-  # alive again. Clear the episode's ACTIVE markers and record the episode as
-  # SPENT so a later idle poll inside this window stays silent (the lane is
-  # healthy, not a new dead turn); only a genuinely new last_429_ts re-arms.
+  # Content-stall observation (F1): hash THIS poll's captured tail40 without
+  # the animated footer rows and compare against the previous poll's hash,
+  # persisted in the .dead-turn-content-<key> observation file. A dead jcode
+  # lane after a rotation redraws its footer (spinner, growing timer, busy
+  # composer) while the CONTENT rows stay byte-identical, so the content hash
+  # stalls even though the raw tail hash keeps churning and every busy
+  # predicate keeps lying `busy`. Busy-ness is deliberately NOT a liveness
+  # signal here (supervision-miss-rootcause F4); it is never consulted.
+  cur=$(pane_content_hash "$tail")
+  prev=$(cat "$content_file" 2>/dev/null || true)
+  printf '%s' "$cur" > "$content_file" 2>/dev/null || true
+  stalled=0
+  [ -n "$prev" ] && [ "$prev" = "$cur" ] && stalled=1
+  # Recovery: a status append after the 429, or ADVANCING content (the
+  # non-footer rows changed since the last poll), means the lane is alive
+  # again. Clear the episode's ACTIVE markers and record the episode as SPENT
+  # so a later idle poll inside this window stays silent (the lane is healthy,
+  # not a new dead turn); only a genuinely new last_429_ts re-arms. A busy
+  # pane NEVER resolves an episode: the incident lanes read busy forever
+  # while dead.
   status_m=$(stat_mtime "$STATE/$task.status")
-  if window_is_busy "$w" "$tail" || { [ -n "$status_m" ] && [ "$status_m" -gt "$ts" ]; }; then
+  if { [ -n "$status_m" ] && [ "$status_m" -gt "$ts" ]; } \
+    || { [ -n "$prev" ] && [ "$prev" != "$cur" ]; }; then
     rm -f "$probe_marker" "$escalated_marker"
     printf '%s' "$ts" > "$resolved_marker" 2>/dev/null || true
     return 0
   fi
   # A spent episode stays silent until a NEW 429 (a fresh last_429_ts).
   [ "$(cat "$resolved_marker" 2>/dev/null || true)" = "$ts" ] && return 0
-  if [ "$(cat "$probe_marker" 2>/dev/null || true)" = "$ts" ]; then
-    # Probe already recorded for THIS episode: the only next actions are
-    # recovery (handled above) or the single escalation wake. Never a second
-    # probe - the escalation poll is where a still-dead lane surfaces.
-    [ "$(cat "$escalated_marker" 2>/dev/null || true)" = "$ts" ] && return 0
-    printf '%s' "$ts" > "$escalated_marker" 2>/dev/null || return 0
-    probe_ts=$(fm_meta_get "$tel" resume_probe_ts)
-    case "$probe_ts" in
-      ''|*[!0-9]*) probe_age= ;;
-      *) probe_age=$(( now - probe_ts )) ;;
-    esac
-    if [ -n "$probe_age" ]; then
-      reason="check: dead-turn $task (429 ${age}s ago, resume steer sent ${probe_age}s ago, pane still idle, no status append since 429)"
-    else
-      reason="check: dead-turn $task (429 ${age}s ago, resume steer not processed, pane still idle, no status append since 429)"
+  # Dead-turn predicate: content-stalled across two polls, OR a conclusive
+  # jcode terminal-dead marker in the tail (auto-retry-limit-reached, or the
+  # swallowed-steer rejection row; catalog owned by bin/fm-composer-lib.sh).
+  # Everything else - native busy state, BUSY_REGEX hits, raw-hash churn - is
+  # ignored for the probe/escalate decision.
+  if [ "$stalled" = 1 ] || fm_composer_tail_has_jcode_dead_marker "$tail"; then
+    if [ "$(cat "$probe_marker" 2>/dev/null || true)" = "$ts" ]; then
+      # Probe already recorded for THIS episode: the only next actions are
+      # recovery (handled above) or the single escalation wake. Never a second
+      # probe - the escalation poll is where a still-dead lane surfaces.
+      [ "$(cat "$escalated_marker" 2>/dev/null || true)" = "$ts" ] && return 0
+      printf '%s' "$ts" > "$escalated_marker" 2>/dev/null || return 0
+      probe_ts=$(fm_meta_get "$tel" resume_probe_ts)
+      case "$probe_ts" in
+        ''|*[!0-9]*) probe_age= ;;
+        *) probe_age=$(( now - probe_ts )) ;;
+      esac
+      if fm_composer_tail_has_jcode_dead_marker "$tail"; then
+        dead_desc="jcode dead marker since the 429"
+      elif [ "$stalled" = 1 ]; then
+        dead_desc="content frozen since the 429"
+      else
+        dead_desc="dead turn since the 429"
+      fi
+      if [ -n "$probe_age" ]; then
+        reason="check: dead-turn $task (429 ${age}s ago, resume steer sent ${probe_age}s ago, ${dead_desc}, no status append since 429)"
+      else
+        reason="check: dead-turn $task (429 ${age}s ago, resume steer not processed, ${dead_desc}, no status append since 429)"
+      fi
+      fm_wake_append check "dead-turn-$key" "$reason" || exit 1
+      wake "$reason"
     fi
-    fm_wake_append check "dead-turn-$key" "$reason" || exit 1
-    wake "$reason"
-  fi
-  # First qualifying poll of the episode: exactly ONE bounded resume steer. The
-  # text is short, single-line, and steer-safe (plain text, no slash command,
-  # no skill invocation) so every verified harness treats it as an ordinary
-  # turn nudge.
-  if ! out=$(FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" \
-      "$FM_DEAD_TURN_SEND_BIN" "$task" \
-      "Auto-nudge: your turn ended after a rate-limit (429) account rotation. Resume your turn; append a working: status line once you are back." 2>&1); then
-    # A send that cannot be confirmed records the episode's single probe and
-    # escalates NOW rather than retrying into a probe loop or swallowing the
-    # stalled lane.
+    # First qualifying poll of the episode: exactly ONE bounded resume steer.
+    # The text is short, single-line, and steer-safe (plain text, no slash
+    # command, no skill invocation) so every verified harness treats it as an
+    # ordinary turn nudge.
+    if ! out=$(FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" \
+        "$FM_DEAD_TURN_SEND_BIN" "$task" \
+        "Auto-nudge: your turn ended after a rate-limit (429) account rotation. Resume your turn; append a working: status line once you are back." 2>&1); then
+      # A send that cannot be confirmed records the episode's single probe and
+      # escalates NOW rather than retrying into a probe loop or swallowing the
+      # stalled lane.
+      printf '%s' "$ts" > "$probe_marker" 2>/dev/null || true
+      printf '%s' "$ts" > "$escalated_marker" 2>/dev/null || true
+      triage_log "dead-turn resume steer send failed for $w: $(printf '%s' "$out" | tail -n 1)"
+      reason="check: dead-turn $task (429 ${age}s ago, resume steer delivery FAILED, content frozen since the 429, no status append since 429)"
+      fm_wake_append check "dead-turn-$key" "$reason" || exit 1
+      wake "$reason"
+    fi
     printf '%s' "$ts" > "$probe_marker" 2>/dev/null || true
-    printf '%s' "$ts" > "$escalated_marker" 2>/dev/null || true
-    triage_log "dead-turn resume steer send failed for $w: $(printf '%s' "$out" | tail -n 1)"
-    reason="check: dead-turn $task (429 ${age}s ago, resume steer delivery FAILED, pane idle, no status append since 429)"
-    fm_wake_append check "dead-turn-$key" "$reason" || exit 1
-    wake "$reason"
+    fm_telemetry_set "$tel" resume_probe_ts "$(date +%s)" || true
+    # Gap-4 coordination: our probe steer stamps last_steer_ts (fm-send does
+    # on confirmed delivery), and steer_stuck_check would otherwise escalate
+    # the SAME steer as a stuck composer on the next poll, without the 429
+    # context. Pre-record the probe's steer ts in Gap-4's .steer-stuck-<key>
+    # warned-marker so the dead-turn wake is the single escalation for that
+    # steer.
+    last_steer=$(fm_meta_get "$tel" last_steer_ts)
+    case "$last_steer" in
+      ''|*[!0-9]*) ;;
+      *) printf '%s' "$last_steer" > "$STATE/.steer-stuck-$key" 2>/dev/null || true ;;
+    esac
   fi
-  printf '%s' "$ts" > "$probe_marker" 2>/dev/null || true
-  fm_telemetry_set "$tel" resume_probe_ts "$(date +%s)" || true
-  # Gap-4 coordination: our probe steer stamps last_steer_ts (fm-send does on
-  # confirmed delivery), and steer_stuck_check would otherwise escalate the
-  # SAME steer as a stuck composer on the next poll, without the 429 context.
-  # Pre-record the probe's steer ts in Gap-4's .steer-stuck-<key> warned-
-  # marker so the dead-turn wake is the single escalation for that steer.
-  last_steer=$(fm_meta_get "$tel" last_steer_ts)
-  case "$last_steer" in
-    ''|*[!0-9]*) ;;
-    *) printf '%s' "$last_steer" > "$STATE/.steer-stuck-$key" 2>/dev/null || true ;;
-  esac
   return 0
 }
 
@@ -2123,12 +2212,16 @@ EOF
     steer_stuck_check "$w" "$task" "$tail40" "$h" "$prev"
     # Visibility Gap-5: the dead-turn liveness tripwire. A lane that rotated
     # accounts on a 429 and then never started a new turn looks healthy (pane
-    # present, telemetry carries the 429) but is dead. Reuses this loop's
-    # already-captured tail40 - zero extra backend capture. Gated internally:
-    # fires only within FM_DEAD_TURN_WINDOW of a recorded last_429_ts, sends
-    # exactly ONE automatic resume steer via fm-send, escalates
-    # `check: dead-turn <task>` on the next poll that is still dead, and
-    # clears silently on busy or a status append after the 429.
+    # present, telemetry carries the 429, busy predicates may even say busy)
+    # but is dead. Reuses this loop's already-captured tail40 - zero extra
+    # backend capture. Gated internally: fires only within
+    # FM_DEAD_TURN_WINDOW of a recorded last_429_ts when pane CONTENT is
+    # frozen across polls (or a jcode dead marker sits in the tail) with no
+    # status append since the 429; sends exactly ONE automatic resume steer
+    # via fm-send, escalates `check: dead-turn <task>` on the next poll that
+    # is still dead, and clears silently on a status append or advancing
+    # content. Busy-ness is NEVER a liveness signal here (the dead jcode
+    # lanes read busy forever; supervision-miss-rootcause F4).
     dead_turn_check "$w" "$task" "$tail40"
     if [ "$h" = "$prev" ]; then
       n=$(( $(cat "$cf" 2>/dev/null || echo 0) + 1 ))
