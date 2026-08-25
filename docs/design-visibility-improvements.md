@@ -134,8 +134,10 @@ difference that the check must handle.
 
 ## Verification evidence
 
-Dated 2026-08-25. Repo state: branch `fm/watch-429-liveness` (see git log for
-the exact sha of the code under test).
+Dated 2026-08-25. Code under test: commit `210906f` on branch
+`fm/watch-429-liveness` (the evidence above was captured from exactly that
+tree; the sha of the tree under test does not change when a later commit only
+edits this doc).
 
 `bin/fm-lint.sh` (shellcheck 0.11.0, the pinned version):
 
