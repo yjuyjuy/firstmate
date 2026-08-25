@@ -174,8 +174,9 @@ difference that the check must handle.
 ## Verification evidence
 
 Dated 2026-08-25 (F4 rework evidence; the pre-F4 evidence is history in this
-file's git log). Code under test: see the sha pin below; the evidence was
-captured from exactly that tree.
+file's git log). Code under test: commit `915fae9` on branch
+`fm/watch-429-liveness`; the sha of the tree under test does not change when a
+later commit only edits this doc.
 
 `bin/fm-lint.sh` (shellcheck 0.11.0, the pinned version):
 
