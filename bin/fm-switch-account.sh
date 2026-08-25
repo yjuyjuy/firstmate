@@ -18,7 +18,7 @@
 # worker's jcode session individually. This script does exactly that.
 #
 # Usage:
-#   bin/fm-switch-account.sh <label> [pane_id ...]
+#   bin/fm-switch-account.sh <label> [pane_id ...] [--resume]
 #   bin/fm-switch-account.sh --help | --status
 #
 #   <label>     required, e.g. claude-1 or claude-2. Validated against the known
@@ -26,6 +26,17 @@
 #   --help      print usage and exit 0 without broadcasting.
 #   --status    print the currently active account and the known labels without
 #               broadcasting a switch.
+#   --resume    after the switch confirmations complete, chain into
+#               bin/fm-resume-fleet.sh to re-warm the fleet on the new account
+#               with a PACED, VERIFIED stagger (one lane at a time, a jittered
+#               60-90s gap between starts) instead of firing every lane's
+#               cold-cache turn at once. Firing all lanes together after a switch
+#               is exactly what tripped a per-minute rate limit on 2026-08-25
+#               (147 HTTP 429s in about two minutes); pacing the STARTS keeps the
+#               per-minute budget from being spent in a single burst. The flag may
+#               appear anywhere in the arguments and changes NOTHING when absent:
+#               the switch itself is byte-for-byte unchanged and its success is
+#               never masked by a lane that needs attention during the re-warm.
 #   pane_id...  optional explicit herdr targets in the full
 #               "<session>:<workspace>:<pane>" form (e.g. "default:w1J:p3"), the
 #               same value meta records in window=; if omitted, all live worker
@@ -93,12 +104,14 @@ clear_settle="${FM_SWITCH_CLEAR_SETTLE:-0.5}"
 
 usage() {
   cat >&2 <<EOF
-usage: $0 <label> [pane_id ...]
+usage: $0 <label> [pane_id ...] [--resume]
        $0 --help | --status
 
   <label>     account label to switch every live worker to (e.g. claude-1).
               Must be one of the known account labels; validated before any
               pane is touched.
+  --resume    after the switch confirmations, chain into fm-resume-fleet.sh to
+              re-warm the fleet on the new account with a paced 60-90s stagger.
   --help      show this help and exit without broadcasting.
   --status    show the active account and known labels without broadcasting.
 EOF
@@ -121,6 +134,22 @@ active_label() {
   grep -o '"active_anthropic_account"[[:space:]]*:[[:space:]]*"[^"]*"' "$auth_json" 2>/dev/null \
     | head -1 | sed 's/.*"\([^"]*\)"$/\1/'
 }
+
+# Extract the optional --resume flag from anywhere in the argument list BEFORE
+# resolving the label, so it composes with the label + explicit-pane forms and
+# never leaks into the pane targets. Absent, nothing below changes at all.
+RESUME_AFTER=0
+_args=()
+for _a in "$@"; do
+  case "$_a" in
+    --resume) RESUME_AFTER=1 ;;
+    *) _args+=("$_a") ;;
+  esac
+done
+set -- "${_args[@]:-}"
+# `${_args[@]:-}` expands to a single empty arg when no args remain; drop it so a
+# bare `--resume` (or no args) still reads as a missing label, not an empty pane.
+[ "$#" -eq 1 ] && [ -z "${1:-}" ] && shift
 
 label="${1:-}"
 
@@ -340,6 +369,25 @@ for p in "${sent_targets[@]}"; do
   fi
   printf '%s\n' "$cap" | sed 's/^/      /'
 done
+
+# --resume: re-warm the fleet on the new account with a PACED, VERIFIED stagger.
+# Chained ONLY after the switch confirmations above, so the account move is fully
+# broadcast before any lane's cold-cache turn starts. fm-resume-fleet owns all the
+# pacing/verify/escalation mechanics; this is a thin chain, never a re-implementation.
+# The re-warm's own exit status (3 when a lane needs attention) is reported but
+# never fails the switch, which already succeeded: FM_SWITCH_RESUME_BIN is the
+# seam a test stubs to assert the chain without driving the real staggered resume.
+# FM_HOME is already resolved and exported at the top of this file, so the chain
+# needs no FM_HOME prefix of its own.
+if [ "$RESUME_AFTER" = 1 ]; then
+  echo "re-warming the fleet on '$label' with a paced stagger (fm-resume-fleet.sh)..."
+  resume_bin="${FM_SWITCH_RESUME_BIN:-$script_dir/fm-resume-fleet.sh}"
+  if [ -x "$resume_bin" ]; then
+    "$resume_bin" || echo "note: paced re-warm reported lanes needing attention (the account switch itself succeeded)"
+  else
+    echo "note: --resume requested but $resume_bin is not executable; skipping the paced re-warm (the account switch itself succeeded)" >&2
+  fi
+fi
 
 if [ "${#unconfirmed[@]}" -gt 0 ]; then
   echo "WARNING: ${#unconfirmed[@]} pane(s) NOT confirmed on account '$label': ${unconfirmed[*]}" >&2

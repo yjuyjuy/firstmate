@@ -411,4 +411,68 @@ done
 [ -z "$strays" ] || fail "run left stray stderr files in repo root:$strays"
 pass "no stray e_* stderr files are created"
 
+# --- case 11: --resume chains into fm-resume-fleet AFTER the switch -------------
+# The paced re-warm (bin/fm-resume-fleet.sh) is chained only after the switch
+# confirmations, so a bulk account switch never fires every lane's cold-cache
+# turn at once (incident 2026-08-25). FM_SWITCH_RESUME_BIN is the seam: a stub
+# records that it was called and with what FM_HOME, so the chain is asserted
+# without driving the real staggered resume.
+RESUME_STUB="$TMPROOT/resume-stub.sh"
+RESUME_CALLED="$TMPROOT/resume-called"
+cat > "$RESUME_STUB" <<SH
+#!/usr/bin/env bash
+printf 'resume-called home=%s args=[%s]\n' "\${FM_HOME:-}" "\$*" >> "$RESUME_CALLED"
+exit 0
+SH
+chmod +x "$RESUME_STUB"
+
+: > "$RESUME_CALLED"
+OUT=$(cd "$REPO" && FM_HOME="$REPO" FM_SWITCH_RESUME_BIN="$RESUME_STUB" ./bin/fm-switch-account.sh claude-2 --resume 2>&1); RC=$?
+expect_code 0 "$RC" "a switch --resume must exit 0"
+assert_contains "$OUT" "re-warming the fleet" "--resume must announce the paced re-warm"
+assert_grep "send_text herdr default:w1:p2 /account claude switch claude-2" "$BACKEND_LOG" "--resume must still perform the switch before chaining"
+assert_grep "resume-called" "$RESUME_CALLED" "--resume must chain into fm-resume-fleet after the switch"
+assert_grep "home=$REPO" "$RESUME_CALLED" "the chained re-warm must inherit FM_HOME"
+pass "--resume performs the switch, then chains into the paced re-warm"
+
+# --- case 11a: --resume anywhere in the args is honored ------------------------
+: > "$RESUME_CALLED"
+: > "$BACKEND_LOG"
+OUT=$(cd "$REPO" && FM_HOME="$REPO" FM_SWITCH_RESUME_BIN="$RESUME_STUB" ./bin/fm-switch-account.sh --resume claude-2 2>&1); RC=$?
+expect_code 0 "$RC" "--resume before the label must still exit 0"
+assert_grep "send_text herdr default:w1:p2 /account claude switch claude-2" "$BACKEND_LOG" "--resume before the label must not corrupt the switch"
+assert_grep "resume-called" "$RESUME_CALLED" "--resume before the label must still chain the re-warm"
+pass "--resume is positional-agnostic in the argument list"
+
+# --- case 11b: WITHOUT --resume nothing chains (byte-unchanged default) ---------
+: > "$RESUME_CALLED"
+OUT=$(cd "$REPO" && FM_HOME="$REPO" FM_SWITCH_RESUME_BIN="$RESUME_STUB" ./bin/fm-switch-account.sh claude-2 2>&1); RC=$?
+expect_code 0 "$RC" "a plain switch must exit 0"
+assert_not_contains "$OUT" "re-warming the fleet" "a plain switch must never announce a re-warm"
+[ -s "$RESUME_CALLED" ] && fail "a plain switch must not chain the re-warm" || true
+pass "the default (no --resume) chains nothing"
+
+# --- case 11c: a failed re-warm never fails the switch itself -------------------
+# fm-resume-fleet exits 3 when a lane needs attention; the switch already
+# succeeded and must not be marked failed by the re-warm's advisory exit.
+RESUME_FAIL_STUB="$TMPROOT/resume-fail.sh"
+cat > "$RESUME_FAIL_STUB" <<'SH'
+#!/usr/bin/env bash
+echo "some lane needs attention"
+exit 3
+SH
+chmod +x "$RESUME_FAIL_STUB"
+OUT=$(cd "$REPO" && FM_HOME="$REPO" FM_SWITCH_RESUME_BIN="$RESUME_FAIL_STUB" ./bin/fm-switch-account.sh claude-2 --resume 2>&1); RC=$?
+expect_code 0 "$RC" "a re-warm that reports a needy lane must not fail the switch"
+assert_contains "$OUT" "needing attention" "a needy-lane re-warm must be reported without failing the switch"
+pass "a re-warm reporting a needy lane never fails the account switch"
+
+# --- case 11d: --resume with a missing label still exits 2 (no switch, no chain) -
+: > "$RESUME_CALLED"
+OUT=$(cd "$REPO" && FM_SWITCH_RESUME_BIN="$RESUME_STUB" ./bin/fm-switch-account.sh --resume 2>&1); RC=$?
+expect_code 2 "$RC" "a bare --resume with no label must exit 2"
+assert_contains "$OUT" "usage:" "a bare --resume must print usage"
+[ -s "$RESUME_CALLED" ] && fail "a bare --resume must never chain the re-warm" || true
+pass "--resume with no label exits 2 and chains nothing"
+
 pass "fm-switch-account.sh: all checks passed"

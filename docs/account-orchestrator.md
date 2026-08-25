@@ -26,6 +26,28 @@ There are exactly two integration points, both fail-soft.
 The manual `bin/fm-switch-account.sh` broadcast is the documented fallback for when the orchestrator is unavailable, the installed quota-axi lacks the merged verbs, or the captain wants to force a specific account by hand.
 It is not deleted; deletion is a later confidence step and a captain call.
 
+## Paced fleet re-warm after a switch
+
+After the fleet moves to a new account its prompt caches are cold, so each lane's first turn re-sends its full working context (about 120K to 180K tokens per lane).
+Starting every lane's first turn at the same instant sends that whole cold-cache burst inside one minute.
+On 2026-08-25 a burst of five simultaneous cold-cache resume steers tripped the `claude-1` account's per-minute rate limit and produced 147 HTTP 429 responses in about two minutes.
+
+`bin/fm-resume-fleet.sh` re-warms the fleet without that burst.
+It resumes the home's recorded lanes one at a time, in a deliberate order, and paces the starts so at most one large cold-cache request begins per minute.
+Its header owns the exact mechanics; the integration-level contract is:
+
+- Lane set: the supervised ship and scout lanes recorded in this home's `state/<id>.meta`, read through the same `fm_backend_of_meta` / `fm_backend_target_of_meta` helpers every other `fm-*` script uses.
+  A service sidecar meta with no backend target, a `kind=secondmate` lane (idle by contract), and a `supervise=off` pane are skipped, never treated as errors.
+- Order: an explicit `--priority <id>` lane first, then any lane whose meta records a truthy `priority=`, then the rest in stable id order.
+- Verify before advancing: after sending a lane its resume steer, the script polls for positive evidence the turn actually started, either a backend busy or working indicator or a fresh append to that lane's status file, before it moves to the next lane.
+- Pacing: a jittered gap in the 60 to 90 second window (randomized per gap, not a fixed sleep) is held before every send after the first, so N sends produce N-1 gaps and the per-minute budget is never spent in a single burst.
+- Escalation, never a silent drop: a lane that does not start a turn within the bounded verify window gets a clearly attributed `blocked:` line appended to its status file and is listed as failed in the run summary, while the remaining lanes still run, so one wedged lane never blocks the whole re-warm.
+- Idempotent: a lane already mid-turn is detected and skipped rather than poked a second time, so the script is safe to re-run.
+
+`fm-switch-account.sh --resume` chains into `fm-resume-fleet.sh` after its own switch confirmations complete, so a manual fleet account switch re-warms the fleet on the new account with the same paced stagger in one command.
+The flag changes nothing when absent, and the re-warm's advisory exit never fails the account switch, which has already succeeded by the time the re-warm runs.
+The routine watcher-driven `rotate` path actuates live sessions through `quota-axi switch` and does not itself chain this re-warm today; the paced re-warm is the manual-switch and deliberate-re-warm path.
+
 ## Versioned contracts firstmate pins to
 
 Firstmate pins to the merged quota-axi JSON contracts and never re-derives them:
