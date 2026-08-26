@@ -18,6 +18,14 @@
 #      -> test_attributes_*, test_unowned_vs_unclassified_are_distinct,
 #         test_ancestry_never_overrides_records.
 #
+# The primary memory measurement is platform-specific: top(1) on macOS, /proc
+# on Linux. The tests under "the Linux /proc reader" pin the Linux branch
+# hermetically through the FM_MEMREPORT_PROC seam (a proc-shaped directory
+# stands in for /proc, so the branch runs on ANY host) plus one native
+# end-to-end run guarded to Linux hosts. Before the fix the Linux branch did
+# not exist and the script died with RC=1 and "top(1) produced no output" on
+# every Linux host in the fleet.
+#
 # Process listings are always INJECTED (FM_MEMREPORT_TOP / _PS / _LSOF), so no
 # assertion depends on what happens to be running on the machine executing it.
 #
@@ -799,6 +807,122 @@ test_worktree_invocation_finds_the_operating_home() {
   pass "invoked from a worktree, the report resolves the operating home"
 }
 
+# --- the Linux /proc reader -------------------------------------------------
+#
+# On macOS the primary memory source is top(1). On Linux that call produces no
+# output at all, so the reader is platform-specific: /proc is enumerated, each
+# process's PSS is read from smaps_rollup (VmRSS from status when the mapping
+# table is unreadable), and the result is emitted in the SAME normalized shape
+# parse_top reads. The FM_MEMREPORT_PROC seam points the reader at a
+# proc-shaped directory instead of /proc, so the whole branch is pinned on any
+# host, macOS CI included; the native end-to-end test additionally runs the
+# real /proc on Linux hosts.
+
+LINUX_PS="$TMPROOT/linux.ps"
+LINUX_PROC="$TMPROOT/fakeproc"
+EMPTY_LSOF="$TMPROOT/empty.lsof"
+: > "$EMPTY_LSOF"
+
+build_fake_proc() {
+  rm -rf "$LINUX_PROC"
+  mkdir -p "$LINUX_PROC"
+  cat > "$LINUX_PROC/meminfo" <<'EOF'
+MemTotal:       16777216 kB
+MemAvailable:    8388608 kB
+SwapTotal:             0 kB
+SwapFree:              0 kB
+EOF
+  # 55 PSS-bearing processes clear the MIN_PROCS floor; 3050 is the self pid.
+  # 3059 has no smaps_rollup and zero VmRSS - the kernel-thread shape, which
+  # must still be counted as a 0K row so the two enumerations agree. 3060 has
+  # no smaps_rollup but a real VmRSS: the world-readable status fallback.
+  local i pid
+  for i in $(seq 1 55); do
+    pid=$(( 3000 + i ))
+    mkdir -p "$LINUX_PROC/$pid"
+    printf 'Pss:\t %d kB\n' "$(( 200000 + i ))" > "$LINUX_PROC/$pid/smaps_rollup"
+    printf 'VmRSS:\t %d kB\n' "$(( 250000 + i ))" > "$LINUX_PROC/$pid/status"
+  done
+  mkdir -p "$LINUX_PROC/3059" "$LINUX_PROC/3060"
+  printf 'VmRSS:\t 0 kB\n' > "$LINUX_PROC/3059/status"
+  printf 'VmRSS:\t 123456 kB\n' > "$LINUX_PROC/3060/status"
+  {
+    for i in $(seq 1 55); do
+      pid=$(( 3000 + i ))
+      printf '%s 900 %s root /usr/sbin/filler-%s\n' "$pid" "$(( 250000 + i ))" "$pid"
+    done
+    printf '3059 900 0 root /usr/sbin/filler-3059\n'
+    printf '3060 900 123456 root /usr/sbin/filler-3060\n'
+  } > "$LINUX_PS"
+}
+build_fake_proc
+
+run_linux_proc() {
+  FM_HOME="$HOME_DIR" \
+  FM_MEMREPORT_PROC="$LINUX_PROC" \
+  FM_MEMREPORT_PS="$LINUX_PS" \
+  FM_MEMREPORT_LSOF="$EMPTY_LSOF" \
+  FM_MEMREPORT_LISTEN="$EMPTY_LISTEN" \
+  FM_MEMREPORT_SELF_PID=3050 \
+    "$REPORT" "$@" 2>&1
+}
+
+test_linux_proc_reader_reports_pss_rows() {
+  local out rc
+  out=$(run_linux_proc --json); rc=$?
+  expect_code 0 "$rc" "the Linux /proc reader must report through the seam"
+  assert_contains "$out" '"measured": "pss"' "a /proc reading must name pss as its quantity"
+  printf '%s\n' "$out" | grep -F '"pid":3001' | grep -Fq '"footprint_kb":200001' \
+    || fail "a smaps_rollup Pss must reach the row, got: $(printf '%s\n' "$out" | grep -F '"pid":3001')"
+  printf '%s\n' "$out" | grep -F '"pid":3060' | grep -Fq '"footprint_kb":123456' \
+    || fail "an unreadable mapping table must fall back to VmRSS, got: $(printf '%s\n' "$out" | grep -F '"pid":3060')"
+  printf '%s\n' "$out" | grep -F '"pid":3059' | grep -Fq '"footprint_kb":0' \
+    || fail "a zero-RSS process must still be counted as a 0K row"
+  printf '%s\n' "$out" | grep -Fq '"physmem_used_kb": 8388608' \
+    || fail "the meminfo used total must flow into --json"
+  pass "the Linux reader emits PSS rows, VmRSS fallback, and the meminfo used total"
+}
+
+test_linux_proc_reader_refuses_when_meminfo_is_missing() {
+  local out rc broken
+  broken="$TMPROOT/brokenproc"
+  rm -rf "$broken"
+  cp -r "$LINUX_PROC" "$broken"
+  rm -f "$broken/meminfo"
+  out=$(FM_HOME="$HOME_DIR" FM_MEMREPORT_PROC="$broken" FM_MEMREPORT_PS="$LINUX_PS" \
+        FM_MEMREPORT_LSOF="$EMPTY_LSOF" FM_MEMREPORT_LISTEN="$EMPTY_LISTEN" \
+        FM_MEMREPORT_SELF_PID=3050 "$REPORT" 2>&1); rc=$?
+  expect_code 3 "$rc" "a proc tree without meminfo must refuse, not report"
+  assert_contains "$out" "REFUSING" "the refusal must say so plainly"
+  assert_not_contains "$out" "TOP PROCESSES" "a refusal must print NO ranking"
+  pass "a proc tree without meminfo refuses under the self-check"
+}
+
+test_linux_proc_reader_dies_when_proc_is_empty() {
+  local out rc empty
+  empty="$TMPROOT/emptyproc"
+  mkdir -p "$empty"
+  out=$(FM_HOME="$HOME_DIR" FM_MEMREPORT_PROC="$empty" FM_MEMREPORT_PS="$LINUX_PS" \
+        FM_MEMREPORT_LSOF="$EMPTY_LSOF" FM_MEMREPORT_LISTEN="$EMPTY_LISTEN" \
+        FM_MEMREPORT_SELF_PID=3050 "$REPORT" 2>&1); rc=$?
+  expect_code 1 "$rc" "an empty process table is an uncollectable required input"
+  assert_contains "$out" "no processes found" "the failure must name the missing table"
+  pass "an empty /proc dies with RC=1 and a clear message"
+}
+
+test_linux_native_reading_reports_real_processes() {
+  [ "$(uname -s)" = Linux ] || { pass "not a Linux host; native /proc reading skipped"; return 0; }
+  local out rc
+  out=$(FM_HOME="$HOME_DIR" "$REPORT" --limit 5 2>&1); rc=$?
+  expect_code 0 "$rc" "a native Linux reading must report with RC=0"
+  assert_not_contains "$out" "produced no output" "the macOS-only top call must not run on Linux"
+  assert_contains "$out" "TOP PROCESSES" "the native reading must print the ranking"
+  assert_contains "$out" "pss" "a native Linux reading must name pss"
+  printf '%s\n' "$out" | awk '/^Host:/ && /0 KB total/ { bad = 1 } END { exit bad + 0 }' \
+    || fail "the Host line must report the real total, not 0 KB"
+  pass "a Linux host reports a real /proc reading end to end"
+}
+
 # --- interface ---------------------------------------------------------------
 
 test_json_is_machine_readable() {
@@ -914,6 +1038,10 @@ test_healthy_attribution_is_quiet
 test_attributes_against_real_meta_records
 test_real_secondmate_home_attributes
 test_worktree_invocation_finds_the_operating_home
+test_linux_proc_reader_reports_pss_rows
+test_linux_proc_reader_refuses_when_meminfo_is_missing
+test_linux_proc_reader_dies_when_proc_is_empty
+test_linux_native_reading_reports_real_processes
 test_json_is_machine_readable
 test_json_refusal_is_not_a_document
 test_limit_and_all

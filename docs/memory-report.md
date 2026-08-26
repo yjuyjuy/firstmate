@@ -192,6 +192,22 @@ Nothing can enumerate every process while missing the one doing the asking.
 A refusal exits 3 and prints no ranking.
 That is the correct output when the instrument is broken.
 
+## Linux: /proc is the primary measurement, 2026-08-26
+
+The fleet runs on Linux, where the macOS top call (`-l 1 -n 20000 -o mem -stats pid,mem`) prints nothing and the script died with RC=1 on every run.
+The macOS top extraction above documents how the macOS side works; on Linux the primary source is /proc itself.
+Each process's `Pss:` is read from `/proc/<pid>/smaps_rollup`, with `VmRSS:` from `/proc/<pid>/status` as the fallback when the mapping table is unreadable (a mapping table needs ptrace permission; `status` is world-readable).
+PSS is the honest Linux analog of phys_footprint: it charges shared pages proportionally, so it never double-counts a shared library the way an rss sum does, and it never overstates a swapped-out process.
+The reader emits the same normalized listing shape (`Processes:` / `PhysMem:` / `PID` rows) parse_top already reads, so every self-check gate and renderer is shared with the macOS path.
+Host totals come from `/proc/meminfo`: `MemTotal` for total, `MemTotal` minus `MemAvailable` for used, and `SwapTotal` minus `SwapFree` for swap (a host with no swap reports `swap none`).
+A process whose files race to exit between `ls` and read, a kernel thread, or a zombie gets a 0K row rather than dropping out of the count, so the two enumerations keep agreeing.
+
+The one-sided 60% floor does not transfer to Linux.
+Kernel memory and page cache are not process memory, so summed pss normally sits well BELOW used memory.
+Measured on 2026-08-26 on the 31 GB fleet host: summed pss 2,956,340 kB against 9,600,480 kB used, a ratio of 30%.
+The Linux floor is anchored to the process listing instead: summed pss is refused only when it falls below 30% of the ps listing's summed rss, and the same host measured 66% (2,956,340 kB of pss against 4,442,672 kB of rss), so the floor carries a 2.2x margin below the only observation.
+The ceiling stays the 400% rule against used memory: pss cannot double-count a page, so a sum several times the machine's memory still means a broken listing.
+
 ## The attribution defect, 2026-07-24
 
 The first version of this script shipped with 25 green tests and ownership broken against every real lane on the machine.

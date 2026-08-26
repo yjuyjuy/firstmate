@@ -84,7 +84,7 @@ The shared no-mistakes gate refusal for fleet lifecycle entrypoints is summarize
 | `fm-supervise-daemon.sh` | Presence-gated away-mode sub-supervisor: self-handle routine wakes, escalate batched digests, alert on failed delivery |
 | `fm-crew-state.sh`       | Print one deterministic current-state line for a crew                                |
 | `fm-resource-check.sh`   | Print one kernel-wide host CPU/memory/swap reading with the concurrent-agent ceiling it supports |
-| `fm-memory-report.sh`    | Rank every process by phys_footprint, attribute each to its fleet owner from durable records, and refuse rather than report a broken reading (docs/memory-report.md) |
+| `fm-memory-report.sh`    | Rank every process by memory (phys_footprint on macOS, pss from /proc on Linux), attribute each to its fleet owner from durable records, and refuse rather than report a broken reading (docs/memory-report.md) |
 | `fm-tangle-lib.sh`       | Shared default-branch resolution and primary-checkout tangle classification          |
 | `fm-supervision-lib.sh`  | Shared in-flight-work-without-fresh-watcher-beacon predicate                         |
 | `fm-ff-lib.sh`           | Shared guarded fast-forward helper for origin pulls and local secondmate syncs       |

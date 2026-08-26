@@ -23,9 +23,12 @@
 #   64 usage error
 #
 # WHAT IT MEASURES. phys_footprint, the same quantity Activity Monitor's Memory
-# column shows, read from top(1) and cross-checkable with --verify. rss is shown
-# only beside it, always labelled, and never sorts the ranking: under swap the
-# two diverge badly and unevenly in BOTH directions.
+# column shows, read from top(1) and cross-checkable with --verify. On Linux the
+# measured quantity is pss, each process's proportional resident share read from
+# /proc/<pid>/smaps_rollup (VmRSS from status when a mapping table is
+# unreadable), with host totals from /proc/meminfo; the platform guard keeps
+# macOS on top(1). rss is shown only beside it, always labelled, and never sorts
+# the ranking: under swap the two diverge badly and unevenly in BOTH directions.
 #
 # HOW IT ATTRIBUTES. Every process is enumerated with no name filter deciding
 # what counts; names only label a process already counted. Ownership is read from
@@ -68,12 +71,30 @@
 # Test seams: FM_MEMREPORT_TOP and FM_MEMREPORT_PS read a captured listing from a
 # file instead of running the tool, FM_MEMREPORT_LSOF likewise for working
 # directories, FM_MEMREPORT_LISTEN likewise for listening-socket ports (a
-# pid<TAB>port listing), and FM_MEMREPORT_SELF_PID overrides which pid the
-# self-check requires to be present.
+# pid<TAB>port listing), FM_MEMREPORT_PROC points the Linux reader at a
+# proc-shaped directory instead of /proc, and FM_MEMREPORT_SELF_PID overrides
+# which pid the self-check requires to be present.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+
+# Platform split: the primary memory source is top(1) on macOS and /proc on
+# Linux, and the host totals come from different places too. Everything else -
+# parsing, self-checks, attribution, rendering - is shared, because the Linux
+# reader emits the same normalized listing shape parse_top already reads.
+case "$(uname -s)" in
+  Linux) PLATFORM=linux; OS_LABEL=linux ;;
+  Darwin) PLATFORM=macos; OS_LABEL=macOS ;;
+  *) PLATFORM=other; OS_LABEL=macOS ;;
+esac
+
+# What the ranking column measures, stated where the report names its own
+# quantity. The macOS defaults describe top(1)'s phys_footprint; the Linux
+# reader overrides them with pss.
+MEASURED_LABEL=phys_footprint
+MEASURED_DESC='the same quantity Activity Monitor shows'
+MEASURED_PAREN='Activity Monitor Memory column'
 
 # Was FM_HOME chosen by the caller, or are we falling back to this code root?
 # The distinction matters: an explicit home is honored exactly, while a fallback
@@ -127,6 +148,12 @@ COUNT_TOLERANCE_PCT=30
 # below the lowest reading actually observed, while still catching a listing that
 # has lost most of the machine's memory.
 FOOTPRINT_FLOOR_PCT=60
+# On Linux the summed pss NEVER runs above used memory: kernel memory and page
+# cache are not process memory, so the floor is anchored to the process listing
+# instead - summed pss against the ps listing's summed rss, measured 66% on
+# 2026-08-26 and floored at 30% (2.2x margin). docs/memory-report.md owns the
+# evidence for both rules.
+FOOTPRINT_FLOOR_PCT_LINUX=30
 # The upper bound on the same ratio, guarding double-counted rows rather than a
 # truncated listing. Set far above the observed 111-126% so ordinary shared
 # memory never trips it.
@@ -191,18 +218,80 @@ SELF_PID=${FM_MEMREPORT_SELF_PID:-$$}
 
 # --- collection -------------------------------------------------------------
 
-# top(1) is the primary measurement: its MEM column is phys_footprint (see
-# MEASUREMENT above). Captured whole so the header counters used by the
-# self-check come from the SAME sample as the per-process numbers.
+# top(1) is the primary measurement on macOS: its MEM column is phys_footprint
+# (see MEASUREMENT above). Captured whole so the header counters used by the
+# self-check come from the SAME sample as the per-process numbers. Linux gets
+# the /proc reader below; the two share one output shape.
 collect_top() {
   if [ -n "${FM_MEMREPORT_TOP:-}" ]; then
     [ -r "$FM_MEMREPORT_TOP" ] || die "FM_MEMREPORT_TOP is not readable: $FM_MEMREPORT_TOP"
     cat "$FM_MEMREPORT_TOP" > "$TMP/top.raw"
     return 0
   fi
+  if [ -n "${FM_MEMREPORT_PROC:-}" ] || [ "$PLATFORM" = linux ]; then
+    collect_top_linux
+    return 0
+  fi
   command -v top >/dev/null 2>&1 || die "top(1) not found; it is the primary memory source"
   top -l 1 -n 20000 -o mem -stats pid,mem > "$TMP/top.raw" 2>/dev/null || true
   [ -s "$TMP/top.raw" ] || die "top(1) produced no output"
+}
+
+# Linux primary source: enumerate /proc and read each process's PSS in one pass,
+# then emit a listing in the SAME normalized shape parse_top reads (Processes: /
+# PhysMem: / PID rows), so every downstream gate and renderer is shared with the
+# macOS path. PSS is the honest Linux analog of phys_footprint: unlike rss it
+# charges shared pages proportionally, so it never double-counts a shared
+# library and never overstates a swapped-out process. When smaps_rollup is
+# unreadable (a mapping table needs ptrace permission), fall back to VmRSS from
+# status, which is world-readable; that is a fact about readability, not about
+# ownership, and the process is still counted - the same stance the lsof-denied
+# cwd takes. A zero-RSS process (kernel thread, zombie) still gets its 0K row so
+# the two enumerations keep agreeing.
+collect_top_linux() {
+  local procdir used_kb n p
+  local -a pids=()
+  procdir=${FM_MEMREPORT_PROC:-/proc}
+  [ -d "$procdir" ] || die "the process table is not readable: $procdir"
+  used_kb=$(awk '
+    /^MemTotal:/ { t = $2 }
+    /^MemAvailable:/ { a = $2 }
+    END { printf "%d", (t > a ? t - a : 0) }
+  ' "$procdir/meminfo" 2>/dev/null || printf '0')
+  for p in "$procdir"/[0-9]*; do
+    [ -d "$p" ] || continue
+    pids+=("${p##*/}")
+  done
+  [ "${#pids[@]}" -gt 0 ] || die "no processes found under $procdir"
+  n=${#pids[@]}
+  MEASURED_LABEL=pss
+  MEASURED_DESC='the per-process proportional resident share, summed from /proc'
+  MEASURED_PAREN='proportional resident share from /proc'
+  {
+    printf 'Processes: %s total\n' "$n"
+    printf 'PhysMem: %sK used (from /proc/meminfo)\n' "$used_kb"
+    printf 'PID    MEM   COMMAND\n'
+    printf '%s\n' "${pids[@]}" | sort -n | awk -v proc="$procdir" '
+      {
+        pid = $0
+        kb = 0
+        f = proc "/" pid "/smaps_rollup"
+        while ((getline line < f) > 0) {
+          if (line ~ /^Pss:/) { split(line, a, " "); kb = a[2] + 0; break }
+        }
+        close(f)
+        if (kb == 0) {
+          f = proc "/" pid "/status"
+          while ((getline line < f) > 0) {
+            if (line ~ /^VmRSS:/) { split(line, a, " "); kb = a[2] + 0; break }
+          }
+          close(f)
+        }
+        printf "%s  %dK  proc\n", pid, kb
+      }
+    '
+  } > "$TMP/top.raw"
+  [ -s "$TMP/top.raw" ] || die "the /proc reading produced no output"
 }
 
 collect_ps() {
@@ -383,19 +472,34 @@ run_self_check() {
               "attribution built on disagreeing listings would be arbitrary"
 
   [ "$physmem_used" -gt 0 ] \
-    || refuse "top(1)'s PhysMem line did not parse" \
+    || refuse "the memory source's PhysMem line did not parse" \
               "without the machine's real used memory there is nothing to sanity-check against"
 
   # Trap 1's decisive gate: 31 daemons topping out at 24 MB would sum to well
-  # under 1% of used memory. Real readings run ABOVE used memory (footprint
+  # under 1% of used memory. Real mac readings run ABOVE used memory (footprint
   # counts compressed pages and shared regions per process; this machine
   # measured 17.6 GB summed against 14 GB used), so the floor is one-sided.
-  local sum_kb floor_kb ceil_kb
+  # Linux never shows that shape - kernel memory and page cache are not process
+  # memory, so summed pss sits well below used - and the floor is anchored to
+  # the process listing itself: summed pss against the ps listing's summed rss
+  # (docs/memory-report.md owns the evidence).
+  local sum_kb floor_kb ceil_kb floor_ref floor_units
   sum_kb=$(awk -F'\t' '{ s += $2 } END { printf "%d", s }' "$TMP/top.tsv")
-  floor_kb=$(( physmem_used * FOOTPRINT_FLOOR_PCT / 100 ))
+  if [ "$PLATFORM" = linux ]; then
+    floor_ref=$(awk -F'\t' '{ s += $3 } END { printf "%d", s + 0 }' "$TMP/ps.tsv")
+    [ "$floor_ref" -gt 0 ] \
+      || refuse "the process listing carries no memory at all" \
+                "ps(1) yielded $ps_count rows but zero summed rss, so nothing can be sanity-checked"
+    floor_kb=$(( floor_ref * FOOTPRINT_FLOOR_PCT_LINUX / 100 ))
+    floor_units='summed resident size'
+  else
+    floor_ref=$physmem_used
+    floor_kb=$(( physmem_used * FOOTPRINT_FLOOR_PCT / 100 ))
+    floor_units='used memory'
+  fi
   [ "$sum_kb" -ge "$floor_kb" ] \
     || refuse "the measured total is impossibly small for this machine" \
-              "summed footprint $(fmt_kb "$sum_kb") against $(fmt_kb "$physmem_used") of used memory" \
+              "summed footprint $(fmt_kb "$sum_kb") against $(fmt_kb "$floor_ref") of $floor_units" \
               "the listing is missing most of the machine's memory; it is filtered or truncated"
 
   # The other side of the same plausibility question. Exceeding used memory is
@@ -738,7 +842,7 @@ classify_rows() {
           } else if (k[p] == "editor" || k[p] == "lsp" || k[p] == "tooling") {
             okindof[p] = "tooling"; olabelof[p] = "editor / language tooling"
           } else if (k[p] == "system") {
-            okindof[p] = "system"; olabelof[p] = "macOS"; via[p] = "path"
+            okindof[p] = "system"; olabelof[p] = OSLABEL; via[p] = "path"
           } else if (c != "") {
             okindof[p] = "unowned"; olabelof[p] = "no record claims it"
           } else {
@@ -752,7 +856,7 @@ classify_rows() {
           p, ppid[p], f, rss[p], user[p], okindof[p], olabelof[p], via[p], k[p], fl, (c == "" ? "-" : c), cmd[p]
       }
     }
-  ' OWN="$TMP/owners.tsv" CWDF="$TMP/cwd.tsv" GITF="$TMP/gitcwd.tsv" TOPF="$TMP/top.tsv" PSF="$TMP/ps.tsv" LISTENF="$TMP/listen.tsv" \
+  ' OWN="$TMP/owners.tsv" CWDF="$TMP/cwd.tsv" GITF="$TMP/gitcwd.tsv" TOPF="$TMP/top.tsv" PSF="$TMP/ps.tsv" LISTENF="$TMP/listen.tsv" OSLABEL="$OS_LABEL" \
     "$TMP/owners.tsv" "$TMP/cwd.tsv" "$TMP/gitcwd.tsv" "$TMP/top.tsv" "$TMP/listen.tsv" "$TMP/ps.tsv" \
     | sort -t$'\t' -k3,3nr > "$TMP/rows.tsv"
 }
@@ -769,15 +873,34 @@ fmt_kb() {
 
 host_line() {
   local total_b total_kb swap
-  total_b=$(sysctl -n hw.memsize 2>/dev/null || echo 0)
-  total_kb=$(( total_b / 1024 ))
-  swap=$(sysctl -n vm.swapusage 2>/dev/null | awk '
-    { for (i = 1; i <= NF; i++) {
-        if ($i == "total") t = $(i + 2)
-        if ($i == "used") u = $(i + 2)
+  if [ "$PLATFORM" = linux ]; then
+    # /proc/meminfo is the Linux sysctl's place: MemTotal, and used is MemTotal
+    # minus MemAvailable (the same quantity the self-check computes).
+    total_kb=$(awk '/^MemTotal:/ { print $2; exit }' /proc/meminfo)
+    swap=$(awk '
+      function fmt(kb) {
+        if (kb >= 1024 * 1024) return sprintf("%.2f GB", kb / 1024 / 1024)
+        if (kb >= 1024) return sprintf("%.0f MB", kb / 1024)
+        return sprintf("%.0f KB", kb)
       }
-      if (t != "") printf "swap %s used of %s", u, t
-    }')
+      /^SwapTotal:/ { t = $2; next }
+      /^SwapFree:/ { f = $2 }
+      END {
+        if (t > 0) printf "swap %s used of %s", fmt(t - f), fmt(t)
+        else printf "swap none"
+      }
+    ' /proc/meminfo)
+  else
+    total_b=$(sysctl -n hw.memsize 2>/dev/null || echo 0)
+    total_kb=$(( total_b / 1024 ))
+    swap=$(sysctl -n vm.swapusage 2>/dev/null | awk '
+      { for (i = 1; i <= NF; i++) {
+          if ($i == "total") t = $(i + 2)
+          if ($i == "used") u = $(i + 2)
+        }
+        if (t != "") printf "swap %s used of %s", u, t
+      }')
+  fi
   printf 'Host: %s total | %s used | %s\n' \
     "$(fmt_kb "$total_kb")" "$(fmt_kb "$SELF_PHYSMEM_USED")" "${swap:-swap unknown}"
 }
@@ -895,7 +1018,7 @@ render_reclaim() {
 render_table() {
   local count=$limit
   [ "$show_all" -eq 1 ] && count=$(wc -l < "$TMP/rows.tsv" | tr -d ' ')
-  printf '\nTOP PROCESSES by phys_footprint (Activity Monitor Memory column)\n'
+  printf '\nTOP PROCESSES by %s (%s)\n' "$MEASURED_LABEL" "$MEASURED_PAREN"
   printf '  %-7s %10s %10s  %-7s %-9s %-30s %s\n' PID FOOTPRINT RSS KIND VIA OWNER COMMAND
   head -n "$count" "$TMP/rows.tsv" | while IFS=$'\t' read -r pid _ppid fpkb rsskb _user okind olabel via kind flags _cwd cmd; do
     local owner
@@ -933,7 +1056,7 @@ render_json() {
   printf '  "physmem_used_kb": %s,\n' "$SELF_PHYSMEM_USED"
   printf '  "footprint_sum_kb": %s,\n' "$SELF_FOOTPRINT_SUM"
   printf '  "process_count": %s,\n' "$SELF_PS_COUNT"
-  printf '  "measured": "phys_footprint",\n'
+  printf '  "measured": "%s",\n' "$MEASURED_LABEL"
   printf '  "records_home": "%s",\n' "$STATE"
   printf '  "fleet_records": %s,\n' \
     "$FLEET_RECORD_COUNT"
@@ -1028,7 +1151,7 @@ if [ "$mode" = json ]; then
 fi
 
 host_line
-printf 'Reading: %s processes, phys_footprint - the same quantity Activity Monitor shows.\n' "$SELF_PS_COUNT"
+printf 'Reading: %s processes, %s - %s.\n' "$SELF_PS_COUNT" "$MEASURED_LABEL" "$MEASURED_DESC"
 printf 'Ownership read from %s fleet records in %s against each working directory.\n' \
   "$FLEET_RECORD_COUNT" "$STATE"
 [ -n "${FM_HOME_REDIRECTED:-}" ] \
