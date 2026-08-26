@@ -85,7 +85,11 @@
 #   config reread generations because the new agent reads the converged files.
 #   --scout records kind=scout in the task's meta (report deliverable, scratch worktree;
 #   see AGENTS.md task lifecycle); --secondmate records kind=secondmate and launches in a
-#   provisioned firstmate home; the default is kind=ship.
+#   provisioned firstmate home; --interactive records kind=interactive and implies
+#   --unsupervised (a captain-driven hands-off pane; report deliverable, scratch
+#   worktree, exactly like a scout for teardown; see fm-brief.sh --interactive and
+#   AGENTS.md task lifecycle); the default is kind=ship.
+#   --scout, --secondmate, and --interactive are mutually exclusive.
 #   --unsupervised records supervise=off in the task's meta and installs NO
 #   turn-end hook, and the watcher (bin/fm-watch.sh recorded_windows) drops any
 #   supervise=off pane from every supervision path: the stale/wedge loop, the
@@ -94,9 +98,10 @@
 #   pokes. It exists for a live interview firstmate must not touch (the
 #   grilling-handoff griller pane); any firstmate injection would corrupt that
 #   interview. supervise=off is orthogonal to kind and combines with the default
-#   ship kind or with --scout; it is refused with --secondmate (a secondmate is
-#   supervised through its status writes by design). The default omits the field,
-#   so an ordinary spawn's meta stays byte-identical (absent supervise= means on).
+#   ship kind or with --scout; --interactive implies it. It is refused with
+#   --secondmate (a secondmate is supervised through its status writes by design).
+#   The default omits the field, so an ordinary spawn's meta stays byte-identical
+#   (absent supervise= means on).
 #   Before a secondmate launch, the home is locally fast-forwarded to the primary
 #   default-branch commit when safe; skipped syncs warn and launch unchanged.
 #   Ship/scout spawns refuse to launch unless the project is one of THIS home's
@@ -266,6 +271,7 @@ if [ -z "${FM_SPAWN_NO_GUARD:-}" ]; then
   esac
 fi
 KIND=ship
+KIND_FLAGS=0
 UNSUPERVISED=off
 HARNESS_ARG=
 MODEL=
@@ -301,8 +307,9 @@ for a in "$@"; do
     continue
   fi
   case "$a" in
-    --scout) KIND=scout ;;
-    --secondmate) KIND=secondmate ;;
+    --scout) KIND=scout; KIND_FLAGS=$((KIND_FLAGS + 1)) ;;
+    --secondmate) KIND=secondmate; KIND_FLAGS=$((KIND_FLAGS + 1)) ;;
+    --interactive) KIND=interactive; KIND_FLAGS=$((KIND_FLAGS + 1)); UNSUPERVISED=on ;;
     --unsupervised) UNSUPERVISED=on ;;
     --harness) want_value=harness ;;
     --harness=*) HARNESS_ARG=${a#--harness=}; HARNESS_SET=1 ;;
@@ -329,7 +336,9 @@ done
 [ "$MODEL_SET" -eq 0 ] || [ -n "$MODEL" ] || { echo "error: --model requires a non-empty value" >&2; exit 1; }
 [ "$EFFORT_SET" -eq 0 ] || [ -n "$EFFORT" ] || { echo "error: --effort requires a non-empty value" >&2; exit 1; }
 [ "$BACKEND_SET" -eq 0 ] || [ -n "$BACKEND_ARG" ] || { echo "error: --backend requires a non-empty value" >&2; exit 1; }
-# --unsupervised is a hands-off crewmate/scout pane; a secondmate is supervised
+# The kind flags name mutually exclusive deliverable shapes, so at most one is valid.
+[ "$KIND_FLAGS" -le 1 ] || { echo "error: --scout, --secondmate, and --interactive are mutually exclusive" >&2; exit 1; }
+# --unsupervised is a hands-off crewmate/scout/interactive pane; a secondmate is supervised
 # through its own status writes by design, so the combination is contradictory.
 [ "$UNSUPERVISED" = off ] || [ "$KIND" != secondmate ] || { echo "error: --unsupervised cannot combine with --secondmate" >&2; exit 1; }
 # Validate each --env KEY=VAL form. KEY must be a POSIX shell env-var name
@@ -520,6 +529,8 @@ if [ "${#POS[@]}" -gt 0 ] && [ "${POS[0]}" != "$idpart" ] && case "$idpart" in *
       continue
     elif [ "$KIND" = scout ]; then
       if FM_SPAWN_NO_GUARD=1 "$FM_ROOT/bin/fm-spawn.sh" "${pair%%=*}" "${pair#*=}" "${shared_args[@]+"${shared_args[@]}"}" --scout; then :; else echo "batch: FAILED to spawn ${pair%%=*} (${pair#*=})" >&2; rc=1; fi
+    elif [ "$KIND" = interactive ]; then
+      if FM_SPAWN_NO_GUARD=1 "$FM_ROOT/bin/fm-spawn.sh" "${pair%%=*}" "${pair#*=}" "${shared_args[@]+"${shared_args[@]}"}" --interactive; then :; else echo "batch: FAILED to spawn ${pair%%=*} (${pair#*=})" >&2; rc=1; fi
     else
       if FM_SPAWN_NO_GUARD=1 "$FM_ROOT/bin/fm-spawn.sh" "${pair%%=*}" "${pair#*=}" "${shared_args[@]+"${shared_args[@]}"}"; then :; else echo "batch: FAILED to spawn ${pair%%=*} (${pair#*=})" >&2; rc=1; fi
     fi

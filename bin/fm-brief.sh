@@ -6,10 +6,22 @@
 # description, acceptance criteria, and context, and may adjust other sections
 # when the task genuinely deviates (e.g. working an existing external PR instead
 # of shipping a new one).
-# Usage: fm-brief.sh <task-id> <repo-name> [--scout] [--herdr-lab]
+# Usage: fm-brief.sh <task-id> <repo-name> [--scout|--interactive] [--herdr-lab]
 #        fm-brief.sh <task-id> --secondmate {<project>...|--no-projects}
 #   --scout writes the scout contract instead: the deliverable is a report at
 #   data/<task-id>/report.md (no branch, no push, no PR) and the worktree is scratch.
+#   --interactive writes the interactive contract: a captain-driven hands-off pane
+#   where the human performs the manual, irreversible, and money-path steps while the
+#   in-pane agent assists (hands the next script/click/query, verifies the captain's
+#   reported result, advances). It makes NO product edits and drives NO pipeline. Its
+#   deliverable is a session log at data/<task-id>/report.md and the worktree is
+#   scratch, exactly like a scout; it uses the scout status protocol. The brief bakes
+#   in the money-path rule (every production write runs DRY_RUN first, CONFIRM only
+#   after the captain approves the exact preview). --interactive is dispatched with
+#   fm-spawn.sh --interactive, which records kind=interactive and implies
+#   --unsupervised (supervise=off) so the pane is dropped from every supervision path.
+#   --scout, --secondmate, and --interactive are mutually exclusive; --interactive
+#   rejects --herdr-lab like --secondmate does (it drives no Herdr lifecycle).
 #   --secondmate writes a persistent secondmate charter. The project list
 #   is cloned into the secondmate home, while the natural-language scope
 #   tells the main firstmate when to route work there; routine churn stays in its own home;
@@ -113,10 +125,12 @@ KIND=ship
 HERDR_LAB=0
 NO_PROJECTS=0
 POS=()
+KIND_FLAGS=0
 for a in "$@"; do
   case "$a" in
-    --scout) KIND=scout ;;
-    --secondmate) KIND=secondmate ;;
+    --scout) KIND=scout; KIND_FLAGS=$((KIND_FLAGS + 1)) ;;
+    --secondmate) KIND=secondmate; KIND_FLAGS=$((KIND_FLAGS + 1)) ;;
+    --interactive) KIND=interactive; KIND_FLAGS=$((KIND_FLAGS + 1)) ;;
     --herdr-lab) HERDR_LAB=1 ;;
     --no-projects) NO_PROJECTS=1 ;;
     *) POS+=("$a") ;;
@@ -124,7 +138,20 @@ for a in "$@"; do
 done
 ID=${POS[0]}
 
+# The kind flags name mutually exclusive deliverable shapes, so at most one is valid.
+if [ "$KIND_FLAGS" -gt 1 ]; then
+  echo "error: --scout, --secondmate, and --interactive are mutually exclusive" >&2
+  exit 1
+fi
+
 if [ "$KIND" = secondmate ] && [ "$HERDR_LAB" -eq 1 ]; then
+  echo "error: --herdr-lab applies only to crewmate ship or scout briefs" >&2
+  exit 1
+fi
+
+# An interactive lane is a captain-driven pane that makes no product edits and drives
+# no Herdr lifecycle, so the Herdr lab contract is contradictory with it.
+if [ "$KIND" = interactive ] && [ "$HERDR_LAB" -eq 1 ]; then
   echo "error: --herdr-lab applies only to crewmate ship or scout briefs" >&2
   exit 1
 fi
@@ -450,6 +477,86 @@ EOF
 echo "scaffolded: $BRIEF (scout; replace {TASK})"
 exit 0
 fi
+
+if [ "$KIND" = interactive ]; then
+cat > "$BRIEF" <<EOF
+You are an interactive assistant managed by firstmate. You assist the CAPTAIN through interactive steps in a dedicated hands-off pane. Work at the captain's pace; the captain drives.
+
+# Task
+{TASK}
+
+# Your role
+You assist the CAPTAIN through the interactive steps. You make NO product edits and drive NO pipeline.
+The human performs every action; you hand the exact next step (the script, click, or query), verify the result the captain reports, then advance to the next step.
+You are a checklist runner and verifier, not an actor: you never perform a destructive, irreversible, or money-path step yourself.
+
+$HERDR_SECTION
+
+# Money-path safety - HARD RULE
+Every production write runs DRY_RUN first.
+Show the captain the preview: the counts, the dollar amounts, and the affected ids.
+Advance to CONFIRM ONLY after the captain explicitly approves that exact preview.
+Never run a CONFIRM step on your own, and never decide a destructive or irreversible step yourself: present it, let the captain perform it, verify the result, and advance.
+An interactive pane grants ISOLATION and FOCUS, not expanded approval, merge, or destructive authority.
+
+# Setup
+You are in a disposable git worktree of $REPO, at a detached HEAD on a clean default branch.
+This is an INTERACTIVE task: the deliverable is a written session log, not a PR.
+The worktree is a scratchpad host for you; it is discarded at teardown, so anything worth keeping lives in the session log.
+You open no branch, push no branch, and open no PR.
+
+# Rules
+1. Never push to any remote and never open a PR. Never edit product code; if the session reveals a code fix is needed, say so in the session log so firstmate can open a SEPARATE ship task - never smuggle a code change through this pane.
+2. Stay inside this worktree; the only files you may write outside it are the session log and the status file below.
+3. Use gh-axi for GitHub operations and chrome-devtools-axi for browser operations.
+4. Report status by appending one line:
+   \`echo "{state}: {one short line}" >> $STATUS_FILE\`
+   States: working, needs-decision, blocked, $PAUSED_VERB, done, failed.
+   Each append wakes firstmate, so report sparingly: only phase changes a supervisor
+   would act on and the needs-decision/blocked/paused/done/failed states. No step-by-step
+   FYI progress lines. Because this pane is hands-off (\`supervise=off\`), firstmate does not
+   peek at it: your status line is the only channel firstmate reads.
+   Use \`$PAUSED_VERB: {why}\` - distinct from \`blocked:\` - ONLY when you are deliberately idling on a
+   known external wait you expect to clear on its own (the captain stepped away, an upstream window):
+   firstmate then leaves your idle pane alone and rechecks it on a long cadence.
+   Use \`blocked:\` when you are stuck and need help.
+   A Claude/auth session-limit, a usage-window or quota exhaustion, or a revoked/expired token is
+   NOT such a wait: it is captain-fixable (switch account or relog in), so report it \`blocked:\`, never \`$PAUSED_VERB:\`.
+5. If you hit the same obstacle twice, append \`blocked: {why}\` and stop; firstmate will help.
+6. When a step needs a human decision the captain has not yet made (a product choice, a destructive or irreversible action, an ask-user finding),
+   append \`needs-decision: {summary of options}\` and stop. Firstmate relays the captain's decision.
+   When firstmate replies or a blocker clears and you resume, append \`resolved: {how it was decided or unblocked}\` (add the same \`[key=<slug>]\` if you opened it with one) so the decision or blocker is durably closed and does not keep resurfacing.
+7. Never stop, restart, or update the shared \`no-mistakes\` daemon - it is one instance serving
+   every lane/home. On ANY no-mistakes daemon error, append \`blocked: {the daemon error}\` and stop; only firstmate manages the daemon.
+8. Run every heavy command - unit suites, end-to-end suites, lint sweeps, builds - through
+   \`$FM_ROOT/bin/fm-heavy-run.sh --task $ID -- <command>\`. It queues the run so the whole fleet
+   is not thrashing one machine, then gives you the command's real output and exit status.
+   It prints a queued notice while you wait; that is normal, not a hang.
+   Cap test parallelism at \`VITEST_MAX_WORKERS=2\` - never 4: vitest sizes its pool from the CPU
+   count and is the fleet's dominant memory consumer.
+9. Announce every test run in the status file: \`working: TEST START - {what is running, rough scale}\`
+   before it, \`working: TEST END - {outcome}\` after it. Firstmate coordinates the shared machine
+   from those two lines, so a silent suite is a defect.
+10. Announce live browser use in the status file so the shared-machine log shows browser activity:
+   \`working: BROWSER START - {what you will drive}\` before it, \`working: BROWSER END - {outcome}\`
+   after it. This is a non-blocking coordination announce only - never wait on firstmate for a slot.
+
+$CAPTAIN_RULES
+
+# Test coverage declaration
+If this session ran or added any test, your session log must state plainly whether that work was built test-first and whether it has end-to-end coverage.
+A gap does not block anything, but name the gap and its reason; the captain reviews every untested product change.
+
+# Definition of done
+Write the SESSION LOG to \`$DATA/$ID/report.md\`.
+The log must stand alone: every step handed to the captain, what the captain executed, DRY_RUN counts versus CONFIRM counts, dollar amounts, affected ids, and before/after evidence. It is the durable record of a money-path operation and must survive teardown.
+Before reporting done, read and follow \`$FM_ROOT/.agents/skills/decision-hold-lifecycle/SKILL.md\` and pass its shared completion gate for the session log and any visual review.
+When the guided steps are finished and the log is complete, append \`done: {one-line outcome}\` to the status file and stop.
+EOF
+echo "scaffolded: $BRIEF (interactive; replace {TASK})"
+exit 0
+fi
+
 
 # Ship task: shape Setup / Rule 1 / Definition of done by the project's delivery mode.
 # yolo does not affect the brief (it governs firstmate's approval behaviour), so discard it.

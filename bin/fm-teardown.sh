@@ -196,7 +196,7 @@ TICKET_MERGE_EVIDENCE=
 # IS that commit. When genuinely unknown, stay empty rather than guessing.
 PR_HEAD_META=$(grep '^pr_head=' "$META" | tail -1 | cut -d= -f2- || true)
 LANDING_SHA=$PR_HEAD_META
-if [ -z "$LANDING_SHA" ] && [ "$KIND" != scout ] && [ "$KIND" != secondmate ] \
+if [ -z "$LANDING_SHA" ] && [ "$KIND" != scout ] && [ "$KIND" != interactive ] && [ "$KIND" != secondmate ] \
    && { [ "$MODE" = direct-push ] || [ "$MODE" = local-only ]; } \
    && [ -n "$WT" ] && [ -d "$WT" ]; then
   LANDING_SHA=$(git -C "$WT" rev-parse --verify HEAD 2>/dev/null || true)
@@ -685,7 +685,7 @@ record_pushed_unmerged_to_merge_queue() {
 capture_ticket_merge_evidence() {
   local branch name origin_default origin_branch
   TICKET_MERGE_EVIDENCE=
-  case "$KIND" in scout|secondmate) return 0 ;; esac
+  case "$KIND" in scout|interactive|secondmate) return 0 ;; esac
   [ "$MODE" != local-only ] || return 0
   [ -n "$WT" ] && [ -d "$WT" ] || return 0
 
@@ -737,7 +737,7 @@ backlog_refresh_reminder() {
   [ "$KIND" = secondmate ] && return 0
   if fm_tasks_axi_backend_available "$CONFIG"; then
     case "$KIND" in
-      scout)
+      scout|interactive)
         report_path="data/$ID/report.md"
         done_cmd="tasks-axi done $ID --report $report_path"
         ;;
@@ -1005,7 +1005,7 @@ validate_worktree_teardown_safety() {
   [ -d "$WT" ] || return 0
   [ "$FORCE" != "--force" ] || return 0
   case "$KIND" in
-    secondmate|scout) return 0 ;;
+    secondmate|scout|interactive) return 0 ;;
   esac
 
   if ! dirty_raw=$(git -C "$WT" status --porcelain 2>/dev/null); then
@@ -1561,16 +1561,16 @@ if [ "$FORCE" != "--force" ] && fm_tasks_axi_backend_available "$CONFIG"; then
   fi
 fi
 
-if [ "$KIND" = scout ] && [ "$FORCE" != "--force" ]; then
+if { [ "$KIND" = scout ] || [ "$KIND" = interactive ]; } && [ "$FORCE" != "--force" ]; then
   REPORT="$DATA/$ID/report.md"
   if [ ! -f "$REPORT" ]; then
-    echo "REFUSED: scout task $ID has no report at $REPORT." >&2
+    echo "REFUSED: $KIND task $ID has no report at $REPORT." >&2
     echo "The report is the work product. Have the crewmate write it, or use --force after explicit discard approval." >&2
     exit 1
   fi
   if ! FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" FM_DATA_OVERRIDE="$DATA" \
       FM_CONFIG_OVERRIDE="$CONFIG" "$SCRIPT_DIR/fm-decision-hold.sh" verify "$ID" >/dev/null; then
-    echo "REFUSED: scout task $ID has not passed the unresolved-decision completion gate." >&2
+    echo "REFUSED: $KIND task $ID has not passed the unresolved-decision completion gate." >&2
     echo "Inventory its report and any visual review through bin/fm-decision-hold.sh before teardown." >&2
     exit 1
   fi
