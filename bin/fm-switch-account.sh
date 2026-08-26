@@ -90,6 +90,10 @@ send_settle="${FM_SWITCH_SEND_SETTLE:-1}"
 confirm_wait="${FM_SWITCH_CONFIRM_WAIT:-5}"
 # Settle between the Escape that clears a pending composer and the re-check.
 clear_settle="${FM_SWITCH_CLEAR_SETTLE:-0.5}"
+# Optional stagger between consecutive panes, to avoid a thundering-herd re-auth
+# against Anthropic when a large fleet switches at once. Default 3s spaces the
+# switch out; set to 0 for the old back-to-back behavior.
+pane_stagger="${FM_SWITCH_PANE_STAGGER:-3}"
 
 usage() {
   cat >&2 <<EOF
@@ -298,11 +302,15 @@ send_switch_to() {  # <backend> <target>
 
 # First pass: send to every target, remembering which panes to verify.
 sent_targets=()
-for p in "${panes[@]}"; do
+for i in "${!panes[@]}"; do
+  p="${panes[$i]}"
   backend="${target_backends[$p]:-herdr}"
   if send_switch_to "$backend" "$p"; then
     sent_targets+=("$p")
   fi
+  # Stagger before the next pane so a large fleet does not re-auth in lockstep.
+  # Skip after the last pane (no next send to space out).
+  [ "$pane_stagger" != 0 ] && [ "$i" -lt "$((${#panes[@]} - 1))" ] && sleep "$pane_stagger"
 done
 
 echo "waiting for confirmations..."
