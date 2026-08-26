@@ -33,7 +33,7 @@
 #   9. a dead endpoint is SKIPPED (recovery's job, not a re-warm).
 #  10. the jittered gap between two real sends is within [min,max] and there is
 #      exactly ONE gap for two sends (paced between requests, no trailing wait).
-#  11. a send that does not land is escalated and does NOT pace the next lane.
+#  11. a swallowed middle send is escalated but still leaves the next lane paced.
 #  12. an explicit --priority id is resumed before a meta-priority lane.
 set -u
 
@@ -338,20 +338,22 @@ gapval=$(grep -E '^[0-9]+$' "$GAPLOG" | head -1)
 [ "$gapval" = 5 ] || fail "a min==max window must pick exactly that gap (got $gapval)"
 pass "the pacing window is configurable and respected"
 
-# --- case 11: a send that does not land is escalated and does NOT pace next -----
+# --- case 11: a swallowed middle send still leaves the next lane paced ----------
 reset_controls
-seed_state alpha bravo
-# alpha's send is swallowed (pending); bravo then confirms. The swallowed send
-# must NOT have spent the per-minute budget, so no pacing gap precedes bravo.
-printf 'pending\n' > "$SENDVERDICT/$(sanitize "$(target_of alpha)")"
-printf 'idle\nbusy\n' > "$BUSY/$(sanitize "$(target_of bravo)")"
+seed_state alpha bravo charlie
+# alpha lands, bravo's send is swallowed (pending), charlie lands. The swallowed
+# bravo must neither consume nor suppress the gap that must separate alpha's and
+# charlie's real cold-cache starts: exactly ONE pacing gap (alpha->charlie).
+printf 'pending\n' > "$SENDVERDICT/$(sanitize "$(target_of bravo)")"
+printf 'idle\nbusy\n' > "$BUSY/$(sanitize "$(target_of alpha)")"
+printf 'idle\nbusy\n' > "$BUSY/$(sanitize "$(target_of charlie)")"
 run_resume
 expect_code 3 "$RC" "a fleet with a non-landing send must exit 3"
-assert_grep "blocked:" "$REPO/state/alpha.status" "a non-landing send must escalate the lane durably"
+assert_grep "blocked:" "$REPO/state/bravo.status" "a non-landing send must escalate the lane durably"
 gaps=$(grep -cE '^[0-9]+$' "$GAPLOG" || true)
-[ "$gaps" = 0 ] || fail "a swallowed send must not pace the next lane (got $gaps gaps)"
-assert_contains "$OUT" "confirmed: bravo" "the next lane must still run after a swallowed send"
-pass "a send that does not land is escalated and does not pace the next lane"
+[ "$gaps" = 1 ] || fail "a swallowed middle send must still leave the next lane paced against the last landed send (got $gaps gaps)"
+assert_contains "$OUT" "confirmed:" "the remaining lanes must still run after a swallowed send"
+pass "a swallowed middle send still leaves the next lane paced against the last landed send"
 
 # --- case 12: an explicit --priority id beats a meta-priority lane -------------
 reset_controls

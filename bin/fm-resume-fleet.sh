@@ -345,7 +345,7 @@ fi
 confirmed=()
 skipped=()
 failed=()
-first_send=1
+gap_owed=0
 
 for i in "${order[@]}"; do
   id="${ids[$i]}"
@@ -386,14 +386,16 @@ for i in "${order[@]}"; do
     continue
   fi
 
-  # Pace BEFORE every send after the first: N sends -> N-1 jittered gaps, always
-  # between real requests, never after a skip and never a trailing wait.
-  if [ "$first_send" = 0 ]; then
+  # Pace BEFORE a send when a prior send LANDED owes a gap. The owe is cleared by
+  # paying ONE gap, so a swallowed send that fires right after the paid gap does
+  # not start a real turn and needs no second gap: two real cold-cache starts stay
+  # a full jittered gap apart. Only a real landing re-owes. Never a trailing wait.
+  if [ "$gap_owed" = 1 ]; then
     gap=$(pick_gap)
     echo "  pacing ${gap}s before next lane (jittered ${min_gap}-${max_gap}s)"
     "$sleep_cmd" "$gap" || true
+    gap_owed=0
   fi
-  first_send=0
 
   message="${RESUME_MESSAGE//\{id\}/$id}"
   baseline=$(file_bytes "$status_file")
@@ -403,11 +405,9 @@ for i in "${order[@]}"; do
   case "$verdict" in
     pending | send-failed | unknown)
       echo "  $id: send did not land (verdict=${verdict:-unknown})"
-      # A send that never landed did not spend budget; treat it as a failed lane
-      # (needs attention) but keep the pacing gate honest by NOT counting it as a
-      # started turn. Re-arm first_send so the next lane is not wrongly paced
-      # against a request that never fired.
-      first_send=1
+      # A send that never landed did not spend budget and did not start a turn; it
+      # leaves the pacing state UNCHANGED so the next lane still paces against the
+      # last lane that really started a turn (do NOT touch sent_landed here).
       msg="blocked: [fm-resume-fleet] resume steer did not submit (verdict=${verdict:-unknown}); lane may be wedged"
       printf '%s\n' "$msg" >> "$status_file" 2>/dev/null || true
       failed+=("$id (send $verdict)")
@@ -415,6 +415,7 @@ for i in "${order[@]}"; do
       ;;
   esac
   echo "  $id: resume steer sent, verifying turn start..."
+  gap_owed=1
 
   if verify_turn_started "$backend" "$target" "$expected" "$status_file" "$baseline"; then
     echo "  $id: confirmed - new turn started"
