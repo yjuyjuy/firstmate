@@ -272,6 +272,8 @@ Read the report, relay its findings rather than merely saying it finished, recor
 A report may recommend implementation but does not authorize it.
 Before treating the investigation or any visual review as complete, load `decision-hold-lifecycle`; teardown enforces that shared completion gate.
 When implementation is separately authorized, promote the existing scout through `bin/fm-promote.sh` rather than creating a duplicate task.
+That script gates on the scout's live context: at or under the threshold it promotes in place, and above the threshold it refuses the in-place promote and emits a fresh-agent handoff instead, so a context-heavy scout implements on a clean budget rather than compacting mid-ship.
+`bin/fm-promote.sh` owns the mechanics and the `config/promote-context-threshold` knob.
 The promoted worker must inventory scratch state, return to a clean default-branch base, carry over only intended fix changes, create the ship branch, and follow the project's selected delivery path.
 Scratch commits and debug edits never ride along, and a reproduced bug becomes the regression test.
 

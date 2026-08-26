@@ -453,6 +453,15 @@ The `200000` default sits at the point a 200k-window session reaches auto-compac
 This knob is not inherited into secondmate homes: it governs firstmate's own session, and a secondmate that fills its context is handed off to a fresh agent through `config/secondmate-context-threshold` rather than nudged to stow.
 The read mechanism and the jcode evidence live in [`docs/secondmate-context-handoff.md`](secondmate-context-handoff.md); the crossing logic, the cadence, and the `FM_CONTEXT_STOW_*` knobs live in the header of [`bin/fm-supervise-daemon.sh`](../bin/fm-supervise-daemon.sh) and the `context_stow_sweep` comment in [`bin/fm-watch.sh`](../bin/fm-watch.sh); the `/afk` skill's "Classification policy" points here for the contract.
 
+## Scout-to-ship promote context gate (config/promote-context-threshold)
+
+`config/promote-context-threshold` is an optional local, gitignored file holding a single positive integer: the context-window token count at or below which a scout is promoted to ship IN PLACE, and above which the promote refuses in place and hands off to a fresh agent instead.
+The first non-empty, non-comment line is parsed; an absent file, a non-integer, or a non-positive value falls back to the default `100000`, exactly like the thresholds above, so a typo never silently disables the gate.
+The reason for the gate: a scout that did heavy investigation can be near auto-compact, so promoting it in place then makes it implement on a nearly-full context, which compacts mid-ship and loses fidelity; above the threshold a fresh agent that inherits the scout's report starts implementation on a clean context budget instead.
+[`bin/fm-promote.sh`](../bin/fm-promote.sh) is the single owner of the gate mechanics: it reads the scout's live context with the shared `fm_sm_context_tokens` reader (claude and jcode only; every other harness reads unknown), promotes in place at or under the threshold, and above it leaves `kind=scout` untouched and emits the fresh-handoff next step for firstmate to execute.
+It fails closed to today's in-place promote when the context is unreadable, but prints a clear notice so the operator can override with a fresh handoff for a context-heavy scout.
+This is the primary's knob and is read only at promote time, not on any poll.
+
 ## Host resource monitoring (FM_RESOURCE_INTERVAL)
 
 `FM_RESOURCE_INTERVAL` is the number of seconds between host CPU, memory, and swap sweeps, defaulting to `900`.

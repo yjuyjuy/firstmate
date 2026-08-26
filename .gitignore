@@ -20,6 +20,7 @@ config/wedge-alarm
 config/secondmate-context-threshold
 config/secondmate-auto-handoff
 config/context-stow-threshold
+config/promote-context-threshold
 config/herdr-presentation-spaces
 config/heavy-run-slots
 config/watcher-cadence
