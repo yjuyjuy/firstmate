@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Spawn a direct report: a crewmate in a treehouse or Orca worktree, or a
 # secondmate in its isolated firstmate home.
-# Usage: fm-spawn.sh <task-id> <project-dir> [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--env <KEY=VAL>]... [--scout] [--unsupervised]
+# Usage: fm-spawn.sh <task-id> <project-dir> [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--env <KEY=VAL>]... [--scout|--interactive] [--unsupervised]
 #        fm-spawn.sh <task-id> [<firstmate-home>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--env <KEY=VAL>]... --secondmate
 #   --harness <name> is the explicit per-spawn harness/profile adapter. The old
 #   positional harness arg still works for back-compat.
@@ -84,8 +84,13 @@
 #   (fm-config-inherit-lib.sh). A successful launch clears pending inherited
 #   config reread generations because the new agent reads the converged files.
 #   --scout records kind=scout in the task's meta (report deliverable, scratch worktree;
-#   see AGENTS.md task lifecycle); --secondmate records kind=secondmate and launches in a
-#   provisioned firstmate home; the default is kind=ship.
+#   see AGENTS.md task lifecycle); --interactive records kind=interactive and implies
+#   --unsupervised: a HUMAN-DRIVEN task where the captain performs each step in a
+#   hands-off pane and an in-pane agent hands the captain the next script/click/query,
+#   verifies the reported result, and advances (the grilling-handoff pattern). Its
+#   deliverable is a session log at data/<id>/report.md and its worktree is scratch, so
+#   teardown treats kind=interactive exactly like kind=scout. --secondmate records
+#   kind=secondmate and launches in a provisioned firstmate home; the default is kind=ship.
 #   --unsupervised records supervise=off in the task's meta and installs NO
 #   turn-end hook, and the watcher (bin/fm-watch.sh recorded_windows) drops any
 #   supervise=off pane from every supervision path: the stale/wedge loop, the
@@ -156,7 +161,7 @@
 # gracefully: an unreachable forge or missing tooling leaves the state unknown,
 # which never refuses, so offline dispatch keeps working. Set
 # FM_SPAWN_ALLOW_DUPLICATE=1 to override the refusal deliberately.
-# On success prints: spawned <id> harness=<name> kind=<ship|scout|secondmate> mode=<mode> yolo=<on|off> window=<backend-target> worktree=<path>
+# On success prints: spawned <id> harness=<name> kind=<ship|scout|interactive|secondmate> mode=<mode> yolo=<on|off> window=<backend-target> worktree=<path>
 # mode/yolo are resolved per-project from data/projects.md for ship/scout tasks;
 # secondmate spawns record mode=secondmate, yolo=off, home=, and projects=.
 set -eu
@@ -308,6 +313,7 @@ for a in "$@"; do
   fi
   case "$a" in
     --scout) KIND=scout ;;
+    --interactive) KIND=interactive; UNSUPERVISED=on ;;
     --secondmate) KIND=secondmate ;;
     --unsupervised) UNSUPERVISED=on ;;
     --harness) want_value=harness ;;
@@ -522,6 +528,10 @@ if [ "${#POS[@]}" -gt 0 ] && [ "${POS[0]}" != "$idpart" ] && case "$idpart" in *
     esac
     if [ "$KIND" = secondmate ]; then
       echo "error: batch dispatch does not support --secondmate; spawn each secondmate explicitly" >&2
+      rc=2
+      continue
+    elif [ "$KIND" = interactive ]; then
+      echo "error: batch dispatch does not support --interactive; an interactive task is a single human-driven pane, spawn each explicitly" >&2
       rc=2
       continue
     elif [ "$KIND" = scout ]; then

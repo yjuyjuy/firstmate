@@ -2389,6 +2389,54 @@ test_failed_auto_close_still_completes_teardown() {
   pass "a failed backlog close warns loudly but never blocks the worktree release"
 }
 
+# An interactive task (kind=interactive) shares scout's scratch-report teardown
+# contract: with no session log at data/<id>/report.md, teardown must REFUSE
+# exactly as it does for a scout, naming the true kind in the message.
+test_interactive_without_report_refuses() {
+  local case_dir rc err
+  case_dir=$(make_case interactive-no-report)
+  write_meta "$case_dir" no-mistakes interactive
+  # A scratch commit that a ship lane would need landed; interactive must not care.
+  wt_commit "$case_dir" "scratch during the guided op"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  err=$(cat "$case_dir/stderr")
+
+  expect_code 1 "$rc" "interactive-no-report: teardown should refuse without a session log"
+  printf '%s\n' "$err" | grep -F 'REFUSED: interactive task task-x1 has no report' >/dev/null \
+    || fail "interactive-no-report: refusal did not name the interactive kind: $err"
+  pass "interactive teardown refuses when the session log is missing (scout scratch contract)"
+}
+
+# With the session log present and the unresolved-decision inventory reviewed, an
+# interactive task tears down as a scratch lane even though its worktree carries
+# unpushed commits a ship lane would have to land first.
+test_interactive_with_report_allows_scratch() {
+  local case_dir rc err
+  case_dir=$(make_case interactive-report-ok)
+  write_meta "$case_dir" no-mistakes interactive
+  # Mark the unresolved-decision inventory reviewed, as fm-decision-hold complete does.
+  printf '%s\n' 'decisions_reviewed=1' >> "$case_dir/state/task-x1.meta"
+  # Unpushed scratch commit: a ship lane refuses on this; a scratch lane does not.
+  wt_commit "$case_dir" "scratch during the guided op"
+  # The session log is the surviving deliverable.
+  mkdir -p "$case_dir/data/task-x1"
+  printf '%s\n' '# interactive session log' > "$case_dir/data/task-x1/report.md"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  err=$(cat "$case_dir/stderr")
+
+  expect_code 0 "$rc" "interactive-report-ok: teardown should release the scratch worktree"
+  ! grep -q REFUSED "$case_dir/stderr" || fail "interactive-report-ok: teardown printed a REFUSED line: $err"
+  pass "interactive teardown releases a scratch worktree once the session log exists"
+}
+
 test_local_only_fork_remote_allows
 test_scout_report_with_tldr_no_warning
 test_scout_report_without_tldr_warns_but_allows
@@ -2456,3 +2504,5 @@ test_merged_branch_auto_closes_ticket
 test_pushed_unmerged_does_not_auto_close_ticket
 test_manual_backend_does_not_auto_close_merged_ticket
 test_failed_auto_close_still_completes_teardown
+test_interactive_without_report_refuses
+test_interactive_with_report_allows_scratch

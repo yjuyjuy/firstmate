@@ -568,6 +568,44 @@ test_scout_and_secondmate_scaffold() {
   pass "fm-brief: scout and secondmate code paths still scaffold well-formed briefs"
 }
 
+# The interactive scaffold is a distinct human-driven contract: the captain
+# performs each step, the in-pane agent never edits product code or drives a
+# pipeline, the money-path DRY_RUN-then-CONFIRM discipline is mandatory, and the
+# deliverable is a session log at report.md gated by the decision-hold policy.
+test_interactive_scaffold() {
+  local brief
+  FM_HOME="$BRIEF_HOME" "$ROOT/bin/fm-brief.sh" brief-interactive-i7 alpha --interactive >/dev/null 2>&1 \
+    || fail "fm-brief.sh interactive scaffold exited non-zero"
+  brief="$BRIEF_HOME/data/brief-interactive-i7/brief.md"
+  assert_present "$brief" "interactive brief was not scaffolded"
+  assert_grep "INTERACTIVE task" "$brief" "interactive brief must declare itself an interactive task"
+  assert_grep "The CAPTAIN drives" "$brief" "interactive brief must state the captain drives"
+  assert_grep "make NO product edits" "$brief" "interactive brief must forbid product edits by the agent"
+  assert_grep "Every prod-write runs DRY_RUN first" "$brief" \
+    "interactive brief must carry the money-path DRY_RUN discipline"
+  assert_grep "CONFIRM only after the captain explicitly approves" "$brief" \
+    "interactive brief must gate CONFIRM on explicit captain approval"
+  assert_grep "report.md" "$brief" "interactive brief must point at the session-log deliverable"
+  assert_grep "$ROOT/.agents/skills/decision-hold-lifecycle/SKILL.md" "$brief" \
+    "interactive brief did not load the unresolved-decision policy before done"
+  # The interactive contract still carries the standing captain rules block.
+  assert_grep "C1. Never force anything." "$brief" \
+    "interactive brief must bind the standing captain rules"
+  pass "fm-brief.sh: interactive scaffold binds the human-driven, money-path, and log contracts"
+}
+
+# --herdr-lab is a ship/scout affordance; combining it with --interactive is a
+# usage error, exactly like the secondmate exclusion.
+test_interactive_rejects_herdr_lab() {
+  local out status
+  out=$(FM_HOME="$BRIEF_HOME" "$ROOT/bin/fm-brief.sh" brief-interactive-badlab alpha --interactive --herdr-lab 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "--interactive --herdr-lab should fail"
+  assert_contains "$out" "--herdr-lab applies only to crewmate ship or scout briefs" \
+    "--interactive --herdr-lab should print the exclusion error"
+  pass "fm-brief.sh: --interactive rejects --herdr-lab"
+}
+
 # The heavy-run serialization point only helps if crewmates actually route
 # through it, so the generated ship and scout briefs must carry the instruction.
 test_briefs_route_heavy_runs_through_the_runner() {
@@ -908,6 +946,8 @@ test_secondmate_no_projects_charter
 test_pause_verb_override_renders_all_brief_scaffolds
 test_scout_and_secondmate_load_decision_hold_policy
 test_scout_and_secondmate_scaffold
+test_interactive_scaffold
+test_interactive_rejects_herdr_lab
 test_briefs_route_heavy_runs_through_the_runner
 test_briefs_carry_rtk_token_efficiency_section
 test_briefs_bind_the_shared_machine_rules

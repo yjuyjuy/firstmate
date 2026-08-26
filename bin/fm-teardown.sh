@@ -67,6 +67,9 @@
 # unresolved-decision completion gate verifies its captain-held inventory.
 # A report missing its mandatory TL;DR header block (see bin/fm-brief.sh --scout)
 # only warns; the block is a supervisor-relay aid, not a landed-work check.
+# Interactive tasks (kind=interactive in meta) share that exact scratch-report
+# contract, so a GATE_KIND collapses them onto scout for every gate below while
+# the completion ledger still records the true kind.
 # Before destructive cleanup, teardown validates task check artifacts and any
 # matching quarantine entries as ordinary single-link files on the state
 # device. It refuses and preserves task state when that proof fails; otherwise
@@ -180,6 +183,14 @@ ORCA_PATH_MATCH_VERIFIED=0
 
 KIND=$(grep '^kind=' "$META" | cut -d= -f2- || true)
 [ -n "$KIND" ] || KIND=ship
+# Interactive tasks share scout's teardown contract exactly: a scratch worktree
+# whose deliverable is the report/session log at data/<id>/report.md, no branch to
+# land, and the same unresolved-decision completion gate. GATE_KIND collapses
+# interactive onto scout for every scratch-report gate below, so that contract is
+# stated once (on scout) rather than duplicated. The completion ledger and any
+# caller-facing output still record the true KIND.
+GATE_KIND=$KIND
+[ "$KIND" = interactive ] && GATE_KIND=scout
 MODE=$(grep '^mode=' "$META" | cut -d= -f2- || true)
 [ -n "$MODE" ] || MODE=no-mistakes
 
@@ -198,7 +209,7 @@ TICKET_MERGE_EVIDENCE=
 # IS that commit. When genuinely unknown, stay empty rather than guessing.
 PR_HEAD_META=$(grep '^pr_head=' "$META" | tail -1 | cut -d= -f2- || true)
 LANDING_SHA=$PR_HEAD_META
-if [ -z "$LANDING_SHA" ] && [ "$KIND" != scout ] && [ "$KIND" != secondmate ] \
+if [ -z "$LANDING_SHA" ] && [ "$GATE_KIND" != scout ] && [ "$KIND" != secondmate ] \
    && { [ "$MODE" = direct-push ] || [ "$MODE" = local-only ]; } \
    && [ -n "$WT" ] && [ -d "$WT" ]; then
   LANDING_SHA=$(git -C "$WT" rev-parse --verify HEAD 2>/dev/null || true)
@@ -687,7 +698,7 @@ record_pushed_unmerged_to_merge_queue() {
 capture_ticket_merge_evidence() {
   local branch name origin_default origin_branch
   TICKET_MERGE_EVIDENCE=
-  case "$KIND" in scout|secondmate) return 0 ;; esac
+  case "$GATE_KIND" in scout|secondmate) return 0 ;; esac
   [ "$MODE" != local-only ] || return 0
   [ -n "$WT" ] && [ -d "$WT" ] || return 0
 
@@ -738,7 +749,7 @@ backlog_refresh_reminder() {
   local pr done_cmd report_path
   [ "$KIND" = secondmate ] && return 0
   if fm_tasks_axi_backend_available "$CONFIG"; then
-    case "$KIND" in
+    case "$GATE_KIND" in
       scout)
         report_path="data/$ID/report.md"
         done_cmd="tasks-axi done $ID --report $report_path"
@@ -766,7 +777,7 @@ backlog_refresh_reminder() {
     # blocks teardown (the worktree is already released). The manual backlog backend
     # never auto-closes: fm_tasks_axi_backend_available is already false for it, so
     # this whole branch is skipped and the hand-edit reminder prints instead.
-    if [ -n "$TICKET_MERGE_EVIDENCE" ] && [ "$KIND" != scout ] \
+    if [ -n "$TICKET_MERGE_EVIDENCE" ] && [ "$GATE_KIND" != scout ] \
        && auto_close_backlog_ticket "$done_cmd" "$TICKET_MERGE_EVIDENCE"; then
       return 0
     fi
@@ -1006,7 +1017,7 @@ validate_worktree_teardown_safety() {
   local dirty_raw dirty unpushed_raw unpushed DEFAULT unmerged_raw unmerged branch origin_ref
   [ -d "$WT" ] || return 0
   [ "$FORCE" != "--force" ] || return 0
-  case "$KIND" in
+  case "$GATE_KIND" in
     secondmate|scout) return 0 ;;
   esac
 
@@ -1563,10 +1574,10 @@ if [ "$FORCE" != "--force" ] && fm_tasks_axi_backend_available "$CONFIG"; then
   fi
 fi
 
-if [ "$KIND" = scout ] && [ "$FORCE" != "--force" ]; then
+if [ "$GATE_KIND" = scout ] && [ "$FORCE" != "--force" ]; then
   REPORT="$DATA/$ID/report.md"
   if [ ! -f "$REPORT" ]; then
-    echo "REFUSED: scout task $ID has no report at $REPORT." >&2
+    echo "REFUSED: $KIND task $ID has no report at $REPORT." >&2
     echo "The report is the work product. Have the crewmate write it, or use --force after explicit discard approval." >&2
     exit 1
   fi
@@ -1580,13 +1591,13 @@ if [ "$KIND" = scout ] && [ "$FORCE" != "--force" ]; then
   fi
   if ! FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" FM_DATA_OVERRIDE="$DATA" \
       FM_CONFIG_OVERRIDE="$CONFIG" "$SCRIPT_DIR/fm-decision-hold.sh" verify "$ID" >/dev/null; then
-    echo "REFUSED: scout task $ID has not passed the unresolved-decision completion gate." >&2
+    echo "REFUSED: $KIND task $ID has not passed the unresolved-decision completion gate." >&2
     echo "Inventory its report and any visual review through bin/fm-decision-hold.sh before teardown." >&2
     exit 1
   fi
 fi
 
-if [ "$BACKEND" = orca ] && [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$FORCE" != "--force" ]; then
+if [ "$BACKEND" = orca ] && [ "$GATE_KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$FORCE" != "--force" ]; then
   if ! inspectable_git_worktree "$WT"; then
     echo "REFUSED: Orca ship task $ID has no inspectable git worktree at ${WT:-<missing>}." >&2
     echo "Cannot verify dirty or unlanded work; restore the worktree path or get explicit OK to discard, then --force." >&2
@@ -1622,7 +1633,7 @@ fi
 # durable merge queue so a released-yet-unmerged branch is never silently forgotten
 # (see bin/fm-merge-queue.sh, docs/merge-queue.md). Recording is read-only and runs
 # for a forced teardown too, which is exactly when a branch is most easily lost.
-if [ "$KIND" != scout ] && [ "$KIND" != secondmate ] \
+if [ "$GATE_KIND" != scout ] && [ "$KIND" != secondmate ] \
    && [ "$MODE" != local-only ] && [ -d "$WT" ]; then
   record_pushed_unmerged_to_merge_queue || true
 fi
@@ -1667,7 +1678,7 @@ elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
   # the project. teardown_treehouse_return tolerates transient and stale git locks
   # left by a killed crew process; see the script header for retry and stale-lock proof.
   post_lock_cleanup_check=
-  if [ "$FORCE" != "--force" ] && [ "$KIND" != scout ] && [ "$KIND" != secondmate ]; then
+  if [ "$FORCE" != "--force" ] && [ "$GATE_KIND" != scout ] && [ "$KIND" != secondmate ]; then
     post_lock_cleanup_check=validate_worktree_teardown_safety
   fi
   teardown_treehouse_return "$WT" "$PROJ" "worktree" "$post_lock_cleanup_check" || {
@@ -1757,7 +1768,7 @@ fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
 [ -n "$TASK_TMP" ] && rm -rf "$TASK_TMP"
 remove_pr_poll_artifacts "$STATE" "$ID" || exit 1
 rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.meta" "$STATE/$ID.telemetry" "$STATE/$ID.crash-tail" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token"
-if [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$MODE" != local-only ]; then
+if [ "$GATE_KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$MODE" != local-only ]; then
   "$FM_ROOT/bin/fm-fleet-sync.sh" "$PROJ" || true
 fi
 echo "teardown $ID complete (window $T, worktree $WT)"
