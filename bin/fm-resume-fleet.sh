@@ -68,9 +68,11 @@
 # blocks the whole fleet re-warm.
 #
 # PACING: a jittered gap of FM_RESUME_MIN_GAP..FM_RESUME_MAX_GAP seconds (default
-# 60..90, randomized per gap, not a fixed sleep) is held BEFORE every send after
-# the first, so N actual sends produce N-1 gaps - always between real requests,
-# never after a skip and never a wasted trailing wait.
+# 60..90, randomized per gap, not a fixed sleep) is held BEFORE a send only when a
+# PRIOR send actually LANDED (started a real turn), so exactly one gap sits between
+# each pair of consecutive landed sends. A swallowed send does not owe or consume a
+# gap, so a failed send can never collapse the gap between two real cold-cache
+# starts. Never a gap before the first landed send and never a trailing wait.
 #
 # EXIT: 0 when every lane either confirmed a fresh turn or was safely skipped
 # (including "nothing to resume"); 2 on a usage error; 3 when at least one lane

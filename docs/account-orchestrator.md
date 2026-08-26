@@ -40,7 +40,7 @@ Its header owns the exact mechanics; the integration-level contract is:
   A service sidecar meta with no backend target, a `kind=secondmate` lane (idle by contract), and a `supervise=off` pane are skipped, never treated as errors.
 - Order: an explicit `--priority <id>` lane first, then any lane whose meta records a truthy `priority=`, then the rest in stable id order.
 - Verify before advancing: after sending a lane its resume steer, the script polls for positive evidence the turn actually started, either a backend busy or working indicator or a fresh append to that lane's status file, before it moves to the next lane.
-- Pacing: a jittered gap in the 60 to 90 second window (randomized per gap, not a fixed sleep) is held before every send after the first, so N sends produce N-1 gaps and the per-minute budget is never spent in a single burst.
+- Pacing: a jittered gap in the 60 to 90 second window (randomized per gap, not a fixed sleep) is held before a send only when a prior send actually landed a turn, so exactly one gap sits between each pair of consecutive real cold-cache starts and a swallowed send can never collapse the gap between two real starts.
 - Escalation, never a silent drop: a lane that does not start a turn within the bounded verify window gets a clearly attributed `blocked:` line appended to its status file and is listed as failed in the run summary, while the remaining lanes still run, so one wedged lane never blocks the whole re-warm.
 - Idempotent: a lane already mid-turn is detected and skipped rather than poked a second time, so the script is safe to re-run.
 
