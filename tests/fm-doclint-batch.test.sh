@@ -14,8 +14,11 @@
 #       - >= 14 days since the last pass with >= 1 lane fires (time ceiling)
 #       - a fresh, small batch does not fire
 #       - no marker yet counts every ship lane for the repo
-#   (b) the `brief` command emits the exact `--skip review,test,rebase` run
-#       (the inverse of the per-lane `--skip document,lint`), off origin/dev
+#   (b) the `brief` command emits the two-phase flow: a document+lint-only pass run
+#       (`--skip rebase,review,test,push,pr,ci`, no delivery steps) off origin/dev, then,
+#       only when the pass produced fixes, a push-legal delivery run
+#       (`--skip document,lint,test`) that ends at a PR for captain merge with no
+#       hand-push, and a clean pass preserved as a valid no-PR success
 #   (c) marker-ref advance is fast-forward-only and never forces or deletes
 set -u
 
@@ -140,17 +143,27 @@ test_status_line_shape() {
 
 # --- (b) brief content ------------------------------------------------------
 
-test_brief_emits_inverse_skip() {
+test_brief_emits_two_phase_pr_delivery() {
   local out
   out=$(FM_ROOT_OVERRIDE="$ROOT" "$CLI" brief hyfin)
-  assert_contains "$out" "no-mistakes axi run --skip review,test,rebase" \
-    "brief must run the exact inverse skip (document+lint only)"
-  assert_not_contains "$out" "--skip document,lint" \
-    "brief must NOT carry the per-lane document,lint skip"
+  assert_contains "$out" "no-mistakes axi run --skip rebase,review,test,push,pr,ci" \
+    "brief must run the pass with document+lint only and the delivery steps skipped"
+  assert_contains "$out" "no-mistakes axi run --skip document,lint,test" \
+    "brief must deliver fixes through a second push-legal run (review + push + PR)"
+  assert_not_contains "$out" "--skip review,test,rebase" \
+    "brief must not carry the refused skip-review run"
+  assert_not_contains "$out" "Land the fixes via" \
+    "brief must not tell the lane to land via normal delivery (the hand-push bypass)"
+  assert_contains "$out" "for captain merge" \
+    "brief must end a with-fixes pass at a PR for captain merge"
+  assert_contains "$out" "git rev-list --count origin/dev..HEAD" \
+    "brief must distinguish a clean pass from a pass with fixes"
+  assert_contains "$out" "done: doclint pass clean, no fixes" \
+    "brief must keep a clean pass as a valid no-PR success"
   assert_contains "$out" "fm/doclint-hyfin-" "brief cuts a dated doclint branch"
   assert_contains "$out" "origin/dev" "brief bases the pass on origin/dev"
-  assert_contains "$out" "advance" "brief tells the lane to advance the marker ref"
-  pass "brief emits the inverse --skip review,test,rebase run off origin/dev"
+  assert_contains "$out" "marker-advance" "brief tells the lane to advance the marker ref"
+  pass "brief emits the two-phase pass+PR flow off origin/dev without a hand-push bypass"
 }
 
 # --- (c) marker-ref advance safety ------------------------------------------
@@ -252,7 +265,7 @@ test_threshold_fires_on_time_ceiling
 test_threshold_quiet_on_fresh_small_batch
 test_no_marker_counts_all_ship_lanes
 test_status_line_shape
-test_brief_emits_inverse_skip
+test_brief_emits_two_phase_pr_delivery
 test_marker_advance_fast_forward_only
 test_marker_advance_refuses_non_fast_forward
 test_marker_helpers_reject_unsafe_repo

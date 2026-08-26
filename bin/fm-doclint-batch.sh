@@ -23,11 +23,15 @@
 #                                         none). Used by fm-session-review.sh.
 #   fm-doclint-batch.sh brief <repo>      emit a scoped ship brief for the on-demand
 #                                         pass lane: cut fm/doclint-<repo>-<date>
-#                                         off origin/dev, run no-mistakes with
-#                                         --skip review,test,rebase (document+lint
-#                                         only - the inverse of the per-lane skip),
-#                                         land via the repo's normal delivery, then
-#                                         advance the marker ref. Prints to stdout.
+#                                         off origin/dev, run no-mistakes document+lint
+#                                         only (the inverse of the per-lane skip) with
+#                                         the delivery steps skipped, then deliver any
+#                                         fixes the pass produced through the
+#                                         no-mistakes-repo PR path as a second
+#                                         push-legal run (review + pipeline-owned
+#                                         push + PR) that ends at a PR for captain
+#                                         merge, then advance the marker ref.
+#                                         Prints to stdout.
 #   fm-doclint-batch.sh marker-read <repo>          print the marker sha (or nothing)
 #   fm-doclint-batch.sh marker-advance <repo> <sha> fast-forward-only advance; never
 #                                                   forces, never deletes (rule C1)
@@ -118,24 +122,31 @@ case "$cmd" in
 You are a crewmate: an autonomous worker agent managed by firstmate. Work on your own; do not wait for a human.
 
 # Task
-Run the batched document+lint recovery pass on $repo. Small / doc-irrelevant lanes landed on $repo's dev with the document and lint steps skipped per-lane, so doc/lint drift has accumulated. Run document+lint ONCE over the accumulated merged code and land the fixes.
-
-Design of record: \`data/batch-doclint-pass/report.md\`. Read it if any step is unclear.
+Run the batched document+lint recovery pass on $repo. Small / doc-irrelevant lanes landed on $repo's dev with the document and lint steps skipped per-lane, so doc/lint drift has accumulated. Run document+lint ONCE over the accumulated merged code. Deliver any fixes the pass produces as a PR for captain merge. Never hand-push, never merge.
 
 Steps:
 1. Verify worktree isolation (Setup below). Then cut your branch:
    \`git fetch origin && git checkout -b $branch origin/dev\`
-2. Run ONLY document and lint - the exact inverse of the per-lane skip:
-   \`no-mistakes axi run --skip review,test,rebase --intent "$intent"\`
-   document and lint inspect the merged code and fix in place; review and test already ran on each landed branch, so re-running them is pure waste. Drive the run to completion by id (fm-crew-state / no-mistakes axi respond as directed by the gate help). NEVER pass --yes.
+2. Run the PASS - document and lint only, no delivery steps:
+   \`no-mistakes axi run --skip rebase,review,test,push,pr,ci --intent "$intent"\`
+   This is the exact inverse of the per-lane skip: document and lint inspect the merged code and fix in place; review and test already ran on each landed branch, so re-running them is pure waste. push/pr/ci are skipped here on purpose: a no-mistakes repo refuses to push a run that skipped review (no durably recorded review-approved head), so this pass commits fixes locally and pushes nothing. Do NOT hand-push this pass's output - that would bypass the no-mistakes review-approved push boundary. Drive the run to completion by id (no-mistakes axi respond as directed by the gate help). NEVER pass --yes.
 3. If document or lint raise an ask-user finding, append \`needs-decision:\` and stop - firstmate decides.
-4. Land the fixes via $repo's normal delivery (see Definition of done). A clean pass with no fixes is a valid, successful outcome - the marker still advances.
-5. After the pass has LANDED on origin/dev, advance the provenance marker to the dev sha you covered:
+4. Find out whether the pass produced fixes:
+   \`git fetch origin && git rev-list --count origin/dev..HEAD\`
+   A count of 0 means the pass was clean.
+5. CLEAN PASS (count 0): no fixes, so no PR is needed. This is a valid, successful outcome. Advance the marker (step 7) and report \`done: doclint pass clean, no fixes\`.
+6. PASS WITH FIXES (count > 0): deliver the fixes through the no-mistakes PR path in one separate run on the SAME branch. This second run runs review for real - the no-mistakes repo's push gate requires a durably recorded review-approved head, which is what makes a pipeline-owned push legal - then pushes the branch and opens the PR:
+   \`no-mistakes axi run --skip document,lint,test --intent "deliver the batched document+lint fixes on $repo as a PR for captain merge"\`
+   document and lint already ran in step 2 and test already ran per-lane. Drive the run by id through the gate flow to its CI-ready/completed outcome. NEVER pass --yes. Never merge the PR, never delete the branch, never hand-push anything - the push must stay pipeline-owned from this review-approved run.
+   - If the pipeline opened the PR, report \`done: doclint pass PR <url>\` (full URL).
+   - If the pipeline's PR step skipped for lack of forge credentials, report \`done: doclint pass branch $branch pushed <head> - firstmate opens PR\`; firstmate verifies the pushed branch and opens the PR itself.
+7. AFTER the pass is complete (clean or delivered), advance the provenance marker to the dev sha the pass covered:
+   \`git fetch origin\`
    \`covered=\$(git rev-parse origin/dev)\`
    \`$FM_ROOT/bin/fm-doclint-batch.sh marker-advance $repo "\$covered"\`
    The advance is fast-forward-only and never forces; if it refuses, report the refusal, do not force it.
 
-Report the outcome: \`done: doclint pass landed <sha>, K fixes\` or \`done: doclint pass clean, no fixes\`.
+Report the outcome: \`done: doclint pass PR <url>\`, \`done: doclint pass branch $branch pushed <head> - firstmate opens PR\`, or \`done: doclint pass clean, no fixes\`.
 
 NOTE: this touches PROJECT code via the normal delivery path, not firstmate shared material - do not edit firstmate's own bin/ or docs here.
 EOF

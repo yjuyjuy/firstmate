@@ -70,15 +70,42 @@ from the oldest such lane.
   The hourly session-review pass calls this and turns each line into one actionable
   finding.
 - `fm-doclint-batch.sh brief <repo>` emits the scoped ship brief firstmate dispatches on
-  demand: cut `fm/doclint-<repo>-<date>` off `origin/dev`, run
-  `no-mistakes axi run --skip review,test,rebase` (document and lint only, the exact
-  inverse of the per-lane skip), land via the repo's normal delivery, then advance the
-  marker ref.
-  review and test already ran on each landed branch, so re-running them is pure waste;
-  document and lint inspect the merged code and fix in place, so a fresh branch off
-  current `dev` is sufficient and needs no base manipulation.
+  demand: cut `fm/doclint-<repo>-<date>` off `origin/dev`, run the document+lint-only pass,
+  deliver any fixes the pass produced as a PR for captain merge, then advance the marker
+  ref.
+  See "Delivery" below for the two-phase shape.
 - `fm-doclint-batch.sh marker-read <repo>` and `marker-advance <repo> <sha>` are the
   fail-closed marker helpers.
+
+## Delivery
+
+A with-fixes pass on a no-mistakes repo ends at a PR for captain merge, never at a
+worker hand-push (captain decision 2026-08-26, option (b), `data/decisions/doclint-delivery.md`).
+The pass is two-phase because of the no-mistakes push gate: a run whose review step was
+skipped has no durably recorded review-approved head, so the pipeline refuses its push
+("refusing to push: run has no durably recorded review-approved head").
+A document+lint-only pass therefore cannot run and push in one invocation.
+
+1. The pass run commits fixes locally and pushes nothing:
+   `no-mistakes axi run --skip rebase,review,test,push,pr,ci`.
+   Only document and lint execute (the exact inverse of the per-lane skip), and no
+   delivery step runs.
+2. If the pass left the branch clean (`git rev-list --count origin/dev..HEAD` is 0), no
+   PR is needed; the marker advances and the pass is a valid success.
+3. If the pass committed fixes, one delivery run on the same branch
+   (`no-mistakes axi run --skip document,lint,test`) runs review for real, which records
+   the review-approved head that makes the pipeline-owned push legal, then pushes the
+   branch and opens the PR.
+   The fixes are new code no lane has reviewed, so this review is the safety boundary
+   doing its job rather than a re-review of gated code.
+   When the pipeline's PR step cannot run for lack of forge credentials it skips instead
+   of failing, and firstmate opens the pull request itself after verifying the pushed
+   branch (see `bitbucket-pr.md` for the Bitbucket path).
+
+test already ran per-lane, so the delivery run skips it; document and lint already ran
+in the pass run, so the delivery run skips them too.
+The crew never merges the PR, never deletes the branch, and never hand-pushes; the
+captain merges through the PR.
 
 ## Trigger and reporting
 
@@ -87,6 +114,8 @@ evaluates `ready` on its existing slow poll and surfaces each threshold-met repo
 `session-review`-style finding with the exact dispatch command in the full report.
 Firstmate then dispatches one scoped pass lane per repo on demand, the same way it
 dispatches a merge worker.
-The lane reports `done: doclint pass landed <sha>, K fixes` or `done: doclint pass
-clean, no fixes`, and the marker advances either way.
-A clean pass with no fixes is a valid, successful outcome.
+The lane reports `done: doclint pass PR <url>`, `done: doclint pass branch <branch>
+pushed <head> - firstmate opens PR` (when the pipeline's PR step skipped for lack of
+forge credentials), or `done: doclint pass clean, no fixes`, and the marker advances
+either way.
+A clean pass with no fixes is a valid, successful outcome and opens no PR.
