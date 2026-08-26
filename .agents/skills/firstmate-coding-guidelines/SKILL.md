@@ -83,7 +83,7 @@ Keep instructions as the authority and discovery layer, but make repeated execut
 - Tracked Markdown, instruction prose, ADRs, and files under `docs/` stay in normal correct prose; the compression rule that `AGENTS.md` section 9 owns exempts them by name and never applies here.
 - Never add an agent name as a commit co-author.
 - `bin/*.sh` and `bin/backends/*.sh` must pass `shellcheck`.
-- Every `bin/*.sh` and `bin/backends/*.sh` must carry the executable bit, even sourced-only `*-lib.sh` libraries, under one uniform rule; `bin/fm-check-exec-bits.sh` owns and enforces it (a script that loses `+x` lints clean but fails silently at spawn time), and CI runs it in the lint job.
+- Every `bin/*.sh` and `bin/backends/*.sh` must carry the executable bit, even sourced-only `*-lib.sh` libraries, under one uniform rule, and every shebang-bearing non-`.sh` entrypoint under `bin/` (for example `jira-axi` and `bin/backends/herdr-workspace-move.py`) must carry it too; `bin/fm-check-exec-bits.sh` owns and enforces both rules (a script that loses `+x` lints clean but fails silently at spawn time), and CI runs it in the lint job.
 - Run `bin/fm-lint.sh` before treating a script change as done; it is the single owner of the lint definition (file set, config, and pinned shellcheck version) that CI and the no-mistakes pre-push gate both invoke, and it refuses to run under any other shellcheck version.
 - Colocate tests with the existing pattern in `tests/`, name them `<subject>.test.sh`, and extend an existing script rather than inventing a new runner.
 - A backend-verification doc (`docs/*-backend.md`) records empirical facts, not assumptions.

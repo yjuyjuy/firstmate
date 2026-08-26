@@ -119,6 +119,7 @@ family_for_basename() {
   case "$1" in
     fm-arm-pretool-check.test.sh|fm-brief.test.sh|fm-calm-pi-extension.test.sh|\
     fm-captain-translation-contract.test.sh|fm-cd-pretool-check.test.sh|\
+    fm-check-exec-bits.test.sh|\
     fm-composer-ghost.test.sh|fm-composer-lib.test.sh|\
     fm-continuity-pretool-check.test.sh|fm-crew-state.test.sh|fm-decision-hold-lifecycle.test.sh|\
     fm-dispatch-select.test.sh|fm-ensure-agents-md.test.sh|fm-grok-harness.test.sh|\
