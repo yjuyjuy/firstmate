@@ -1154,7 +1154,7 @@ install_failing_jq() {  # <fakebin> <model|toon>
   cat > "$fakebin/jq" <<SH
 #!/usr/bin/env bash
 case "\$*" in
-  *'def trunc'*) [ "$phase" = model ] && exit 9 ;;
+  *'round_robin_landed'*) [ "$phase" = model ] && exit 9 ;;
   *'def q:'*) [ "$phase" = toon ] && exit 9 ;;
 esac
 exec "$real" "\$@"
