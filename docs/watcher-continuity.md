@@ -3,6 +3,18 @@
 The watcher remains intentionally one-shot: one actionable reason closes one watcher cycle.
 Must-work continuity now lives above that process boundary instead of depending on the model remembering a re-arm step.
 
+## Watcher-side exit contract
+
+One-shot means an ACTIONABLE reason closes the cycle, not that any non-actionable outcome does.
+`bin/fm-watch.sh` ends a cycle for exactly two reasons: an actionable wake (it queues a reason line and exits zero) or a real internal error (it prints a loud message and exits nonzero).
+Absorbing a benign wake must never end the cycle; the loop continues so the single live supervision cycle is preserved.
+The distinction matters most for a best-effort side effect that fails: a dedupe-marker write, a log append, or any optimization that is not itself the surfacing of a wake.
+While a wake is being absorbed, such a failure surfaces nothing, so it is logged and the loop continues.
+After an actionable wake is already durably queued, the surface is guaranteed, so a later side-effect failure still surfaces the reason rather than exiting.
+Only a failure that would actually lose a wake (the durable enqueue itself failing) is the internal-error exit, and it announces `watcher: FAILED` so it is distinguishable from a benign continue.
+The event fast-path (`handle_push_transition`, the herdr push escalation) follows this rule: its declared-pause absorb continues on a failed dedupe commit, its actionable branch still wakes the supervisor on a failed post-enqueue commit because the record is already queued, and only a failed enqueue exits loudly.
+`tests/fm-supervision-events.test.sh` pins all three cases; `tests/fm-watch-triage.test.sh` pins that the poll loop keeps the liveness beacon fresh while absorbing.
+
 ## Ownership
 
 Pi's `.pi/extensions/fm-primary-pi-watch.ts` and OpenCode's `.opencode/plugins/fm-primary-watch-arm.js` own continuous re-arm after an actionable child close.

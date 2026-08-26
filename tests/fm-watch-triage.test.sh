@@ -626,32 +626,65 @@ test_terminal_stale_verdict_unchanged_absorbs_pane_redraw() {
 # --- the liveness beacon stays fresh through a full terminal sleep -------------
 # Wedge regression: the beacon was touched only at the loop top, so a poll longer
 # than the grace left a healthy sleeping watcher reading as dead for the back of
-# every cycle. beacon_sleep slices the terminal wait below the grace and re-touches
-# the beacon each slice, so its age never crosses the grace mid-sleep.
+# every cycle. beacon_sleep slices the terminal wait into pieces no longer than
+# BEACON_SLICE=min(POLL, grace/2) and re-touches the beacon each slice, so its age
+# never crosses the grace mid-sleep.
+#
+# This is asserted as a DETERMINISTIC unit test of beacon_sleep itself rather than
+# a wall-clock race against a running watcher. The earlier version launched a real
+# watcher with POLL=4 > grace=2 and asserted the beacon's observed age never
+# exceeded 2s. That age is not a property of the watcher alone: on a loaded host
+# the test's own sampler is scheduled out for >2s between the watcher's touch and
+# the reading, so a perfectly healthy watcher read as stale purely because THIS
+# process did not run in time (the "beacon aged 3s past the 2s grace" flake, which
+# reproduced on unmodified main under load). Worse, under enough load the healthy
+# watcher's own 1s slices stretch too, so counting mtime advances over a fixed
+# wall-clock window cannot reliably tell a healthy-but-throttled watcher from the
+# single-touch-per-cycle regression either.
+#
+# So source the watcher (its guard returns before the lock/loop), stub `sleep` to
+# return instantly, count how many times beacon_sleep touches the beacon, and
+# assert it slices: beacon_sleep <total> with BEACON_SLICE=<slice> must touch
+# ceil(total/slice) times, NOT once. A single loop-top touch (the regression)
+# would count exactly 1. No wall clock, no host-load sensitivity.
 test_beacon_stays_fresh_through_terminal_sleep() {
-  local dir state fakebin out pid i m now age
-  dir=$(make_case beacon-sleep-slice); state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
-  # Empty fleet: every cycle falls straight through to the terminal wait. A poll
-  # longer than the grace is exactly the wedge configuration.
-  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
-    FM_POLL=4 FM_WATCHER_STALE_GRACE=2 FM_GUARD_GRACE=2 FM_SIGNAL_GRACE=1 \
-    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
-  pid=$!
-  # Sample across a window longer than one full poll; the age must never exceed
-  # the 2s grace while the watcher sits in beacon_sleep.
-  i=0
-  while [ "$i" -lt 25 ]; do
-    kill -0 "$pid" 2>/dev/null || { reap "$pid"; fail "watcher exited early: $(cat "$out")"; }
-    m=$(file_mtime "$state/.last-watcher-beat")
-    if [ -n "$m" ]; then
-      now=$(date +%s); age=$(( now - m ))
-      [ "$age" -le 2 ] || { reap "$pid"; fail "beacon aged ${age}s past the 2s grace during the terminal sleep"; }
-    fi
-    sleep 0.2
-    i=$((i + 1))
-  done
-  reap "$pid"
-  pass "the liveness beacon stays fresh through a full terminal sleep (beacon_sleep slices the wait below the grace)"
+  local dir state count
+  dir=$(make_case beacon-sleep-slice); state="$dir/state"
+  mkdir -p "$state"
+  # Drive beacon_sleep in a clean child process (env + bash -c) rather than a
+  # command-substitution subshell that re-exports FM_* (which trips SC2030/SC2031).
+  # The child sources the watcher (its guard returns before the lock/loop), stubs
+  # `sleep` to return instantly and `touch` to count each beacon refresh, then runs
+  # beacon_sleep and prints the touch count. beacon_count <total> <slice> -> count.
+  beacon_count() {  # <total-seconds> <beacon-slice>
+    FM_STATE_OVERRIDE="$state" FM_ROOT_OVERRIDE="$ROOT" \
+      bash -c '
+        set -u
+        total=$1; slice=$2
+        # shellcheck source=bin/fm-watch.sh
+        . "$FM_ROOT_OVERRIDE/bin/fm-watch.sh"
+        n=0
+        sleep() { :; }
+        touch() { command touch "$@"; n=$((n + 1)); }
+        BEACON_SLICE=$slice
+        beacon_sleep "$total"
+        printf "%s" "$n"
+      ' _ "$1" "$2"
+  }
+  # A 5s terminal wait sliced at 1s must re-touch the beacon 5 times (one per
+  # slice). A single loop-top touch (the wedge regression) would count exactly 1.
+  count=$(beacon_count 5 1)
+  [ "$count" = 5 ] \
+    || fail "beacon_sleep 5 with BEACON_SLICE=1 touched the beacon $count time(s), expected 5 (one per slice); a single loop-top touch is the wedge regression"
+  # A total that is not a multiple of the slice rounds up: 5 sliced at 2 is 2+2+1.
+  count=$(beacon_count 5 2)
+  [ "$count" = 3 ] \
+    || fail "beacon_sleep 5 with BEACON_SLICE=2 touched $count time(s), expected 3 (2+2+1 slices, rounding up)"
+  # A slice at least as large as the total still touches exactly once.
+  count=$(beacon_count 3 3)
+  [ "$count" = 1 ] \
+    || fail "beacon_sleep 3 with BEACON_SLICE=3 touched $count time(s), expected 1 (single slice)"
+  pass "beacon_sleep slices the terminal wait and re-touches the beacon every slice (never a single loop-top touch)"
 }
 
 # --- non-terminal stale, crew provably working: absorbed, then wedge-escalated ---
@@ -1041,16 +1074,41 @@ test_exited_declared_pause_is_bounded_but_live_gate_surfaces() {
   printf '%s' "$pane_hash" > "$state/.hash-$key"
   printf '1\n' > "$state/.count-$key"
 
-  round=1
+  # Round 1 is the ONE bounded pause recheck: the pane's declared-pause status is
+  # already older than PAUSE_RESURFACE_SECS, so the first poll surfaces exactly
+  # once and exits. Wait for that exit with a generous ceiling rather than a short
+  # reap window. The earlier version reaped every round at a 1.5s ceiling, which
+  # under host load killed this first watcher mid-poll BEFORE it wrote the wake -
+  # then no round ever created state/.wake-queue, and the awk count below opened a
+  # missing file and yielded an empty string, so `[ "" -le 1 ]` failed with
+  # "integer expression expected" (surfacing as the blank "flooded  stale wakes").
+  # wait_for_exit makes the surface deterministic instead of a race.
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=zsh FM_FAKE_CREW_STATE='state: stopped · source: pane · bare shell' \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_PAUSE_RESURFACE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" >> "$out" &
+  pid=$!
+  wait_for_exit "$pid" 40 || { reap "$pid"; fail "dead-agent declared pause did not surface its one bounded recheck"; }
+  # Rounds 2-6: with the resurface marker now set, every further poll of the same
+  # unchanged pane must ABSORB (stay alive, append no new wake) until the long
+  # PAUSE_RESURFACE_SECS cadence elapses. That decision is gated on the marker's
+  # age, not on timing, so a slow host cannot make it falsely re-surface: a watcher
+  # that DIES here surfaced a second wake and is a real flood regression.
+  round=2
   while [ "$round" -le 6 ]; do
     PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
       FM_FAKE_TMUX_CURRENT_COMMAND=zsh FM_FAKE_CREW_STATE='state: stopped · source: pane · bare shell' \
       FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_PAUSE_RESURFACE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
       FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" >> "$out" &
     pid=$!
-    if wait_live "$pid" 15; then reap "$pid"; else wait "$pid" || fail "dead-agent watcher round $round failed"; fi
+    wait_live "$pid" 15 || { wait "$pid" 2>/dev/null; fail "dead-agent declared pause re-surfaced on poll $round (should absorb on the bounded cadence, not flood)"; }
+    reap "$pid"
     round=$((round + 1))
   done
+  # Defensive: treat a missing queue as zero rather than letting awk error on an
+  # absent file leave an empty (non-integer) count. Round 1's asserted exit means
+  # the queue exists on the happy path, so this only clarifies a genuine failure.
+  [ -e "$state/.wake-queue" ] || fail "dead-agent declared pause wrote no wake at all (expected exactly one bounded recheck)"
   wakes=$(awk -F '\t' -v w="$window" '$3 == "stale" && $4 == w { n++ } END { print n + 0 }' "$state/.wake-queue")
   bare=$(awk -F '\t' -v w="$window" '$3 == "stale" && $4 == w && $5 == "stale: " w { n++ } END { print n + 0 }' "$state/.wake-queue")
   [ "$wakes" -le 1 ] || fail "dead-agent declared pause flooded $wakes stale wakes across six unchanged polls"

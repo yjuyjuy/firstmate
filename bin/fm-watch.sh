@@ -13,6 +13,13 @@
 # While away mode is on AND a live daemon for this home is actually running it,
 # the daemon owns triage and this watcher queues and exits on every wake; away
 # mode with no daemon is the away posture only and leaves triage here.
+# Exit contract: absorbing a benign wake NEVER exits the loop. Only two things
+# end a cycle - an actionable wake (a queued reason line, exit 0) or a real
+# internal error (a loud message, nonzero exit). A best-effort side effect that
+# fails while a wake is being ABSORBED (nothing is being surfaced) or after an
+# actionable wake is already durably queued must be logged and the loop continued
+# or the reason still surfaced; it must never be conflated with the internal-error
+# exit. See handle_push_transition for the event fast-path's version of this rule.
 # Printed reason lines:
 #   signal: <file>...      status/turn-end signals, surfaced when a listed status
 #                          has a captain-relevant verb OR a no-verb signal's crew
@@ -1613,13 +1620,39 @@ handle_push_transition() {  # <backend> <session> <record>
   window="$session:$pane_id"
   task=$(window_to_task "$window" "$STATE")
   if status_is_paused "$(last_status_line "$STATE/$task.status")"; then
+    # BENIGN absorb: the crew declared an external-wait pause, so the poll loop
+    # owns it on the long pause cadence and this fast-path takes no action. The
+    # dedupe-marker commit is a best-effort optimization (it stops the same
+    # blocked edge re-firing next cycle); its failure NEVER loses a wake, because
+    # nothing is being surfaced here. So a transient marker-write failure must
+    # NOT exit the watcher - doing so would turn a benign absorption into a FAILED
+    # exit and drop supervision of the whole fleet. Log it and keep polling; a
+    # short throttle prevents a hot loop if the write keeps failing (the missing
+    # marker just lets this same edge re-absorb on the next cycle, which is
+    # harmless for a paused pane).
     triage_log "absorbed push $to (declared pause, awaiting external): $window"
-    fm_backend_commit_transition "$backend" "$STATE" "$session" "$record" || exit 1
+    if ! fm_backend_commit_transition "$backend" "$STATE" "$session" "$record"; then
+      triage_log "push absorb dedupe-commit failed (continuing, not fatal): $window"
+      sleep 1
+    fi
     return
   fi
   reason="stale: $window (herdr: agent $to - waiting on human, escalated immediately, not via wedge timer)"
-  fm_wake_append stale "$window" "$reason" || exit 1
-  fm_backend_commit_transition "$backend" "$STATE" "$session" "$record" || exit 1
+  # A REAL internal error: the durable wake could not be enqueued, so the blocked
+  # crew would be lost entirely. This is distinct from a benign absorption - exit
+  # loudly (an explicit stderr line, not just a bare nonzero) so the failure is
+  # visible rather than silent.
+  if ! fm_wake_append stale "$window" "$reason"; then
+    echo "watcher: FAILED - could not enqueue a durable wake for a blocked crew ($window)" >&2
+    exit 1
+  fi
+  # The wake is now durably queued, so the supervisor WILL be surfaced regardless
+  # of what happens next. The dedupe-marker commit is a best-effort optimization
+  # ON TOP of that surface; a transient marker-write failure must not drop the
+  # surface. The wake drain collapses any duplicate stale-by-window record that a
+  # missing marker would let re-enqueue next cycle, so re-firing is harmless.
+  fm_backend_commit_transition "$backend" "$STATE" "$session" "$record" \
+    || triage_log "push escalate dedupe-commit failed (wake already queued, surfacing anyway): $window"
   mark_surfaced "$STATE/$task.status"
   wake "$reason"
 }

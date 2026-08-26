@@ -78,6 +78,76 @@ fi
 grep -q 'absorbed push' "$STATE_DIR/.watch-triage.log" 2>/dev/null || fail "the paused absorb should be logged to the triage log"
 pass "handle_push_transition: a declared-pause crew is absorbed (no fast wake), left to the poll loop's long cadence"
 
+# --- handle_push_transition: a BENIGN absorb survives a dedupe-commit failure ---
+# Regression for the benign-wake-exits-FAILED defect: the declared-pause absorb
+# branch used `fm_backend_commit_transition ... || exit 1`, so a transient
+# marker-write failure tore down the WHOLE watcher (a benign absorption became a
+# FAILED exit that dropped supervision of the entire fleet). The commit is only a
+# best-effort dedupe optimization here - nothing is being surfaced - so its
+# failure must CONTINUE the loop, never exit. The benign path is run in a subshell
+# so a stray `exit` is caught as a failure of THIS test rather than aborting the
+# whole file.
+reset_state
+fm_write_meta "$STATE_DIR/tk2.meta" "window=default:wG:pQ" "backend=herdr" "kind=ship"
+printf 'paused: waiting on the upstream release\n' > "$STATE_DIR/tk2.status"
+commit_rc=0
+(
+  # A commit that always fails, modeling a transient marker-write error.
+  fm_backend_commit_transition() { return 1; }
+  # A tighter sleep so the throttle does not slow the suite; the point under test
+  # is that control RETURNS, not the throttle duration.
+  sleep() { :; }
+  handle_push_transition herdr default "$(mkrec wG:pQ blocked)"
+) >/dev/null 2>&1 || commit_rc=$?
+[ "$commit_rc" -eq 0 ] || fail "a benign paused-absorb whose dedupe-commit fails must CONTINUE (return 0), not exit (got $commit_rc)"
+if [ -e "$STATE_DIR/.wake-queue" ] && grep -q 'stale' "$STATE_DIR/.wake-queue"; then
+  fail "a benign paused-absorb with a failing commit must still enqueue nothing: $(cat "$STATE_DIR/.wake-queue")"
+fi
+[ ! -s "$WAKE_LOG" ] || fail "a benign paused-absorb with a failing commit must not wake the supervisor"
+grep -q 'dedupe-commit failed (continuing, not fatal)' "$STATE_DIR/.watch-triage.log" 2>/dev/null \
+  || fail "the non-fatal commit failure should be logged to the triage log"
+pass "handle_push_transition: a benign paused-absorb whose dedupe-commit fails continues the loop (never a FAILED exit)"
+
+# --- handle_push_transition: an ACTIONABLE wake still surfaces when the ------
+#     post-enqueue dedupe-commit fails --------------------------------------
+# The actionable branch also used `|| exit 1` on the post-enqueue commit, so a
+# transient marker-write failure exited the watcher WITHOUT surfacing the reason -
+# the blocked crew's wake was already queued but the supervisor was never woken
+# (arm read it as FAILED). The wake is durable once enqueued, so a commit failure
+# must NOT drop the surface: the record stays queued and the supervisor is woken.
+reset_state
+fm_write_meta "$STATE_DIR/tk1.meta" "window=default:wG:pQ" "backend=herdr" "kind=ship"
+surface_rc=0
+(
+  fm_backend_commit_transition() { return 1; }
+  handle_push_transition herdr default "$(mkrec wG:pQ blocked)"
+) >/dev/null 2>&1 || surface_rc=$?
+[ "$surface_rc" -eq 0 ] || fail "an actionable wake whose post-enqueue commit fails must still surface (return 0), not exit (got $surface_rc)"
+[ -e "$STATE_DIR/.wake-queue" ] || fail "the blocked crew's wake must remain durably enqueued despite the commit failure"
+grep -q 'stale' "$STATE_DIR/.wake-queue" || fail "the enqueued wake must be a stale record: $(cat "$STATE_DIR/.wake-queue")"
+grep -q 'herdr: agent blocked' "$STATE_DIR/.wake-queue" || fail "the stale payload must name the herdr-blocked cause"
+[ -s "$WAKE_LOG" ] || fail "an actionable wake must wake the supervisor even when the dedupe-commit fails"
+grep -q 'stale: default:wG:pQ' "$WAKE_LOG" || fail "the surfaced wake reason must name the blocked crew's window: $(cat "$WAKE_LOG")"
+pass "handle_push_transition: an actionable blocked crew still surfaces (queue + wake) when the post-enqueue dedupe-commit fails"
+
+# --- handle_push_transition: a REAL error (enqueue failure) exits LOUDLY ------
+# The durable enqueue failing is a genuine internal error - the blocked crew's
+# wake would be lost entirely - so it MUST still exit, and loudly (an explicit
+# "watcher: FAILED" line, distinct from a benign absorption's silent continue) so
+# the arm layer and operator see a real failure rather than an empty cycle.
+reset_state
+fm_write_meta "$STATE_DIR/tk1.meta" "window=default:wG:pQ" "backend=herdr" "kind=ship"
+err_out="$TMP/push-enqueue-fail.err"
+real_rc=0
+(
+  fm_wake_append() { return 1; }
+  handle_push_transition herdr default "$(mkrec wG:pQ blocked)"
+) >/dev/null 2>"$err_out" || real_rc=$?
+[ "$real_rc" -ne 0 ] || fail "a durable enqueue failure must exit non-zero (real internal error), got $real_rc"
+grep -q 'watcher: FAILED' "$err_out" || fail "a durable enqueue failure must announce a loud 'watcher: FAILED' line, got: $(cat "$err_out")"
+[ ! -e "$STATE_DIR/.herdr-escalated-default_wG_pQ" ] || fail "a failed durable enqueue must not commit the Herdr dedupe marker"
+pass "handle_push_transition: a durable enqueue failure exits loudly with a distinct FAILED line (a real error, not a benign continue)"
+
 # --- event_wait_or_sleep: secondmate windows are excluded from the pane list --
 
 reset_state
