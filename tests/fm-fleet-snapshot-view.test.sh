@@ -116,10 +116,178 @@ EOF
     "mode=ship"
 }
 
+# Compact default projection: identity + state + title capped at 120 with an
+# inline full-source pointer + decision/PR metadata + aggregate counts, bounded
+# by the ceiling. Presence (ABSENT vs empty vs content) survives; fat fields
+# restore via --fields; the empty home still renders explicit absence markers.
+test_compact_default_projection() {
+  local home out chars
+  home=$(make_home compact-default)
+  write_fixture "$home"
+  out=$(FM_HOME="$home" "$SNAPSHOT" --json)
+  chars=$(printf '%s' "$out" | LC_ALL=C wc -c | tr -d ' ')
+  [ "$chars" -le 20000 ] || fail "compact default must stay under the default ceiling, got $chars chars"
+  printf '%s' "$out" | jq -e '
+    .schema == "fm-fleet-snapshot.v1"
+      and .mode == "compact"
+      and .projection.mode == "compact"
+      and .projection.ceiling == 20000
+      and (.projection.truncated | length) == 0
+      and (.backlog.records | length) == 5
+      and .backlog.records[0].title == "Scout Task"
+      and (.backlog.records[0] | has("raw") | not)
+      and (.backlog.records[0] | has("body_lines") | not)
+      and (.backlog.records[0] | has("body_excerpt") | not)
+      and (.tasks | any(.[]; .id == "ship-task" and ((.actions | has("watch")) | not)))
+      and (.tasks | any(.[]; .id == "ship-task" and ((.paths.meta | has("path")) | not)))
+      and (.tasks | any(.[]; .id == "ship-task" and ((.paths.worktree.path // "") != "")))
+      and (.tasks | any(.[]; .id == "secondmate-task" and ((.paths.home.path // "") != "")))
+      and .summary.backlog_total == 5
+      and .summary.backlog_in_flight == 2
+      and .summary.backlog_queued == 2
+      and .summary.backlog_done == 1
+      and .summary.tasks_total == 4
+      and .summary.tasks_secondmates == 1
+      and .summary.landed == 1
+      and .summary.scout_reports_total == 1
+  ' >/dev/null || fail "compact default projection shape wrong: $out"
+  # Presence survives the projection: an empty home keeps explicit ABSENT
+  # markers and a true empty inventory in compact mode.
+  home=$(make_home compact-empty)
+  out=$(FM_HOME="$home" "$SNAPSHOT" --json)
+  printf '%s' "$out" | jq -e '
+    .mode == "compact"
+      and .backlog.present == false
+      and .backlog.records == []
+      and .main_inventory.valid == true
+      and .main_inventory.reason == null
+      and (.tasks | length) == 0
+      and .summary.backlog_total == 0
+      and .summary.tasks_total == 0
+  ' >/dev/null || fail "compact empty home lost ABSENT markers: $out"
+  pass "compact default stays under the ceiling with identity, state, titles, counts, and presence"
+}
+
+test_compact_fields_body_restores_full_backlog() {
+  local home out
+  home=$(make_home compact-body)
+  write_fixture "$home"
+  out=$(FM_HOME="$home" "$SNAPSHOT" --json --fields body)
+  printf '%s' "$out" | jq -e '
+    .mode == "compact"
+      and (.backlog.records | length) == 5
+      and (.backlog.records[] | select(.id == "ship-task")
+        | .raw == "- [ ] ship-task - Ship Task https://github.com/kunchenguid/firstmate/pull/9 (repo: alpha) (kind: ship) (priority: 2) (since 2026-07-07)"
+          and .body_lines == ["Preserve this detail for bearings."]
+          and .body_excerpt == "Preserve this detail for bearings."
+          and .title == "Ship Task")
+      and (.backlog.records[] | select(.id == "queued-task")
+        | .body_lines == [] and .unresolved_blocker_ids == ["ship-task"])
+  ' >/dev/null || fail "--fields body must restore raw, bodies, excerpts, and full titles: $out"
+  pass "--fields body restores the full backlog bodies"
+}
+
+test_compact_title_truncation_carries_pointer() {
+  local home out
+  home=$(make_home compact-title)
+  mkdir -p "$home/projects/t-wt"
+  cat > "$home/data/backlog.md" <<EOF
+## In flight
+- [ ] long-title - $(printf 'word%.0s ' {1..40}) (repo: alpha) (kind: ship)
+## Queued
+free-form queued note with no canonical syntax and a long tail $(printf 'word%.0s ' {1..40})
+## Done
+EOF
+  fm_write_meta "$home/state/t.meta" \
+    "window=firstmate:fm-t" \
+    "worktree=$home/projects/t-wt" \
+    "project=alpha" \
+    "harness=codex" \
+    "kind=ship" \
+    "mode=ship"
+  out=$(FM_HOME="$home" "$SNAPSHOT" --json)
+  printf '%s' "$out" | jq -e '
+    (.backlog.records[] | select(.id == "long-title"))
+    | (.title | length) <= 175
+      and (.title | startswith("word"))
+      and (.title | contains("… (full: tasks-axi show long-title)"))
+  ' >/dev/null || fail "structured title truncation lost its inline pointer: $out"
+  printf '%s' "$out" | jq -e '
+    (.backlog.records[] | select(.structured == false))
+    | (.title | contains("… (full: "))
+  ' >/dev/null || fail "unstructured row pointer must name the full-source path: $out"
+  pass "compact title truncation carries the full-source pointer inline"
+}
+
+test_summary_mode_counts() {
+  local home out
+  home=$(make_home summary-mode)
+  write_fixture "$home"
+  out=$(FM_HOME="$home" "$SNAPSHOT" --summary)
+  printf '%s' "$out" | jq -e '
+    .schema == "fm-fleet-snapshot.v1"
+      and .mode == "summary"
+      and (.summary | has("backlog_total") and has("backlog_in_flight")
+           and has("backlog_queued") and has("backlog_done")
+           and has("captain_actionable") and has("tasks_total")
+           and has("tasks_working") and has("tasks_secondmates")
+           and has("decisions_open") and has("landed")
+           and has("scout_reports_total") and has("secondmates_total"))
+      and .summary.backlog_total == 5
+      and .summary.tasks_total == 4
+      and .summary.landed == 1
+      and .summary.scout_reports_total == 1
+  ' >/dev/null || fail "--summary counts wrong: $out"
+  pass "--summary emits the aggregate counts object"
+}
+
+test_compact_ceiling_trims_with_disclosure() {
+  local home out chars i body
+  home=$(make_home compact-ceiling)
+  mkdir -p "$home/projects/t-wt"
+  body=$(printf 'x%.0s' {1..300})
+  {
+    printf '## In flight\n'
+    for i in $(seq 1 200); do
+      printf -- '- [ ] big-%03d - Big Task %03d %s (repo: alpha) (kind: ship) (since 2026-07-07)\n' "$i" "$i" "$body"
+    done
+  } > "$home/data/backlog.md"
+  fm_write_meta "$home/state/big-001.meta" \
+    "window=firstmate:fm-big-001" \
+    "worktree=$home/projects/t-wt" \
+    "project=alpha" \
+    "harness=codex" \
+    "kind=ship" \
+    "mode=ship"
+  out=$(FM_HOME="$home" FM_SNAPSHOT_COMPACT_CEILING=6000 "$SNAPSHOT" --json)
+  chars=$(printf '%s' "$out" | LC_ALL=C wc -c | tr -d ' ')
+  [ "$chars" -le 6000 ] || fail "compact output must respect the ceiling, got $chars chars"
+  printf '%s' "$out" | jq -e '
+    .projection.ceiling == 6000
+      and .projection.chars <= 6000
+      and .summary.backlog_total == 200
+      and (.backlog.records | length) < 200
+      and .backlog.records_truncated == true
+      and (.backlog.records_total == 200)
+      and (.projection.truncated | any(.[];
+        .surface == "backlog records" and .total == 200 and .shown < 200 and (.reveal | startswith("fm-fleet-snapshot.sh --json --fields body"))))
+      and (.projection.full_hint == "fm-fleet-snapshot.sh --json --full")
+  ' >/dev/null || fail "ceiling trim lacked disclosure: $out"
+  pass "the hard ceiling trims rows with full aggregate and reveal disclosure"
+}
+
+test_compact_unknown_field_fails_closed() {
+  local home
+  home=$(make_home compact-badfield)
+  FM_HOME="$home" "$SNAPSHOT" --json --fields bogus >/dev/null 2>&1 \
+    && fail "an unknown --fields name must fail closed"
+  pass "unknown --fields names are rejected instead of silently ignored"
+}
+
 test_empty_fleet_json() {
   local home out view
   home=$(make_home empty)
-  out=$(FM_HOME="$home" "$SNAPSHOT" --json)
+  out=$(FM_HOME="$home" "$SNAPSHOT" --json --full)
   printf '%s' "$out" | jq -e '
     .schema == "fm-fleet-snapshot.v1"
       and .backlog.present == false
@@ -140,7 +308,7 @@ test_fixture_snapshot_json() {
   home=$(make_home fixture)
   write_fixture "$home"
   fakebin=$(make_fakebin "$home")
-  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json)
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json --full)
   printf '%s' "$out" | jq -e . >/dev/null || fail "snapshot must be valid JSON"
   ids=$(printf '%s' "$out" | jq -r '.tasks | map(.id) | join(",")')
   [ "$ids" = "cmux-task,scout-task,secondmate-task,ship-task" ] \
@@ -208,7 +376,7 @@ EOF
     "mode=ship"
   printf 'working: visible\n' > "$home/state/visible-ship.status"
   fakebin=$(make_fakebin "$home")
-  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json)
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json --full)
   printf '%s' "$out" | jq -e '
     .main_inventory.valid == false
       and .main_inventory.reason == "unstructured current backlog row"
@@ -235,7 +403,7 @@ EOF
     "kind=ship" \
     "mode=ship"
   printf 'working: orphan now live\n' > "$home/state/orphan-ship.status"
-  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json)
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json --full)
   printf '%s' "$out" | jq -e '
     .main_inventory.valid == true
       and .main_inventory.reason == null
@@ -268,7 +436,7 @@ EOF
     "harness=codex" "kind=ship" "mode=ship"
   printf 'working: preparing canary\n' > "$home/state/worker.status"
   fakebin=$(make_fakebin "$home")
-  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json)
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json --full)
   printf '%s' "$out" | jq -e '
     .main_inventory.orphan_in_flight == ["orphan"]
       and (.backlog.records[] | select(.id == "program")
@@ -297,7 +465,7 @@ EOF
 - [x] worker - Real worker (repo: alpha) (kind: ship) (done 2026-07-22)
 EOF
   rm "$home/state/worker.meta" "$home/state/worker.status"
-  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json)
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json --full)
   printf '%s' "$out" | jq -e '
     .backlog.records[] | select(.id == "captain-run")
     | .blocked_by == "review"
@@ -318,7 +486,7 @@ EOF
 - [x] worker - Real worker (repo: alpha) (kind: ship) (done 2026-07-22)
 - [x] review - Security review (repo: alpha) (kind: ship) (done 2026-07-22)
 EOF
-  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json)
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json --full)
   printf '%s' "$out" | jq -e '
     .backlog.records[] | select(.id == "captain-run")
     | .blocked_by == "review"
@@ -329,7 +497,7 @@ EOF
 
   sed 's/blocked-by: review/blocked-by: missing/' "$home/data/backlog.md" > "$home/data/backlog.next"
   mv "$home/data/backlog.next" "$home/data/backlog.md"
-  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json)
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json --full)
   printf '%s' "$out" | jq -e '
     .backlog.records[] | select(.id == "captain-run")
     | .blocked_by_ids == ["worker", "missing"]
@@ -380,7 +548,7 @@ test_event_hints_follow_reconciled_current_state() {
     "mode=ship"
   printf 'blocked: old failure\n' > "$home/state/stale-blocked.status"
   fakebin=$(make_fakebin "$home")
-  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json)
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json --full)
   printf '%s' "$out" | jq -e '
     def task($id): (.tasks[] | select(.id == $id));
     task("active-decision").current_state.state == "parked"
@@ -405,7 +573,7 @@ test_scout_reports_include_teardown_reports() {
 EOF
   printf '# Reported Scout\n' > "$home/data/reported-scout/report.md"
   printf '# Untracked Scout\n' > "$home/data/untracked-scout/report.md"
-  out=$(FM_HOME="$home" "$SNAPSHOT" --json)
+  out=$(FM_HOME="$home" "$SNAPSHOT" --json --full)
   printf '%s' "$out" | jq -e --arg home "$home" '
     (.tasks | length) == 0
       and .scout_reports == [
@@ -449,7 +617,7 @@ EOF
     "mode=scout"
   printf 'done: report ready\n' > "$home/state/bold-task.status"
   fakebin=$(make_fakebin "$home")
-  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_DATA_OVERRIDE="$data" FM_PROJECTS_OVERRIDE="$projects" "$SNAPSHOT" --json)
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_DATA_OVERRIDE="$data" FM_PROJECTS_OVERRIDE="$projects" "$SNAPSHOT" --json --full)
   printf '%s' "$out" | jq -e --arg data "$data" --arg projects "$projects" '
     .roots.data == $data
       and .roots.projects == $projects
@@ -647,7 +815,7 @@ test_gap3_pairs_event_with_current_state_old_and_superseded() {
     || touch -t "$(date -r "$old_epoch" +%Y%m%d%H%M.%S 2>/dev/null)" "$home/state/gap3-ship-task.status"
   fakebin=$(make_running_run_fakebin "$home" fm/gap3-ship-task "$head")
   out=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_SNAPSHOT_NOW_EPOCH="$now" \
-    FM_SNAPSHOT_NOW="2027-01-15T08:00:00Z" "$SNAPSHOT" --json)
+    FM_SNAPSHOT_NOW="2027-01-15T08:00:00Z" "$SNAPSHOT" --json --full)
   printf '%s' "$out" | jq -e '
     .tasks[] | select(.id == "gap3-ship-task")
     | .current_state.state == "working"
@@ -681,7 +849,7 @@ test_gap3_fresh_agreeing_event_is_paired_without_markers() {
     "mode=ship"
   printf 'blocked: waiting on access\n' > "$home/state/fresh-ship.status"
   fakebin=$(make_fakebin "$home")
-  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json)
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json --full)
   printf '%s' "$out" | jq -e '
     .tasks[] | select(.id == "fresh-ship")
     | .current_state.superseded == false
@@ -732,7 +900,7 @@ count_429=2
 observed_at=1784841300
 EOF
   fakebin=$(make_fakebin "$home")
-  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json)
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json --full)
   printf '%s' "$out" | jq -e '
     .tasks[] | select(.id == "t1")
     | .telemetry.account == "claude-2"
@@ -778,7 +946,7 @@ test_open_decision_survives_later_unrelated_event() {
   printf 'working: implementing an unrelated subsystem\n' >> "$home/state/masked-decision.status"
   printf 'done: an unrelated subtask finished\n' >> "$home/state/masked-decision.status"
   fakebin=$(make_fakebin "$home")
-  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json)
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json --full)
   printf '%s' "$out" | jq -e '
     .tasks[] | select(.id == "masked-decision")
     | .hints.pending_decision == true
@@ -804,7 +972,7 @@ test_secondmate_open_decision_survives_live_endpoint() {
     "projects=alpha"
   printf 'needs-decision [key=race]: choose ordering\n' > "$home/state/active-secondmate.status"
   fakebin=$(make_fakebin "$home")
-  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json)
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json --full)
   printf '%s' "$out" | jq -e '
     .tasks[] | select(.id == "active-secondmate")
     | .endpoint.agent_alive == "alive"
@@ -832,7 +1000,7 @@ test_open_decision_transfers_to_captain_hold() {
   printf 'needs-decision [key=route]: choose a sample route\n' > "$home/state/transferred-decision.status"
   printf 'captain-held [key=route]: tracked by transferred-decision-route\n' >> "$home/state/transferred-decision.status"
   fakebin=$(make_fakebin "$home")
-  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json)
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json --full)
   printf '%s' "$out" | jq -e '
     .tasks[] | select(.id == "transferred-decision")
     | .hints.pending_decision == false
@@ -858,7 +1026,7 @@ test_open_decision_clears_on_keyed_resolution() {
   printf 'done: an unrelated subtask finished\n' >> "$home/state/resolved-decision.status"
   printf 'resolved [key=race]: captain chose subscribe-then-reconcile\n' >> "$home/state/resolved-decision.status"
   fakebin=$(make_fakebin "$home")
-  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json)
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json --full)
   printf '%s' "$out" | jq -e '
     .tasks[] | select(.id == "resolved-decision")
     | .hints.pending_decision == false
@@ -892,7 +1060,7 @@ test_completed_scout_report_is_pointer_not_pending() {
   # Completed report whose PROSE reads like the decision.
   printf '# Lavish 103\nThe open question is whether to adopt approach A or B.\nThis needs a captain decision. Recommendation: A.\n' > "$home/data/lavish-103/report.md"
   fakebin=$(make_fakebin "$home")
-  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json)
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json --full)
   printf '%s' "$out" | jq -e '
     .tasks[] | select(.id == "lavish-103")
     | .current_state.state == "done"
@@ -919,7 +1087,7 @@ test_parked_scout_decision_stays_pending() {
     "mode=scout"
   printf 'needs-decision [key=q1]: adopt approach A or B\n' > "$home/state/parked-scout.status"
   fakebin=$(make_fakebin "$home")
-  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json)
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json --full)
   printf '%s' "$out" | jq -e '
     .tasks[] | select(.id == "parked-scout")
     | .hints.pending_decision == true
@@ -950,7 +1118,7 @@ test_large_backlog_survives_argv_limit() {
   bytes=$(wc -c < "$home/data/backlog.md")
   [ "$bytes" -gt 131072 ] \
     || fail "fixture backlog must exceed MAX_ARG_STRLEN (128KB), got $bytes bytes"
-  out=$(FM_HOME="$home" "$SNAPSHOT" --json) \
+  out=$(FM_HOME="$home" "$SNAPSHOT" --json --full) \
     || fail "snapshot must not fail on a >128KB backlog (argv-limit regression)"
   printf '%s' "$out" | jq -e '
     .schema == "fm-fleet-snapshot.v1"
@@ -989,6 +1157,16 @@ test_large_blobs_reach_jq_via_stdin_not_argv() {
   pass "large snapshot blobs reach jq on stdin, never as --argjson argv (ARG_MAX regression)"
 }
 
+# Compact default projection: identity + state + title capped at 120 with an
+# inline full-source pointer + decision/PR metadata + aggregate counts, bounded
+# by the ceiling. Presence (ABSENT vs empty vs content) survives; fat fields
+# restore via --fields; the empty home still renders explicit absence markers.
+test_compact_default_projection
+test_compact_fields_body_restores_full_backlog
+test_compact_title_truncation_carries_pointer
+test_summary_mode_counts
+test_compact_ceiling_trims_with_disclosure
+test_compact_unknown_field_fails_closed
 test_empty_fleet_json
 test_fixture_snapshot_json
 test_main_inventory_orphan_and_unstructured_disclosure

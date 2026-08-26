@@ -174,14 +174,27 @@ if [ "${FM_BEARINGS_SKIP_AFK_GUARD:-0}" != 1 ]; then
 fi
 
 NOW=${FM_BEARINGS_NOW:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}
+# The canonical snapshot's DEFAULT is a compact projection bounded by a hard
+# ceiling. Bearings renders bodies (SUPERSEDED gate filter), status events,
+# aggregated secondmate records/landed, and the scout-report inventory, so it
+# restores exactly those surfaces and keeps its own output byte-identical while
+# the producer's compact default stays cheap for every other caller. Bearings'
+# own --fields actions/paths opt-ins need the producer's surfaces too.
+SNAP_FIELDS="body,events,secondmates,reports"
+case ",$FIELDS," in
+  *",actions,"*) SNAP_FIELDS="$SNAP_FIELDS,actions" ;;
+  *",paths,"*) SNAP_FIELDS="$SNAP_FIELDS,paths" ;;
+esac
 if [ "$ALL_LANDED" = 1 ] || [ "$ALL_SECONDMATES" = 1 ]; then
   if [ "$ALL_LANDED" = 1 ]; then
-    SNAP=$(FM_SNAPSHOT_NOW="$NOW" FM_SNAPSHOT_SECONDMATES=0 FM_SNAPSHOT_SECONDMATE_LANDED_PER_HOME=0 "$FLEET" --json) || exit $?
+    SNAP=$(FM_SNAPSHOT_NOW="$NOW" FM_SNAPSHOT_SECONDMATES=0 FM_SNAPSHOT_SECONDMATE_LANDED_PER_HOME=0 \
+      "$FLEET" --json --fields "$SNAP_FIELDS") || exit $?
   else
-    SNAP=$(FM_SNAPSHOT_NOW="$NOW" FM_SNAPSHOT_SECONDMATES=0 "$FLEET" --json) || exit $?
+    SNAP=$(FM_SNAPSHOT_NOW="$NOW" FM_SNAPSHOT_SECONDMATES=0 \
+      "$FLEET" --json --fields "$SNAP_FIELDS") || exit $?
   fi
 else
-  SNAP=$(FM_SNAPSHOT_NOW="$NOW" "$FLEET" --json) || exit $?
+  SNAP=$(FM_SNAPSHOT_NOW="$NOW" "$FLEET" --json --fields "$SNAP_FIELDS") || exit $?
 fi
 HOME_LABEL=$(printf '%s' "$SNAP" | jq -er '.fm_home | strings | split("/") | (.[-2:] | join("/"))') \
   || { echo "fm-bearings-snapshot: invalid canonical snapshot" >&2; exit 1; }

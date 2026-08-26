@@ -6,8 +6,34 @@
 # The command is read-only: it does not acquire the session lock, drain wakes,
 # arm watchers, mutate backlog state, or write reports.
 #
+# Default output is a COMPACT projection (mode:"compact") bounded by a hard
+# size ceiling, so a per-call read stays cheap no matter how the fleet grows.
+# `--full` restores the complete serialization (the historical shape, byte for
+# byte), and `--fields <name,...>` restores individual fat surfaces:
+#   body        - backlog raw lines, full bodies, body excerpts, full titles
+#   events      - per-task status-log last event, last-event text, current-state raw
+#   actions     - per-task watch/steer/send actions
+#   paths       - per-task path values (compact keeps only presence flags)
+#   secondmates - full secondmate_current records and the full landed roll-up
+#   reports     - the full scout-report pointer list
+# The compact default keeps: record identity, state, title capped at 120 chars
+# with an inline full-source pointer, decision/PR metadata (blocked_by,
+# hold_reason, hold_kind, PR links, completion, captain_actionable), aggregate
+# summary counts, and a projection block that discloses every truncation with
+# its reveal command. Presence (ABSENT vs empty vs content) is preserved, and
+# the ceiling is enforced mechanically by trimming rows in a fixed order with
+# disclosure, never by silent elision.
+# `--summary` prints only the aggregate counts object.
+#
 # Top-level fields:
 #   schema: stable schema id.
+#   mode: "compact" (default) or "full" (--full); absent in the historical
+#     full shape, which --full reproduces byte for byte.
+#   projection: compact-only block with ceiling, chars, restored fields,
+#     truncated[] disclosure (surface, shown, total, reveal), and the
+#     full-output hint.
+#   summary: compact-only aggregate counts (backlog by state, captain holds,
+#     tasks, working, secondmates, open decisions, landed, scout reports).
 #   generated: UTC observation time for this fresh command execution.
 #   fm_home: resolved operational home.
 #   roots: resolved root/config/data/state/projects directories.
@@ -20,6 +46,8 @@
 #     requires_child_metadata, blocked_by_ids, unresolved_blocker_ids, and
 #     captain_actionable fields. Repeated blocker tokens remain ordered; a blocker
 #     resolves only when its structured record is Done, and missing ids stay open.
+#     Compact rows additionally carry body_lines_count and records_shown,
+#     records_total, records_truncated on the backlog object.
 #   tasks[]: one row per state/<id>.meta, sorted by id.
 #     current_state is parsed from bin/fm-crew-state.sh <id> and preserves
 #     state, source, detail, and raw line separately.
@@ -50,14 +78,21 @@
 #     Each structured-home record carries active_children, decisions_open, holds,
 #     queued, landed, endpoints, counts, and omitted. Actionable captain holds
 #     appear in decisions_open; blocked captain holds remain queued with metadata.
+#     Compact records keep id, home, current, provenance, freshness,
+#     active_children, decisions_open (summaries capped with a pointer), counts,
+#     omitted, and contradiction; holds/queued/landed/parent evidence restore
+#     via --fields secondmates.
 #   secondmate_landed: {records[],truncated[],unreadable[],partial[]} - the
 #     compatibility landed-work roll-up derived from secondmate_current. Readable
 #     structured homes with an unknown current classification are partial, not
 #     unreadable, and retain independently trustworthy structured surfaces.
+#     Compact mode adds records_total/records_shown and caps the list.
 #   secondmate_guidance: return-channel action note for renderers and bearings.
 #
 # Compatibility: JSON is the primary machine-readable surface.
 # Human views must render this output instead of parsing state files again.
+# Consumers that render fat fields pass --fields/--full so their view is
+# unaffected by the compact default (fm-fleet-view.sh, fm-bearings-snapshot.sh).
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -145,11 +180,28 @@ validate_positive_bound FM_SNAPSHOT_REGISTRY_TIMEOUT "$FM_SNAPSHOT_REGISTRY_TIME
 
 usage() {
   cat <<'EOF'
-usage: fm-fleet-snapshot.sh --json
+usage: fm-fleet-snapshot.sh [--json] [--full] [--summary] [--fields <name,...>]
        fm-fleet-snapshot.sh --secondmate-home-summary
 
 Print a read-only structured snapshot of the firstmate fleet.
 JSON is the stable machine-readable output contract.
+
+--fields <name,...>  opt in to fat surfaces in the compact default:
+  body        backlog raw lines, full bodies, body excerpts, full titles
+  events      per-task status-log last event, last-event text, current-state raw
+  actions     per-task watch/steer/send actions
+  paths       per-task path values (compact keeps presence flags only)
+  secondmates full secondmate_current records and the full landed roll-up
+  reports     the full scout-report pointer list
+--full        the complete serialization (historical shape, byte for byte);
+              overrides --fields.
+--summary     print only the aggregate counts object (schema fm-fleet-snapshot.v1,
+              mode "summary") and exit.
+The default compact projection carries identity, state, titles capped at 120
+chars with inline full-source pointers, decision/PR metadata, aggregate counts,
+and a projection block disclosing every truncation with its reveal command.
+The output is bounded by FM_SNAPSHOT_COMPACT_CEILING (default 20000 chars),
+enforced by trimming rows in a fixed order with disclosure, never silence.
 
 --secondmate-home-summary emits the bounded structured summary used after a
 validated registered-home handoff. It is local-only, skips nested secondmate
@@ -172,13 +224,51 @@ FM_SNAPSHOT_REGISTRY_TIMEOUT, with unavailability and truncation disclosed.
 EOF
 }
 
-OUTPUT_MODE=json
-case "${1:---json}" in
-  --json) ;;
-  --secondmate-home-summary) OUTPUT_MODE=secondmate-home-summary ;;
-  -h|--help) usage; exit 0 ;;
-  *) usage >&2; exit 2 ;;
+# Compact-default hard ceiling. Enforced by trimming rows in a fixed order with
+# disclosure (projection.truncated[]), never by silent elision.
+FM_SNAPSHOT_COMPACT_CEILING=${FM_SNAPSHOT_COMPACT_CEILING:-20000}
+case "$FM_SNAPSHOT_COMPACT_CEILING" in
+  ''|*[!0-9]*|0) echo "fm-fleet-snapshot: FM_SNAPSHOT_COMPACT_CEILING must be a positive integer" >&2; exit 2 ;;
 esac
+
+OUTPUT_MODE=json
+FULL=0
+SUMMARY=0
+FIELDS=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --json) OUTPUT_MODE=json ;;
+    --secondmate-home-summary) OUTPUT_MODE=secondmate-home-summary ;;
+    --full) FULL=1 ;;
+    --summary) SUMMARY=1 ;;
+    --fields) shift; FIELDS="${FIELDS:+$FIELDS,}${1:-}" ;;
+    --fields=*) FIELDS="${FIELDS:+$FIELDS,}${1#--fields=}" ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+if [ -n "$FIELDS" ]; then
+  # Normalize to a comma-joined set in a fixed order, rejecting unknown names
+  # so a typo fails closed instead of silently printing the compact default.
+  NORMALIZED_FIELDS=""
+  for name in body events actions paths secondmates reports; do
+    case ",$FIELDS," in
+      *",$name,"*) NORMALIZED_FIELDS="${NORMALIZED_FIELDS:+$NORMALIZED_FIELDS,}$name" ;;
+    esac
+  done
+  for name in $(printf '%s' "$FIELDS" | tr ',' ' '); do
+    case "$name" in
+      body|events|actions|paths|secondmates|reports) ;;
+      *)
+        echo "fm-fleet-snapshot: unknown --fields name '$name' (valid: body, events, actions, paths, secondmates, reports)" >&2
+        exit 2
+        ;;
+    esac
+  done
+  FIELDS=$NORMALIZED_FIELDS
+fi
 
 command -v jq >/dev/null 2>&1 || { echo "fm-fleet-snapshot: jq not found" >&2; exit 1; }
 
@@ -1389,6 +1479,292 @@ scout_report_lines() {
     | jq -s 'sort_by(.id)'
 }
 
+full_assembly() {  # <backlog> <tasks> <main-inventory> <scout-reports> <secondmate-current> <secondmate-landed>
+  printf '%s\n%s\n%s\n%s\n%s\n%s\n' \
+    "$1" "$2" "$3" "$4" "$5" "$6" | jq -n \
+    --arg generated "$SNAPSHOT_NOW" \
+    --arg fm_home "$FM_HOME" \
+    --arg fm_root "$FM_ROOT" \
+    --arg state "$STATE" \
+    --arg data "$DATA" \
+    --arg config "$CONFIG" \
+    --arg projects "$PROJECTS" \
+    '(input) as $backlog | (input) as $tasks
+     | (input) as $main_inventory | (input) as $scout_reports
+     | (input) as $secondmate_current | (input) as $secondmate_landed
+     | def backlog_by_id($id): ($backlog.records[]? | select(.structured == true and .id == $id) | .) // null;
+     def task_by_id($id): ($tasks[]? | select(.id == $id) | .) // null;
+     def report_kind($id): (task_by_id($id).kind // backlog_by_id($id).kind // "scout");
+     {
+       schema:"fm-fleet-snapshot.v1",
+       generated:$generated,
+       fm_home:$fm_home,
+       roots:{fm_root:$fm_root,state:$state,data:$data,config:$config,projects:$projects},
+       backlog:$backlog,
+       tasks:($tasks | map(. + {backlog:backlog_by_id(.id)})),
+       main_inventory:($main_inventory | .orphan_in_flight_total = (.orphan_in_flight | length)),
+       scout_reports:($scout_reports | map(. + {kind:report_kind(.id)})),
+       secondmate_current:$secondmate_current,
+       secondmate_landed:$secondmate_landed,
+       secondmate_guidance:{
+         note:"For kind=secondmate, bearings selects validated structured state from that registered home; parent events and bounded terminal evidence are fallback-only supplements and never current-state authority."
+       }
+     }'
+}
+
+# Compact default assembly: identity + state + title (capped 120 with an inline
+# full-source pointer) + decision/PR metadata + aggregate counts, with fat fields
+# restored only when --fields names them. Rows trim in a fixed priority order
+# (scratch pointers first, then history, then backlog, then secondmate records,
+# then live tasks) until the hard ceiling holds; every cut is disclosed in
+# projection.truncated[] with its reveal command. A compact projection NEVER
+# fails to silence: the header, roots, main_inventory, summary counts, and the
+# projection block always survive.
+compact_assembly() {  # <fields> <ceiling>
+  local fields=$1 ceiling=$2 compact chars trim_target step
+  compact=$(printf '%s\n%s\n%s\n%s\n%s\n%s\n' \
+    "$BACKLOG_JSON" "$TASKS_JSON" \
+    "$MAIN_INVENTORY_JSON" "$SCOUT_REPORTS_JSON" \
+    "$SECONDMATE_CURRENT_JSON" "$SECONDMATE_LANDED_JSON" | jq -c -n \
+    --arg generated "$SNAPSHOT_NOW" \
+    --arg fm_home "$FM_HOME" \
+    --arg fm_root "$FM_ROOT" \
+    --arg state "$STATE" \
+    --arg data "$DATA" \
+    --arg config "$CONFIG" \
+    --arg projects "$PROJECTS" \
+    --arg fields "$fields" \
+    --argjson cap_backlog 60 \
+    --argjson cap_reports 8 \
+    --argjson cap_landed 15 \
+    '
+    def trunc_s($n): tostring | gsub("\\s+"; " ") | if (length > $n) then (.[:$n] + "…") else . end;
+    def title_row($id; $path):
+      if . == null then null else
+      (tostring | gsub("\\s+"; " ")) as $t
+      | if (($t | length) > 120) then
+          $t[:120] + "… (full: " + (if $id != null then "tasks-axi show \($id)" else $path end) + ")"
+        else $t end
+      end;
+    def dec_row($n; $source_path):
+      if . == null then null else
+        (tostring | gsub("\\s+"; " ") | if (length > $n) then (.[:$n] + "… (full: \($source_path))") else . end)
+      end;
+    def drop_empty: with_entries(select(.value != null and .value != "" and .value != []));
+    (input) as $backlog | (input) as $tasks
+    | (input) as $main_inventory | (input) as $scout_reports
+    | (input) as $secondmate_current | (input) as $secondmate_landed
+    | ($fields | split(",") | map(select(. != ""))) as $fl
+    | ((($fl | index("body")) != null)) as $f_body
+    | ((($fl | index("events")) != null)) as $f_events
+    | ((($fl | index("actions")) != null)) as $f_actions
+    | ((($fl | index("paths")) != null)) as $f_paths
+    | ((($fl | index("secondmates")) != null)) as $f_secondmates
+    | ((($fl | index("reports")) != null)) as $f_reports
+    | def backlog_by_id($id): ($backlog.records[]? | select(.structured == true and .id == $id) | .) // null;
+      def task_by_id($id): ($tasks[]? | select(.id == $id) | .) // null;
+      def report_kind($id): (task_by_id($id).kind // backlog_by_id($id).kind // "scout");
+    {
+      schema:"fm-fleet-snapshot.v1",
+      mode:"compact",
+      generated:$generated,
+      fm_home:$fm_home,
+      roots:{fm_root:$fm_root,state:$state,data:$data,config:$config,projects:$projects},
+      backlog:(if $f_body then $backlog
+               else $backlog + {
+                 records:([ $backlog.records[]
+                            | select(.state == "in_flight" or .state == "queued" or .state == "done")
+                            | (.id) as $rid
+                            | . + {title:(if .structured then (.title | title_row($rid; $backlog.path))
+                                          else (.raw | title_row(null; $backlog.path)) end),
+                                   body_lines_count:(.body_lines | length),
+                                   completion:(if (.completion.verb != null) then .completion else null end)}
+                            | del(.raw, .body_lines, .body_excerpt)
+                            | (if .state == "in_flight" then 0
+                               elif .state == "queued" then 1
+                               else 2 end) as $prio
+                            | . + {_prio:$prio} ]
+                          | sort_by(._prio, .order)
+                          | .[:$cap_backlog] | map(del(._prio) | drop_empty)),
+                 records_shown: ([([ $backlog.records[] | select(.state == "in_flight" or .state == "queued" or .state == "done")] | length), $cap_backlog] | min),
+                 records_total: ($backlog.records | length),
+                 records_truncated: (($backlog.records | length) > $cap_backlog)
+               } end),
+      tasks:([ $tasks[] as $t
+               | {id:$t.id, kind:$t.kind, backend:$t.backend, project:$t.project,
+                  telemetry:$t.telemetry,
+                  paths:{meta:{present:$t.paths.meta.present},
+                         status_log:{present:$t.paths.status_log.present},
+                         worktree:{path:$t.paths.worktree.path, present:$t.paths.worktree.present},
+                         home:{path:$t.paths.home.path, present:$t.paths.home.present},
+                         report:{present:$t.paths.report.present}},
+                  current_state:{state:$t.current_state.state,
+                                 source:$t.current_state.source,
+                                 detail:($t.current_state.detail | dec_row(200; $t.paths.status_log.path // ""))},
+                  endpoint:{target:$t.endpoint.target, exists:$t.endpoint.exists, agent_alive:$t.endpoint.agent_alive},
+                  pr:{url:($t.pr.url // null), source:$t.pr.source},
+                  hints:{pending_decision:$t.hints.pending_decision,
+                         blocked_event:$t.hints.blocked_event,
+                         scout_report_present:$t.hints.scout_report_present,
+                         open_decisions:[ ($t.hints.open_decisions // [])[]? | . + {summary:(.summary | dec_row(160; $t.paths.status_log.path // ""))} ]}}
+               | if $f_events then
+                   .paths.status_log = $t.paths.status_log
+                   | .current_state = $t.current_state
+                   | .hints.last_event_text = $t.hints.last_event_text
+                 else . end
+               | if $f_actions then .actions = $t.actions else . end
+               | if $f_paths then .paths = $t.paths else . end
+               | if $f_secondmates then . + {secondmate_projects:$t.secondmate_projects} else . end ]
+               | map(. + {backlog:backlog_by_id(.id)})),
+      main_inventory:($main_inventory | .orphan_in_flight_total = (.orphan_in_flight | length)),
+      scout_reports:(if $f_reports
+                     then ($scout_reports | map(. + {kind:report_kind(.id)}))
+                     else ($scout_reports[:$cap_reports] | map(. + {kind:report_kind(.id)})) end),
+      secondmate_current:(if $f_secondmates then $secondmate_current
+                          else $secondmate_current + {
+                            records:[ $secondmate_current.records[]
+                                      | (.home // "") as $mhome
+                                      | {id,home,registered,
+                                         current:{state:.current.state,reason:.current.reason},
+                                         invalidity,
+                                         provenance:({selected:.provenance.selected,trust:.provenance.trust} | drop_empty),
+                                         freshness:({status:.freshness.status} | drop_empty),
+                                         active_children,
+                                         decisions_open:[ (.decisions_open // [])[]? | . + {summary:(.summary | dec_row(160; "secondmate home " + $mhome))} ],
+                                         endpoints,counts,omitted,contradiction}
+                                      | drop_empty ] } end),
+      secondmate_landed:(if $f_secondmates
+                         then $secondmate_landed | .records_total = (.records | length) | .records_shown = (.records | length)
+                         else $secondmate_landed
+                           | .records = [.records[:$cap_landed][]? | . as $rec | $rec + {
+                               title:($rec.title | title_row($rec.id; "secondmate backlog")),
+                               id:($rec.id | trunc_s(120)),
+                               home_id:($rec.home_id | trunc_s(120))} | drop_empty ]
+                           | .records_total = (.["records_total"] // (($secondmate_landed.records | length)))
+                           | .records_shown = (.records | length) end),
+      secondmate_guidance:{
+        note:"For kind=secondmate, bearings selects validated structured state from that registered home; parent events and bounded terminal evidence are fallback-only supplements and never current-state authority."
+      },
+      summary:{
+        backlog_total:($backlog.records | length),
+        backlog_in_flight:([ $backlog.records[] | select(.state == "in_flight")] | length),
+        backlog_queued:([ $backlog.records[] | select(.state == "queued")] | length),
+        backlog_done:([ $backlog.records[] | select(.state == "done")] | length),
+        captain_actionable:([ $backlog.records[] | select(.captain_actionable == true)] | length),
+        tasks_total:($tasks | length),
+        tasks_working:([ $tasks[] | select(.current_state.state == "working")] | length),
+        tasks_secondmates:([ $tasks[] | select(.kind == "secondmate")] | length),
+        decisions_open:([ $tasks[] | .hints.open_decisions[]? ] | length),
+        landed:(([ $backlog.records[] | select(.state == "done" and .structured and .kind != "captain")] | length) + ($secondmate_landed.records | length)),
+        scout_reports_total:($scout_reports | length),
+        secondmates_total:($secondmate_current.total)
+      }
+    }')
+  chars=$(printf '%s' "$compact" | LC_ALL=C wc -c | tr -d ' ')
+  # Reserve headroom for the projection wrap so the final output cannot exceed
+  # the ceiling; rows trim in priority order (pointers, history, backlog,
+  # secondmate records, live tasks) and every cut is disclosed at wrap time.
+  # A surface restored via --fields is NEVER trimmed: the caller asked for it.
+  trim_target=$((ceiling - 2048))
+  # shellcheck disable=SC2016  # each step is a literal jq filter, not a shell expression
+  if [ "$chars" -gt "$trim_target" ]; then
+    for step in \
+      '(if (($fields | split(",") | index("reports")) == null) then .scout_reports = .scout_reports[:5] else . end)' \
+      '(if (($fields | split(",") | index("secondmates")) == null) then .secondmate_landed.records = .secondmate_landed.records[:8] else . end)' \
+      '(if (($fields | split(",") | index("body")) == null) then .backlog.records = .backlog.records[:40] else . end)' \
+      '(if (($fields | split(",") | index("body")) == null) then .main_inventory.orphan_in_flight = .main_inventory.orphan_in_flight[:20] else . end)' \
+      '(if (($fields | split(",") | index("reports")) == null) then .scout_reports = .scout_reports[:2] else . end)' \
+      '(if (($fields | split(",") | index("secondmates")) == null) then .secondmate_landed.records = .secondmate_landed.records[:4] else . end)' \
+      '(if (($fields | split(",") | index("body")) == null) then .backlog.records = .backlog.records[:25] else . end)' \
+      '(if (($fields | split(",") | index("secondmates")) == null) then .secondmate_current.records = .secondmate_current.records[:6] else . end)' \
+      '(if (($fields | split(",") | index("reports")) == null) then .scout_reports = [] else . end)' \
+      '(if (($fields | split(",") | index("body")) == null) then .backlog.records = .backlog.records[:15] else . end)' \
+      '(if (($fields | split(",") | index("events")) == null and (($fields | split(",") | index("actions")) == null) and (($fields | split(",") | index("paths")) == null)) then .tasks = .tasks[:8] else . end)' \
+      '(if (($fields | split(",") | index("secondmates")) == null) then .secondmate_current.records = .secondmate_current.records[:4] else . end)' \
+      '(if (($fields | split(",") | index("body")) == null) then .backlog.records = .backlog.records[:8] else . end)' \
+      '(if (($fields | split(",") | index("secondmates")) == null) then .secondmate_landed.records = [] else . end)' \
+      '(if (($fields | split(",") | index("events")) == null and (($fields | split(",") | index("actions")) == null) and (($fields | split(",") | index("paths")) == null)) then .tasks = .tasks[:5] else . end)' \
+      '(if (($fields | split(",") | index("secondmates")) == null) then .secondmate_current.records = .secondmate_current.records[:2] else . end)' \
+      '(if (($fields | split(",") | index("events")) == null and (($fields | split(",") | index("actions")) == null) and (($fields | split(",") | index("paths")) == null)) then .tasks = .tasks[:3] else . end)' \
+      '(if (($fields | split(",") | index("body")) == null) then .backlog.records = .backlog.records[:3] else . end)' \
+    ; do
+      compact=$(printf '%s' "$compact" | jq -c --arg fields "$fields" "$step")
+      chars=$(printf '%s' "$compact" | LC_ALL=C wc -c | tr -d ' ')
+      [ "$chars" -le "$trim_target" ] && break
+    done
+  fi
+  compact=$(printf '%s' "$compact" | jq -c \
+    --argjson ceiling "$ceiling" \
+    --arg fields "$fields" \
+    '
+    def truncated($surface; $shown; $total; $reveal):
+      if ($shown < $total) then [{surface:$surface,shown:$shown,total:$total,reveal:$reveal}] else [] end;
+    . as $d
+    | .backlog.records_shown = (.backlog.records | length)
+    | .backlog.records_truncated = ((.backlog.records | length) < .backlog.records_total)
+    | .secondmate_landed.records_shown = (.secondmate_landed.records | length)
+    | .mode = "compact"
+    | .projection = {
+        mode:"compact",
+        ceiling:$ceiling,
+        chars:null,
+        fields:($fields | split(",") | map(select(. != ""))),
+        title_truncated_at:120,
+        decision_summary_truncated_at:160,
+        truncated:(
+          truncated("backlog records"; (.backlog.records | length); .backlog.records_total; "fm-fleet-snapshot.sh --json --fields body") +
+          truncated("task rows"; (.tasks | length); .summary.tasks_total; "fm-fleet-snapshot.sh --json --fields events,actions,paths") +
+          truncated("scout report pointers"; (.scout_reports | length); .summary.scout_reports_total; "fm-fleet-snapshot.sh --json --fields reports") +
+          truncated("secondmate records"; (.secondmate_current.records | length); .summary.secondmates_total; "fm-fleet-snapshot.sh --json --fields secondmates") +
+          truncated("secondmate landed rows"; (.secondmate_landed.records | length); .secondmate_landed.records_total; "fm-fleet-snapshot.sh --json --fields secondmates") +
+          truncated("main inventory orphan ids"; (.main_inventory.orphan_in_flight | length); .main_inventory.orphan_in_flight_total; "fm-fleet-snapshot.sh --json --full")
+        ),
+        full_hint:"fm-fleet-snapshot.sh --json --full",
+        note:"Compact default projection: identity, state, title capped at 120 (inline full-source pointer), decision/PR metadata, and aggregate counts. Fat per-record text restores via --fields; the ceiling is enforced here, never silently."
+      }')
+  chars=$(printf '%s' "$compact" | LC_ALL=C wc -c | tr -d ' ')
+  if [ "$chars" -gt "$ceiling" ] && [ -z "$fields" ]; then
+    # Hard backstop: header, roots, main_inventory, summary counts, and the
+    # projection block always survive; row arrays clear with full disclosure.
+    compact=$(printf '%s' "$compact" | jq -c \
+      '.backlog.records=[] | .tasks=[] | .scout_reports=[]
+       | .secondmate_current.records=[] | .secondmate_landed.records=[]
+       | .main_inventory.orphan_in_flight=[]
+       | .projection.chars = null')
+    compact=$(printf '%s' "$compact" | jq --argjson ceiling "$ceiling" --arg fields "$fields" '
+      def truncated($surface; $shown; $total; $reveal):
+        if ($shown < $total) then [{surface:$surface,shown:$shown,total:$total,reveal:$reveal}] else [] end;
+      . as $d
+      | .backlog.records_shown = 0
+      | .backlog.records_truncated = ((.backlog.records | length) < .backlog.records_total)
+      | .secondmate_landed.records_shown = 0
+      | .mode = "compact"
+      | .projection = {
+          mode:"compact", ceiling:$ceiling, chars:null,
+          fields:($fields | split(",") | map(select(. != ""))),
+          title_truncated_at:120, decision_summary_truncated_at:160,
+          truncated:(
+            truncated("backlog records"; 0; .summary.backlog_total; "fm-fleet-snapshot.sh --json --fields body") +
+            truncated("task rows"; 0; .summary.tasks_total; "fm-fleet-snapshot.sh --json --fields events,actions,paths") +
+            truncated("scout report pointers"; 0; .summary.scout_reports_total; "fm-fleet-snapshot.sh --json --fields reports") +
+            truncated("secondmate records"; 0; .summary.secondmates_total; "fm-fleet-snapshot.sh --json --fields secondmates") +
+            truncated("secondmate landed rows"; 0; .summary.landed; "fm-fleet-snapshot.sh --json --fields secondmates") +
+            truncated("main inventory orphan ids"; 0; .main_inventory.orphan_in_flight_total; "fm-fleet-snapshot.sh --json --full")
+          ),
+          full_hint:"fm-fleet-snapshot.sh --json --full",
+          note:"Compact default projection: identity, state, title capped at 120 (inline full-source pointer), decision/PR metadata, and aggregate counts. This output hit the hard ceiling and row arrays cleared; the summary counts above are complete."
+        }')
+    chars=$(printf '%s' "$compact" | LC_ALL=C wc -c | tr -d ' ')
+  fi
+  compact=$(printf '%s' "$compact" | jq -c --argjson chars "$chars" --arg fields "$fields" '.projection.chars = $chars
+  | if (.projection.chars > .projection.ceiling) and ($fields != "") then
+      .projection.note = (.projection.note + " This call restored fields via --fields, so the ceiling does not bind the restored surfaces; chars " + (.projection.chars|tostring) + " exceed ceiling " + (.projection.ceiling|tostring) + ".")
+    else . end')
+  # The compact default prints as one JSON line: its whole contract is a size
+  # bound. --full keeps the pretty historical shape.
+  printf '%s\n' "$compact"
+}
+
 BACKLOG_JSON=$(backlog_json) || { echo "fm-fleet-snapshot: backlog read failed" >&2; exit 1; }
 TASKS_JSON=$(task_json_lines) || { echo "fm-fleet-snapshot: task snapshot failed" >&2; exit 1; }
 
@@ -1406,35 +1782,17 @@ SECONDMATE_CURRENT_JSON=$(secondmate_current_json "$TASKS_JSON") \
 SECONDMATE_LANDED_JSON=$(secondmate_landed_from_current_json "$SECONDMATE_CURRENT_JSON") \
   || { echo "fm-fleet-snapshot: secondmate landed projection failed" >&2; exit 1; }
 
-printf '%s\n%s\n%s\n%s\n%s\n%s\n' \
-  "$BACKLOG_JSON" "$TASKS_JSON" \
-  "$MAIN_INVENTORY_JSON" "$SCOUT_REPORTS_JSON" \
-  "$SECONDMATE_CURRENT_JSON" "$SECONDMATE_LANDED_JSON" | jq -n \
-  --arg generated "$SNAPSHOT_NOW" \
-  --arg fm_home "$FM_HOME" \
-  --arg fm_root "$FM_ROOT" \
-  --arg state "$STATE" \
-  --arg data "$DATA" \
-  --arg config "$CONFIG" \
-  --arg projects "$PROJECTS" \
-  '(input) as $backlog | (input) as $tasks
-   | (input) as $main_inventory | (input) as $scout_reports
-   | (input) as $secondmate_current | (input) as $secondmate_landed
-   | def backlog_by_id($id): ($backlog.records[]? | select(.structured == true and .id == $id) | .) // null;
-   def task_by_id($id): ($tasks[]? | select(.id == $id) | .) // null;
-   def report_kind($id): (task_by_id($id).kind // backlog_by_id($id).kind // "scout");
-   {
-     schema:"fm-fleet-snapshot.v1",
-     generated:$generated,
-     fm_home:$fm_home,
-     roots:{fm_root:$fm_root,state:$state,data:$data,config:$config,projects:$projects},
-     backlog:$backlog,
-     tasks:($tasks | map(. + {backlog:backlog_by_id(.id)})),
-     main_inventory:$main_inventory,
-     scout_reports:($scout_reports | map(. + {kind:report_kind(.id)})),
-     secondmate_current:$secondmate_current,
-     secondmate_landed:$secondmate_landed,
-     secondmate_guidance:{
-       note:"For kind=secondmate, bearings selects validated structured state from that registered home; parent events and bounded terminal evidence are fallback-only supplements and never current-state authority."
-     }
-   }'
+if [ "$SUMMARY" = 1 ]; then
+  compact_assembly "$FIELDS" "$FM_SNAPSHOT_COMPACT_CEILING" \
+    | jq '{schema, mode:"summary", generated, fm_home, summary}'
+  exit 0
+fi
+
+if [ "$FULL" = 1 ]; then
+  full_assembly "$BACKLOG_JSON" "$TASKS_JSON" \
+    "$MAIN_INVENTORY_JSON" "$SCOUT_REPORTS_JSON" \
+    "$SECONDMATE_CURRENT_JSON" "$SECONDMATE_LANDED_JSON"
+  exit 0
+fi
+
+compact_assembly "$FIELDS" "$FM_SNAPSHOT_COMPACT_CEILING"

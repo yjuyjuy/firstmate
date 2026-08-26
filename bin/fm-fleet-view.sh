@@ -13,20 +13,24 @@ usage() {
 usage: fm-fleet-view.sh [--json]
 
 Render a human fleet view from fm-fleet-snapshot.sh.
-Use --json to print the underlying snapshot.
+Use --json to print the underlying full snapshot.
 EOF
 }
 
 case "${1:-}" in
   -h|--help) usage; exit 0 ;;
-  --json) "$SCRIPT_DIR/fm-fleet-snapshot.sh" --json; exit $? ;;
+  # The underlying full snapshot is the debug/parity read; the render below
+  # asks the producer for exactly the surfaces it renders (backlog bodies for
+  # raw/title fallback, status events, watch/steer actions, and path values)
+  # so the compact default projection never changes the rendered view.
+  --json) exec "$SCRIPT_DIR/fm-fleet-snapshot.sh" --json --full ;;
   "") ;;
   *) usage >&2; exit 2 ;;
 esac
 
 command -v jq >/dev/null 2>&1 || { echo "fm-fleet-view: jq not found" >&2; exit 1; }
 
-SNAPSHOT=$("$SCRIPT_DIR/fm-fleet-snapshot.sh" --json) || exit $?
+SNAPSHOT=$("$SCRIPT_DIR/fm-fleet-snapshot.sh" --json --fields body,events,actions,paths) || exit $?
 
 printf '%s\n' "$SNAPSHOT" | jq -r '
   def dash($v): if $v == null or $v == "" then "-" else $v end;
