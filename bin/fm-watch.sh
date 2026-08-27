@@ -1258,7 +1258,9 @@ surface_nonterminal_stale() {  # <window> <hash>
   # this surface is its bounded hold-recheck, so it escalates exactly as before.
   if ! status_is_paused_or_captain_held "$last" && nudge_stale_worker "$win"; then
     printf '%s' "$h" > "$STATE/.stale-$key"
-    date +%s > "$STATE/.stale-since-$key"
+    # Atomic restart: a reader polling on .stale-nudged (written first, inside
+    # nudge_stale_worker) must never observe .stale-since mid-truncate as empty.
+    date +%s > "$STATE/.stale-since-$key.tmp" && mv -f "$STATE/.stale-since-$key.tmp" "$STATE/.stale-since-$key"
     rm -f "$STATE/.wedge-escalations-$key" "$STATE/.stale-verdict-$key"
     return 0
   fi
