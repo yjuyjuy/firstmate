@@ -1,0 +1,31 @@
+{
+  "note": "Data-driven model-tier map. The single owner is bin/fm-token-tier-lib.sh; this file is its data. A recorded model id is matched, case-insensitively, against each tier's glob patterns in array order; the first tier with any matching pattern wins, and a model that matches no tier falls into default_tier. So a NEW model lands in a sensible tier without a code edit, and an unrecognized model lands in the explicit default bucket rather than a fabricated tier. Patterns are shell-style globs (fnmatch): * matches any run, so wrap a substring in *...* to match anywhere. The fleet splits tooling work to the cheap deepseek flash lane and product work to opus, so those two tiers are the ones that matter; extend the patterns here (not the code) as the fleet's model mix changes.",
+  "tiers": [
+    {
+      "tier": "tooling",
+      "match": [
+        "*deepseek*flash*",
+        "deepseek-4-flash",
+        "*flash*",
+        "*haiku*",
+        "*gpt-oss*",
+        "*grok-code*",
+        "*mini*"
+      ]
+    },
+    {
+      "tier": "product",
+      "match": [
+        "*opus*",
+        "*sonnet*",
+        "*fable*",
+        "gpt-5*",
+        "*gpt-5*",
+        "*grok-4*",
+        "*deepseek*pro*",
+        "*gemini*pro*"
+      ]
+    }
+  ],
+  "default_tier": "other"
+}

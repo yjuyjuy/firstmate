@@ -93,6 +93,28 @@
 #                                                        (sessions with no
 #                                                        ledger row land in
 #                                                        "unattributed")
+#   fm-token-report.sh --period <range> --by-tier        group by SPEND TIER of
+#                                                        the recorded model
+#                                                        (tooling vs product vs
+#                                                        other), so the cheap
+#                                                        deepseek-flash lane's
+#                                                        savings versus the opus
+#                                                        product lane are visible;
+#                                                        each tier line also
+#                                                        reports its distinct
+#                                                        attributed-ticket count.
+#                                                        The model->tier map is
+#                                                        data-driven from
+#                                                        config/model-tiers.json
+#                                                        (bin/fm-token-tier-lib.sh
+#                                                        is its single owner), so
+#                                                        a new model lands in a
+#                                                        sensible tier without a
+#                                                        code edit; an unpriced
+#                                                        model still surfaces its
+#                                                        tokens in the labeled
+#                                                        UNKNOWN bucket, never a
+#                                                        fabricated $0.
 #   fm-token-report.sh ... --json                        stable machine output
 #   fm-token-report.sh ... --precise                     per-message time
 #                                                        bucketing (D5 option b)
@@ -100,8 +122,8 @@
 #
 # --period <range> forms: all | today | Nd (e.g. 7d) | YYYY-MM-DD |
 #   YYYY-MM-DD..YYYY-MM-DD (both ends inclusive by whole day).
-# --by <time-unit> composes with --by-model / --by-provider / --by-ticket
-#   (e.g. --period 7d --by day --by-ticket = daily cost per ticket).
+# --by <time-unit> composes with --by-model / --by-provider / --by-ticket /
+#   --by-tier (e.g. --period 7d --by week --by-tier = weekly cost per spend tier).
 #
 # --retro details (D4): the ticket must have NO ledger rows (pre-capture) and a
 #   completion record in data/completions.tsv. The completion's close date ends
@@ -127,9 +149,11 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 . "$SCRIPT_DIR/fm-token-sessions-lib.sh"
 # shellcheck source=bin/fm-completions-lib.sh disable=SC1091
 . "$SCRIPT_DIR/fm-completions-lib.sh"
+# shellcheck source=bin/fm-token-tier-lib.sh disable=SC1091
+. "$SCRIPT_DIR/fm-token-tier-lib.sh"
 
 usage() {
-  sed -n '2,112p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,138p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 die() {
@@ -177,8 +201,11 @@ while [ $# -gt 0 ]; do
       [ -z "$BY_DIM" ] || die "choose one of --by-model, --by-provider, or --by-ticket, not two"
       BY_DIM=provider; shift ;;
     --by-ticket)
-      [ -z "$BY_DIM" ] || die "choose one of --by-model, --by-provider, or --by-ticket, not two"
+      [ -z "$BY_DIM" ] || die "choose one of --by-model, --by-provider, --by-ticket, or --by-tier, not two"
       BY_DIM=ticket; shift ;;
+    --by-tier)
+      [ -z "$BY_DIM" ] || die "choose one of --by-model, --by-provider, --by-ticket, or --by-tier, not two"
+      BY_DIM=tier; shift ;;
     --json) JSON=1; shift ;;
     --precise) PRECISE=1; shift ;;
     --retro) RETRO=1; shift ;;
@@ -201,11 +228,15 @@ esac
 
 if [ "$MODE" = session ] || [ "$MODE" = ticket ]; then
   [ -z "$BY_TIME" ] && [ -z "$BY_DIM" ] && [ "$PRECISE" -eq 0 ] \
-    || die "--by, --by-model, --by-provider, --by-ticket, and --precise apply to --period, not a session or task-id"
+    || die "--by, --by-model, --by-provider, --by-ticket, --by-tier, and --precise apply to --period, not a session or task-id"
 fi
 
 if [ "$BY_DIM" = ticket ]; then
   [ "$MODE" = period ] || die "--by-ticket applies only to --period"
+fi
+
+if [ "$BY_DIM" = tier ]; then
+  [ "$MODE" = period ] || die "--by-tier applies only to --period"
 fi
 
 if [ "$RETRO" -eq 1 ]; then
@@ -545,14 +576,34 @@ for (b, model, provider, route, ticket), row in agg.items():
 PY
 }
 
+# Build a JSON object mapping every distinct model in a costed TSV to its spend
+# tier, using the ONE tier owner (fm_token_tier_of over config/model-tiers.json).
+# The tier boundary is resolved here, in bash, exactly once per distinct model,
+# so the render pass only LOOKS UP a model's tier and never re-implements the
+# glob matching. Reads the costed file (model is field 2) from $1.
+build_tier_map() {
+  local costed_file=$1 model tier first=1
+  printf '{'
+  while IFS= read -r model; do
+    [ -n "$model" ] || continue
+    tier=$(fm_token_tier_of "$model")
+    if [ "$first" -eq 1 ]; then first=0; else printf ','; fi
+    FM_TM_MODEL="$model" FM_TM_TIER="$tier" python3 -c \
+      'import json,os,sys; sys.stdout.write(json.dumps(os.environ["FM_TM_MODEL"])+":"+json.dumps(os.environ["FM_TM_TIER"]))'
+  done < <(cut -f2 "$costed_file" | sort -u)
+  printf '}'
+}
+
 # Pass B: render. Reads the COSTED rows from the file named by $FM_TR_COSTED
 # (each carrying a lib-produced cost or an empty cost for an unpriced model) and
 # only SUMS them per display group. No costing formula lives here. The rows come
 # from a file rather than stdin because python's own script is fed on stdin by
 # the heredoc below, so stdin is already consumed.
 render_period() {
-  local costed_file=$1
+  local costed_file=$1 tiermap="{}"
+  [ "$BY_DIM" = tier ] && tiermap=$(build_tier_map "$costed_file")
   FM_TR_COSTED="$costed_file" FM_TR_BYTIME="$BY_TIME" FM_TR_BYDIM="$BY_DIM" \
+    FM_TR_TIERMAP="$tiermap" \
     FM_TR_JSON="$JSON" FM_TR_PRECISE="$PRECISE" FM_TR_PERIOD="$PERIOD" \
     FM_TR_START="$PERIOD_START" FM_TR_END="$PERIOD_END" FM_TR_PS="$PRICE_SOURCE" \
     FM_TR_PC="$PRICE_CACHED" python3 - <<'PY'
@@ -569,6 +620,10 @@ start = os.environ.get("FM_TR_START", "")
 end = os.environ.get("FM_TR_END", "")
 price_source = os.environ.get("FM_TR_PS", "")
 price_cached = os.environ.get("FM_TR_PC", "")
+try:
+    tier_map = json.loads(os.environ.get("FM_TR_TIERMAP", "{}") or "{}")
+except ValueError:
+    tier_map = {}
 
 
 def blank():
@@ -580,6 +635,7 @@ def blank():
         "has_priced": False,
         "unk_tokens": 0,
         "unk_models": set(),
+        "tickets": set(),
         "ti": 0,
         "to": 0,
         "cr": 0,
@@ -604,6 +660,8 @@ for line in costed_lines:
         dim = provider
     elif bydim == "ticket":
         dim = ticket
+    elif bydim == "tier":
+        dim = tier_map.get(model, "other")
     else:
         dim = ""
     key = (bucket, dim)
@@ -616,6 +674,12 @@ for line in costed_lines:
     g["to"] += int(to)
     g["cr"] += int(cr)
     g["cw"] += int(cw)
+    # Distinct attributed tickets per group, so --by-tier can report how many
+    # tickets each spend tier served (the fleet's cheap-lane-savings question is
+    # "how much spend AND how many tickets on the cheap lane"). "unattributed"
+    # is a real bucket, not a ticket, so it never counts.
+    if ticket and ticket != "unattributed":
+        g["tickets"].add(ticket)
     if cost != "":
         c = float(cost)
         g["cost"] += c
@@ -637,6 +701,7 @@ for g in groups.values():
         total[k] += g[k]
     total["has_priced"] = total["has_priced"] or g["has_priced"]
     total["unk_models"] |= g["unk_models"]
+    total["tickets"] |= g["tickets"]
 
 # Sort: by bucket ascending (chronological for every time unit), then by cost
 # descending within a bucket, then dimension name for determinism.
@@ -662,6 +727,8 @@ if as_json:
                 "bucket": bucket if bytime else None,
                 "dimension": dim if bydim else None,
                 "ticket": dim if bydim == "ticket" else None,
+                "tier": dim if bydim == "tier" else None,
+                "ticket_count": len(g["tickets"]) if bydim == "tier" else None,
                 "sessions": g["sessions"],
                 "token_input": g["ti"],
                 "token_output": g["to"],
@@ -696,6 +763,7 @@ if as_json:
             "cost_if_api_estimate": False,
             "unknown_model_tokens": total["unk_tokens"],
             "unknown_models": sorted(total["unk_models"]),
+            "ticket_count": len(total["tickets"]) if bydim == "tier" else None,
         },
     }
     json.dump(obj, sys.stdout, indent=2, sort_keys=True)
@@ -715,19 +783,25 @@ def render_row(label, g):
     if g["unk_tokens"] > 0:
         models = ",".join(sorted(g["unk_models"]))
         unk_tail = "  [unknown-model tokens %s | %s]" % (commafy(g["unk_tokens"]), models)
+    # For --by-tier, show the distinct attributed-ticket count alongside spend
+    # so the cheap-lane-savings question ("how much AND how many tickets") is
+    # answered on one line.
+    tier_tail = "  tickets=%d" % len(g["tickets"]) if bydim == "tier" else ""
     if g["has_priced"]:
-        return "%s  sessions=%d  cost_if_api $%s  covered $%s / api $%s%s" % (
+        return "%s  sessions=%d%s  cost_if_api $%s  covered $%s / api $%s%s" % (
             label,
             g["sessions"],
+            tier_tail,
             money(g["cost"]),
             money(g["covered"]),
             money(g["billed"]),
             unk_tail,
         )
     # No priced tokens at all: withhold dollars, show the tokens (never $0).
-    return "%s  sessions=%d  cost_if_api UNKNOWN (no price)  tokens %s%s" % (
+    return "%s  sessions=%d%s  cost_if_api UNKNOWN (no price)  tokens %s%s" % (
         label,
         g["sessions"],
+        tier_tail,
         commafy(g["ti"] + g["to"] + g["cr"] + g["cw"]),
         unk_tail,
     )

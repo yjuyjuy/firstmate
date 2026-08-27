@@ -94,6 +94,25 @@ Bake these honesty rules into any cost section, they are the hard-won constraint
 
 This is optional and cost is not a throughput number, so keep it a distinct section (below), never conflated with COMMITS / LANDINGS / FILED.
 
+## Step 3c - optional spend by model tier
+
+For the cheap-lane-savings question - "how much are we spending on the cheap tooling lane versus the expensive product lane, and how many tickets each" - group weekly spend by the recorded model's spend tier:
+
+```
+# weekly spend + distinct ticket count per tier, human table:
+bin/fm-token-report.sh --period 7d --by week --by-tier
+# whole-window per-tier rollup:
+bin/fm-token-report.sh --period <range> --by-tier
+# stable machine output (rows carry tier + ticket_count):
+bin/fm-token-report.sh --period <range> --by-tier --json
+```
+
+The `--by-tier` grouping rides the same join and the same one coster (`bin/fm-token-lib.sh`) every other `bin/fm-token-report.sh` path uses, so a tier's dollars equal the sum of its models' dollars exactly.
+The model-to-tier map is data-driven from the tracked snapshot `config/model-tiers.json`, whose single owner is `bin/fm-token-tier-lib.sh`; a new model lands in a sensible tier by editing those patterns, never a code edit.
+The fleet deliberately routes tooling work to the cheap `deepseek-v4-flash` lane and product work to `opus`, so the `tooling` versus `product` split is the one that makes the savings visible; a model matching no tier lands in the explicit `other` bucket.
+The same honesty rules apply: an unpriced model's tier withholds dollars and shows its tokens in a labeled `UNKNOWN` bucket, never a fabricated `$0`, and the covered-versus-billed split is reported, not folded together.
+This is optional and belongs in the ticket-cost section (below), never conflated with the throughput numbers.
+
 ## Step 4 - assemble the report
 
 Write `data/work-report-<slug>/report.md` with these sections, mirroring the reference report:
