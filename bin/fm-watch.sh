@@ -164,6 +164,14 @@ mkdir -p "$STATE"
 # shellcheck source=bin/fm-telemetry-lib.sh
 . "$SCRIPT_DIR/fm-telemetry-lib.sh"
 
+# Immediate herdr pane-exit detection: on a confirmed dead herdr pane for a
+# tracked task, capture the last ~20 pane lines to state/<id>.crash-tail and
+# enqueue one `check: pane-crashed <id>` wake so recovery starts with evidence.
+# Herdr-only, meta-gated, idempotent - see fm_pane_crash_capture. Assumes
+# fm-backend.sh and fm-wake-lib.sh are already sourced above.
+# shellcheck source=bin/fm-pane-crash-lib.sh
+. "$SCRIPT_DIR/fm-pane-crash-lib.sh"
+
 WATCH_LOCK="$STATE/.watch.lock"
 WATCH_PATH="$SCRIPT_DIR/fm-watch.sh"
 WATCHER_STALE_GRACE=${FM_WATCHER_STALE_GRACE:-${FM_GUARD_GRACE:-900}}
@@ -1971,6 +1979,17 @@ EOF
     fi
     if [ "$kind" = secondmate ] && ! status_is_paused "$last"; then
       continue
+    fi
+    # Immediate herdr pane-exit detection: a dead pane makes the capture below
+    # fail and `continue` past every stale/wedge path, so the crash evidence
+    # would only surface much later via a liveness sweep. Check FIRST, before the
+    # capture short-circuit, so a confirmed dead pane records its crash-tail and
+    # wakes firstmate now. Herdr-only, meta-gated, idempotent (see
+    # fm_pane_crash_capture): a no-op for every live pane and every other backend,
+    # printing `captured` only on the one fresh detection of a death, so this
+    # wakes exactly once and never re-fires for the same crash.
+    if [ "$(fm_pane_crash_capture "$(window_backend "$w")" "$w" "$task" "$STATE")" = captured ]; then
+      wake "check: pane-crashed $task"
     fi
     tail40=$(fm_backend_capture "$(window_backend "$w")" "$w" 40 "$(window_label "$w")" 2>/dev/null) || continue
     h=$(printf '%s' "$tail40" | hash_pane)
