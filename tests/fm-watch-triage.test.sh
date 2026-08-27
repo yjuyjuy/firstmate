@@ -944,6 +944,13 @@ test_provably_working_wedge_nudged_once_then_escalated() {
 
   # Phase C: still silent past the restarted grace window - escalate with the
   # ordinary escalation count, never a second nudge.
+  # Reset the escalation counter to the state Phase B is meant to leave behind
+  # (a nudge sent, nothing yet escalated). On an overloaded runner the Phase B
+  # watcher can outlive its reap and keep polling past the 240s window, letting
+  # its own straggler poll escalate and pre-increment .wedge-escalations before
+  # Phase C ever starts; clearing it here anchors the first post-nudge escalation
+  # at count 1 deterministically without weakening the assertion.
+  rm -f "$state/.wedge-escalations-$key"
   echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
   : > "$out"
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
