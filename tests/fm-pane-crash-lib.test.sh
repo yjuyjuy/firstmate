@@ -115,4 +115,32 @@ assert_absent "$STATE/taskC.crash-tail" "an unknown pane must never fabricate a 
 [ -z "$(wake_queue_records)" ] || fail "an unknown pane must never enqueue a wake"
 pass "an unknown (not confidently dead) pane records nothing - no false crash"
 
+# --- case: enqueue failure leaves no orphan crash-tail -----------------------
+# If the wake enqueue fails, the just-published crash-tail must be rolled back so
+# the idempotency guard does not block the next stale-loop cycle from retrying;
+# otherwise a confirmed crash captures evidence but never triggers recovery.
+reset_queue
+fm_write_meta "$STATE/taskD.meta" "window=default:w3:p3" "backend=herdr"
+STUB_ALIVE=dead
+STUB_TAIL=$'evidence-D'
+fm_wake_append() { return 1; }
+set +e
+out=$(fm_pane_crash_capture herdr "default:w3:p3" taskD "$STATE")
+rc=$?
+set -e
+[ "$rc" -ne 0 ] || fail "an enqueue failure must return non-zero (got rc=$rc)"
+[ -z "$out" ] || fail "an enqueue failure must not print 'captured' (got: '$out')"
+assert_absent "$STATE/taskD.crash-tail" "an enqueue failure must leave no orphan crash-tail"
+# Restore the real owner so a retry succeeds and proves the detection was not
+# permanently wedged by the failed attempt.
+unset -f fm_wake_append
+# shellcheck source=bin/fm-wake-lib.sh
+. "$ROOT/bin/fm-wake-lib.sh"
+out=$(fm_pane_crash_capture herdr "default:w3:p3" taskD "$STATE")
+[ "$out" = captured ] || fail "the next cycle must retry and capture after a prior enqueue failure (got: '$out')"
+assert_present "$STATE/taskD.crash-tail" "the retry must write the crash-tail"
+[ "$(printf '%s\n' "$(wake_queue_records)" | grep -c 'pane-crashed taskD')" = 1 ] \
+  || fail "the retry must enqueue exactly one wake"
+pass "an enqueue failure rolls back the crash-tail so the next cycle retries cleanly"
+
 echo "ALL fm-pane-crash-lib tests passed"

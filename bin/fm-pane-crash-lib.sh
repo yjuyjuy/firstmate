@@ -41,8 +41,8 @@
 # recorded a crash-tail AND enqueued the wake, so the caller can end its
 # supervision cycle exactly once per death. Prints nothing on every no-op.
 # Returns 0 on a fresh capture-and-enqueue and on every silent no-op; a non-zero
-# return means the enqueue itself failed (the crash-tail is still recorded) and
-# the caller may surface it.
+# return means the enqueue itself failed, in which case the crash-tail is rolled
+# back (removed) so the next supervision cycle retries the detection.
 FM_PANE_CRASH_TAIL_LINES=${FM_PANE_CRASH_TAIL_LINES:-20}
 fm_pane_crash_capture() {  # <backend> <window> <task-id> <state-dir>
   local backend=$1 window=$2 id=$3 state=$4 meta crash_tail alive tail tmp
@@ -94,8 +94,12 @@ fm_pane_crash_capture() {  # <backend> <window> <task-id> <state-dir>
   fi
 
   # Enqueue exactly one durable wake through the queue's one owner. On enqueue
-  # failure the crash-tail is left in place (it is the evidence) and the failure
-  # is surfaced to the caller.
-  fm_wake_append check "pane-crashed-$id" "pane-crashed $id" || return 1
+  # failure remove the just-published crash-tail so the idempotency guard does
+  # not block the next stale-loop cycle from retrying this detection; otherwise
+  # a confirmed crash would capture evidence but never trigger recovery.
+  if ! fm_wake_append check "pane-crashed-$id" "pane-crashed $id"; then
+    rm -f "$crash_tail"
+    return 1
+  fi
   printf 'captured'
 }
