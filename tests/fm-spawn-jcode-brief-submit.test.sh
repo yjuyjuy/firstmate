@@ -47,6 +47,27 @@ export BACKEND=fake
 export FM_SPAWN_JCODE_READY_POLLS=1
 export FM_SPAWN_JCODE_BRIEF_SETTLE=0
 export FM_SPAWN_JCODE_BRIEF_SUBMIT_TRIES=3
+export FM_SPAWN_JCODE_VERIFY_SETTLE=0
+export FM_SPAWN_JCODE_VERIFY_TRIES=3
+
+# The real session resolver + store reader back the verify-before-brief gate, so
+# the one test that pins an explicit model needs a fake store to verify against.
+# shellcheck source=bin/fm-token-sessions-lib.sh
+. "$ROOT/bin/fm-token-sessions-lib.sh"
+SESS_DIR="$TMP_ROOT/sessions"
+mkdir -p "$SESS_DIR"
+export JCODE_SESSIONS_DIR="$SESS_DIR"
+PROBE_WT="$TMP_ROOT/probe-worktree"
+mkdir -p "$PROBE_WT"
+SPAWN_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+write_store() {  # <model|-> <effort|->
+  local model=$1 effort=$2 sess_file="$SESS_DIR/session_probe.json"
+  if [ "$model" = - ]; then model=null; else model="\"$model\""; fi
+  if [ "$effort" = - ]; then effort=null; else effort="\"$effort\""; fi
+  cat > "$sess_file" <<EOF
+{"id":"session_probe","model":$model,"reasoning_effort":$effort,"working_dir":"$PROBE_WT","created_at":"$SPAWN_TS"}
+EOF
+}
 
 # --- scriptable fake backend ------------------------------------------------
 #
@@ -136,17 +157,22 @@ has_call() {  # <substring>
 
 test_brief_delivered_even_when_slash_verifies_pending() {
   # THE REGRESSION: /model verifies `pending` (the slash-popup race). The brief
-  # must STILL be delivered, and delivery must succeed.
+  # must STILL be delivered once the store confirms the pin, and delivery must
+  # succeed. The store is pre-seeded with the requested model, so the pre-brief
+  # verify passes on the first read even though the slash submit itself reported
+  # pending - proving a pending verdict is not treated as fatal.
   reset_fake
+  write_store claude-opus-4-8 -
   # ready poll (composer_state) -> non-unknown so delivery proceeds; then the
   # slash /model submit -> pending; then brief submit -> empty (clean).
   set_composer_queue empty
   set_submit_queue pending empty
-  jcode_post_launch_delivery fakepane /tmp/brief.md claude-opus-4-8 default \
+  jcode_post_launch_delivery fakepane /tmp/brief.md claude-opus-4-8 default "" \
+    "$PROBE_WT" "$SPAWN_TS" "$TMP_ROOT/pending.status" "$TMP_ROOT/pending.meta" \
     || fail "delivery must succeed despite a pending slash-command verdict, got failure"
   [ "$(count_brief_submits)" -ge 1 ] \
     || fail "the brief must be submitted even when the slash command verified pending; calls: $(calls_joined)"
-  pass "a pending /model verdict no longer aborts delivery: the brief is still submitted and delivery succeeds"
+  pass "a pending /model verdict no longer aborts delivery: the store confirms the pin and the brief is still submitted"
 }
 
 test_brief_resubmitted_until_composer_clears() {

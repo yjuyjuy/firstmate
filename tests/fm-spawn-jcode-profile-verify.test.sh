@@ -1,21 +1,31 @@
 #!/usr/bin/env bash
-# Behavior tests for fm-spawn.sh's jcode launch-profile VERIFY-AND-RETRY
-# (task spawn-model-verify-enforce, incident 2026-08-23, data/learnings.md
-# "MODEL DRIFT INCIDENT"). A slash command that loses jcode's popup submit race
-# is a silent no-op, so after the brief lands, jcode_post_launch_delivery reads
-# the session's ACTUAL model and reasoning_effort back from the jcode session
-# store and, on a mismatch with the requested profile, re-sends the slash
-# commands and re-reads, bounded by FM_SPAWN_JCODE_VERIFY_TRIES (3). Exhaustion
-# appends `blocked: model-drift wanted=<m>/<e> actual=<m>/<e>` to the status
-# file and prints the same to the caller; a verified profile is stamped into the
-# meta as the CONFIRMED model=/effort= (last-write-wins over the requested
-# values the spawn recorded). A default profile, an unresolvable session id, or
-# an unreadable store never blocks: verification is skipped with a warning.
+# Behavior tests for fm-spawn.sh's jcode launch-profile VERIFY-BEFORE-BRIEF hard
+# gate (task fix-jcode-spawn-model-pin; incidents 2026-08-10 "verdict pending +
+# brief raced ahead" and 2026-08-23 "MODEL DRIFT INCIDENT").
 #
-# These tests extract jcode_post_launch_delivery from bin/fm-spawn.sh (the same
-# awk-extraction the brief-submit suite uses) and drive it against a scriptable
-# fake backend plus a fake jcode session store (JCODE_SESSIONS_DIR), so no live
-# jcode server is needed.
+# ROOT CAUSE the gate defends against: jcode DEFERS a /model or /effort change
+# behind the agent lock while a turn is running (projects/jcode server
+# provider_control.rs handle_set_model / handle_set_reasoning_effort). Submitting
+# the brief STARTS a turn, so a /model|/effort sent after the brief queues and
+# never applies - the session runs the whole task on the wrong model. While the
+# session is IDLE (before the brief) a /model|/effort applies and persists to the
+# store immediately.
+#
+# So for an EXPLICIT model/effort, jcode_post_launch_delivery pins the profile
+# while idle, reads the session store back, and delivers the brief ONLY after the
+# store CONFIRMS the requested axis values (re-sending the idle slash between
+# reads, bounded by FM_SPAWN_JCODE_VERIFY_TRIES=3). A verified profile is stamped
+# into the meta as the CONFIRMED model=/effort= (last-write-wins over the
+# requested values). If the profile cannot be verified - a lost slash race, an
+# unresolvable session, an unreadable store, or missing anchors - the function
+# appends `blocked: model-drift wanted=<m>/<e> actual=<m>/<e>` to the status file
+# and WITHHOLDS the brief (returns failure), never running wrong-model work. A
+# DEFAULT profile has nothing to pin: no verification, brief delivered directly.
+#
+# These tests extract jcode_post_launch_delivery and jcode_submit_brief_verified
+# from bin/fm-spawn.sh verbatim (the same awk-extraction the brief-submit suite
+# uses) and drive them against a scriptable fake backend plus a fake jcode
+# session store (JCODE_SESSIONS_DIR), so no live jcode server is needed.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -146,6 +156,13 @@ count_submit() {  # <text>
   grep -cF "submit:$1" "$CALLS_F" 2>/dev/null || true
 }
 
+# The brief rides the canonical launch-brief operational input, so its submit
+# line is the only one carrying "launch-brief". Counting it proves whether the
+# brief was actually delivered - the crux of the withhold-on-failure contract.
+count_brief() {
+  grep -cF "launch-brief" "$CALLS_F" 2>/dev/null || true
+}
+
 # run_delivery: drive the extracted function with the given profile + anchors.
 # Prints the function's stdout/stderr and its exit code as "$rc <output>".
 run_delivery() {  # <model> <effort> [<fix-on-resend:0|1>]
@@ -160,10 +177,10 @@ run_delivery() {  # <model> <effort> [<fix-on-resend:0|1>]
 
 # --- tests ------------------------------------------------------------------
 
-test_verified_profile_stamps_confirmed_meta() {
-  # Happy path: the store already shows the requested profile, so the first
-  # read verifies. No re-send, no blocked line; the meta gets the CONFIRMED
-  # model=/effort= stamp.
+test_verified_profile_delivers_brief_and_stamps_confirmed_meta() {
+  # Happy path: the store already shows the requested profile, so the first read
+  # verifies. No re-send; the meta gets the CONFIRMED model=/effort= stamp; the
+  # brief is delivered (exactly once) only AFTER verification.
   reset_fake
   set_composer_queue empty
   set_submit_queue empty
@@ -172,19 +189,40 @@ test_verified_profile_stamps_confirmed_meta() {
   [ "${got%%|*}" = 0 ] || fail "delivery must succeed when the store verifies on the first read; got: $got"
   [ "$(count_submit /model)" = 1 ] || fail "no /model re-send may happen on a verified first read; calls: $(calls_joined)"
   [ "$(count_submit /effort)" = 1 ] || fail "no /effort re-send may happen on a verified first read; calls: $(calls_joined)"
+  [ "$(count_brief)" = 1 ] || fail "the brief must be delivered exactly once after a verified profile; calls: $(calls_joined)"
   grep -qx "model=deepseek-v4-flash" "$META_F" \
     || fail "the CONFIRMED model must be stamped into the meta; meta: $(cat "$META_F")"
   grep -qx "effort=high" "$META_F" \
     || fail "the CONFIRMED effort must be stamped into the meta; meta: $(cat "$META_F")"
   [ -s "$STATUS_F" ] && fail "no blocked status may appear on a verified profile; status: $(cat "$STATUS_F")"
-  pass "a store that matches on the first read verifies instantly and stamps the confirmed profile"
+  pass "a store that matches on the first read verifies instantly, stamps the confirmed profile, then delivers the brief"
 }
 
-test_lost_model_recovers_through_retry() {
-  # The /model slash lost the popup race (store shows a different model). The
-  # re-send applies it (FIX_ON_RESEND flips the store on the retry submit, as a
-  # successful slash command would), and the SECOND read verifies. Exactly one
-  # re-send of each slash line, no blocked status.
+test_brief_is_delivered_only_after_the_pin_verifies() {
+  # ORDERING is the whole fix: the brief must not be submitted until the store
+  # confirms the profile. Assert the first /model submit precedes the brief
+  # submit in the recorded call order.
+  reset_fake
+  set_composer_queue empty
+  set_submit_queue empty
+  write_store deepseek-v4-flash high
+  got=$(run_delivery deepseek-v4-flash high)
+  [ "${got%%|*}" = 0 ] || fail "delivery must succeed; got: $got"
+  model_ln=$(grep -nF "submit:/model deepseek-v4-flash" "$CALLS_F" | head -1 | cut -d: -f1)
+  brief_ln=$(grep -nF "launch-brief" "$CALLS_F" | head -1 | cut -d: -f1)
+  [ -n "$model_ln" ] || fail "the /model pin must be recorded; calls: $(calls_joined)"
+  [ -n "$brief_ln" ] || fail "the brief must be recorded; calls: $(calls_joined)"
+  [ "$model_ln" -lt "$brief_ln" ] \
+    || fail "the /model pin must precede the brief (verify BEFORE brief); calls: $(calls_joined)"
+  pass "the brief is submitted only after the model pin, never racing ahead of it"
+}
+
+test_lost_slash_recovers_through_idle_retry_then_delivers_brief() {
+  # The idle /model lost the popup race (store shows a different model). The
+  # re-send (still idle, no brief yet) applies it - FIX_ON_RESEND flips the store
+  # on the retry submit, as a successful slash command would - and the SECOND
+  # read verifies. Exactly one re-send of each slash line, brief delivered, no
+  # blocked status.
   reset_fake
   set_composer_queue empty
   set_submit_queue empty
@@ -193,17 +231,19 @@ test_lost_model_recovers_through_retry() {
   [ "${got%%|*}" = 0 ] || fail "delivery must succeed once the retried slash applies; got: $got"
   [ "$(count_submit /model)" = 2 ] || fail "exactly one /model re-send expected on a lost-first-submit; calls: $(calls_joined)"
   [ "$(count_submit /effort)" = 2 ] || fail "exactly one /effort re-send expected on a lost-first-submit; calls: $(calls_joined)"
+  [ "$(count_brief)" = 1 ] || fail "the brief must be delivered once the retry verifies; calls: $(calls_joined)"
   grep -qx "model=deepseek-v4-flash" "$META_F" \
     || fail "the confirmed model must be stamped after a successful retry; meta: $(cat "$META_F")"
   [ -s "$STATUS_F" ] && fail "no blocked status may appear when the retry recovers; status: $(cat "$STATUS_F")"
-  pass "a slash command lost to the popup race is re-sent and verified on the retry read"
+  pass "a slash command lost to the popup race is re-sent while idle and verified on the retry read, then the brief lands"
 }
 
-test_persistent_mismatch_fails_loud_after_bounded_retries() {
+test_persistent_mismatch_fails_loud_and_withholds_the_brief() {
   # The slash commands never land (store keeps a foreign profile across every
-  # read). Bounded retries: exactly 3 store reads = the initial submit plus 2
-  # re-sends per slash line, then a `blocked: model-drift wanted=<m>/<e>
-  # actual=<m>/<e>` status line, the same line on stderr, no confirmed stamps.
+  # read). Bounded retries: exactly 3 store reads = the initial idle submit plus
+  # 2 re-sends per slash line, then a `blocked: model-drift wanted=<m>/<e>
+  # actual=<m>/<e>` status line, the same line on stderr, NO confirmed stamps,
+  # and - the point of the fix - the brief is NEVER delivered.
   reset_fake
   set_composer_queue empty
   set_submit_queue empty
@@ -214,6 +254,7 @@ test_persistent_mismatch_fails_loud_after_bounded_retries() {
   [ "$rc" = 1 ] || fail "delivery must fail after bounded retries still mismatch; rc=$rc out=$out"
   [ "$(count_submit /model)" = 3 ] || fail "bounded retries: exactly 3 /model submits expected (1 initial + 2 re-sends); calls: $(calls_joined)"
   [ "$(count_submit /effort)" = 3 ] || fail "bounded retries: exactly 3 /effort submits expected; calls: $(calls_joined)"
+  [ "$(count_brief)" = 0 ] || fail "the brief must be WITHHELD when the profile never verifies; calls: $(calls_joined)"
   grep -qx 'blocked: model-drift wanted=deepseek-v4-flash/high actual=claude-opus-4-8/max' "$STATUS_F" \
     || fail "the blocked model-drift line must be appended to the status file; status: $(cat "$STATUS_F")"
   case "$rest" in
@@ -222,66 +263,93 @@ test_persistent_mismatch_fails_loud_after_bounded_retries() {
   esac
   grep -q "model=deepseek" "$META_F" \
     && fail "no confirmed stamp may be written for a profile that never verified; meta: $(cat "$META_F")"
-  pass "a persistently mismatched profile fails loud with a bounded retry count and a blocked: model-drift status"
+  pass "a persistently mismatched profile fails loud with a bounded retry count, a blocked: model-drift status, and NO brief delivered"
 }
 
-test_default_profile_skips_verification() {
-  # A default profile (no requested axis) must not verify at all: no store
-  # file needed, no slash submits, no meta stamps, no blocked status - the
-  # normal-spawn path stays byte-identical.
+test_default_profile_skips_verification_and_delivers_brief() {
+  # A default profile (no requested axis) must not verify at all: no store file
+  # needed, no slash submits, no meta stamps, no blocked status - and the brief
+  # is delivered directly, so the normal-spawn path stays byte-identical.
   reset_fake
   set_composer_queue empty
   set_submit_queue empty
-  SESS_SAVE="$SESS_DIR/session_probe.json"
-  rm -f "$SESS_SAVE"
+  rm -f "$SESS_DIR"/session_*.json
   got=$(run_delivery default default)
   [ "${got%%|*}" = 0 ] || fail "a default-profile delivery must succeed; got: $got"
+  [ "$(count_submit /model)" = 0 ] || fail "a default profile must send no /model; calls: $(calls_joined)"
+  [ "$(count_submit /effort)" = 0 ] || fail "a default profile must send no /effort; calls: $(calls_joined)"
+  [ "$(count_brief)" = 1 ] || fail "the brief must be delivered for a default profile; calls: $(calls_joined)"
   [ ! -e "$STATUS_F" ] || [ ! -s "$STATUS_F" ] \
     || fail "no blocked status may appear for a default profile; status: $(cat "$STATUS_F")"
   [ ! -s "$META_F" ] || fail "no confirmed stamps may appear for a default profile; meta: $(cat "$META_F")"
-  pass "a default profile spawns exactly as before: no verification, no stamps, no escalation"
+  pass "a default profile spawns exactly as before: no verification, no stamps, no escalation, brief delivered"
 }
 
-test_unresolvable_session_warns_and_succeeds() {
-  # No session file in the store: the sid cannot be resolved, so verification
-  # is skipped with a warning - never a blocked status and never a failure.
+test_unresolvable_session_fails_loud_and_withholds_the_brief() {
+  # No session file in the store: the sid cannot be resolved, so an EXPLICIT
+  # profile cannot be verified. The fix WITHHOLDS the brief and fails loud with
+  # actual=-/- rather than running the task on an unverified (likely wrong)
+  # model - the old behavior passed silently here, which is exactly the drift
+  # this task removes.
   reset_fake
   set_composer_queue empty
   set_submit_queue empty
   rm -f "$SESS_DIR"/session_*.json
   out=$(run_delivery deepseek-v4-flash high)
   rc=${out%%|*}
-  rest=${out#*|}
-  [ "$rc" = 0 ] || fail "delivery must succeed when the session cannot be resolved; rc=$rc out=$out"
-  case "$rest" in
-    *"could not resolve the jcode session id"*) : ;;
-    *) fail "an unresolvable session id must warn, not silently pass; output: $rest" ;;
-  esac
-  [ ! -s "$STATUS_F" ] || fail "no blocked status may appear when verification is skipped; status: $(cat "$STATUS_F")"
-  pass "an unresolvable session id skips verification with a warning, never a blocked lane"
+  [ "$rc" = 1 ] || fail "delivery must FAIL when an explicit profile cannot be verified; rc=$rc out=$out"
+  [ "$(count_brief)" = 0 ] || fail "the brief must be WITHHELD when the session cannot be resolved; calls: $(calls_joined)"
+  grep -qx 'blocked: model-drift wanted=deepseek-v4-flash/high actual=-/-' "$STATUS_F" \
+    || fail "an unresolvable session must fail loud with a blocked line and actual=-/-; status: $(cat "$STATUS_F")"
+  pass "an unresolvable session fails loud and withholds the brief, never a silent unverified pass"
 }
 
-test_effort_only_profile_verifies_effort_axis() {
+test_missing_anchors_withholds_the_brief_for_an_explicit_profile() {
+  # An explicit profile with no worktree/spawn_ts/status anchors cannot be
+  # verified at all. The brief is withheld and the call fails, rather than
+  # delivering on an unverifiable pin.
+  reset_fake
+  set_composer_queue empty
+  set_submit_queue empty
+  write_store deepseek-v4-flash high
+  export MODEL=deepseek-v4-flash EFFORT=high
+  out=$(jcode_post_launch_delivery fakepane /tmp/brief.md deepseek-v4-flash high "" \
+    "" "" "" "" 2>&1)
+  rc=$?
+  [ "$rc" = 1 ] || fail "delivery must fail when an explicit profile has no verification anchors; rc=$rc out=$out"
+  [ "$(count_brief)" = 0 ] || fail "the brief must be withheld when the profile cannot be verified; calls: $(calls_joined)"
+  case "$out" in
+    *"the brief is withheld"*) : ;;
+    *) fail "a missing-anchor explicit profile must warn that the brief is withheld; output: $out" ;;
+  esac
+  pass "an explicit profile with no verification anchors withholds the brief and fails loud"
+}
+
+test_effort_only_profile_verifies_effort_axis_then_delivers_brief() {
   # Only the effort axis is requested: the model axis is never compared, and a
   # mismatch on it alone must not block (the sweep enforces only requested
-  # axes). A matching effort verifies; the confirmed effort is stamped.
+  # axes). A matching effort verifies; the confirmed effort is stamped; the brief
+  # is delivered.
   reset_fake
   set_composer_queue empty
   set_submit_queue empty
   write_store claude-opus-4-8 max
   got=$(run_delivery default max)
   [ "${got%%|*}" = 0 ] || fail "an effort-only verification against a matching store must succeed; got: $got"
+  [ "$(count_brief)" = 1 ] || fail "the brief must be delivered after an effort-only verify; calls: $(calls_joined)"
   grep -qx "effort=max" "$META_F" \
     || fail "the confirmed effort must be stamped; meta: $(cat "$META_F")"
   grep -q "^model=" "$META_F" \
     && fail "the model axis must not be stamped when it was not requested; meta: $(cat "$META_F")"
   [ -s "$STATUS_F" ] && fail "no blocked status may appear when the requested axis matches; status: $(cat "$STATUS_F")"
-  pass "an effort-only profile verifies and stamps only the requested axis"
+  pass "an effort-only profile verifies and stamps only the requested axis, then delivers the brief"
 }
 
-test_verified_profile_stamps_confirmed_meta
-test_lost_model_recovers_through_retry
-test_persistent_mismatch_fails_loud_after_bounded_retries
-test_default_profile_skips_verification
-test_unresolvable_session_warns_and_succeeds
-test_effort_only_profile_verifies_effort_axis
+test_verified_profile_delivers_brief_and_stamps_confirmed_meta
+test_brief_is_delivered_only_after_the_pin_verifies
+test_lost_slash_recovers_through_idle_retry_then_delivers_brief
+test_persistent_mismatch_fails_loud_and_withholds_the_brief
+test_default_profile_skips_verification_and_delivers_brief
+test_unresolvable_session_fails_loud_and_withholds_the_brief
+test_missing_anchors_withholds_the_brief_for_an_explicit_profile
+test_effort_only_profile_verifies_effort_axis_then_delivers_brief

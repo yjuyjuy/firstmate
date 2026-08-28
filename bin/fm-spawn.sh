@@ -131,9 +131,13 @@
 #   A harness with no positional prompt (jcode) carries no __BRIEF__ placeholder:
 #   its brief, model, and effort are delivered to the live session after launch by
 #   jcode_post_launch_delivery(), which waits FM_SPAWN_JCODE_READY_POLLS seconds
-#   for the composer, submits /model and /effort best-effort, then submits the
-#   launch-brief pointer as a separately-verified step (jcode_submit_brief_verified)
-#   that re-submits Enter until the composer clears, so the brief is never dropped.
+#   for the composer, then - for an explicitly requested model/effort - pins them
+#   while the session is idle and VERIFIES them against the session store BEFORE
+#   submitting the launch-brief pointer (jcode defers /model|/effort while a turn
+#   runs, so the brief must not start a turn first); a profile that cannot be
+#   verified blocks the lane and the brief is withheld. The pointer is submitted
+#   through jcode_submit_brief_verified, which re-submits Enter until the composer
+#   clears, so the brief is never dropped.
 # Per-harness turn-end hooks are installed automatically; some live outside the worktree.
 # grok uses a firstmate-owned global hook under ${GROK_HOME:-$HOME/.grok}/hooks
 # plus a gitignored .fm-grok-turnend worktree pointer and a state token.
@@ -231,17 +235,19 @@ FM_SPAWN_JCODE_READY_POLLS=${FM_SPAWN_JCODE_READY_POLLS:-30}
 # per-attempt pause before re-reading the composer.
 FM_SPAWN_JCODE_BRIEF_SUBMIT_TRIES=${FM_SPAWN_JCODE_BRIEF_SUBMIT_TRIES:-3}
 FM_SPAWN_JCODE_BRIEF_SETTLE=${FM_SPAWN_JCODE_BRIEF_SETTLE:-1}
-# After the brief is delivered, jcode_post_launch_delivery VERIFIES the launch
-# profile against the jcode session store (the only truth for what a session
-# actually runs; incident 2026-08-23, data/learnings.md "MODEL DRIFT
-# INCIDENT": the slash-popup race silently lost /model|/effort, leaving three
-# tooling lanes on the wrong model at max effort for hours). On a mismatch the
-# /model and /effort slash commands are re-sent and the store re-read, at most
-# FM_SPAWN_JCODE_VERIFY_TRIES verification attempts (each attempt after the
-# first follows a re-send); a store that still disagrees appends a
-# `blocked: model-drift` status so the watcher escalates, never a quiet
-# continue. FM_SPAWN_JCODE_VERIFY_SETTLE is the settle paused before each
-# store read (the store write races the slash submit).
+# Before the brief is delivered, jcode_post_launch_delivery VERIFIES an
+# explicitly requested launch profile against the jcode session store (the only
+# truth for what a session actually runs; incident 2026-08-23, data/learnings.md
+# "MODEL DRIFT INCIDENT": the slash-popup race silently lost /model|/effort,
+# leaving three tooling lanes on the wrong model at max effort for hours). jcode
+# defers a /model|/effort change while a turn runs, so the pin is verified while
+# the session is still idle - before the brief starts the first turn. On a
+# mismatch the /model and /effort slash commands are re-sent and the store
+# re-read, at most FM_SPAWN_JCODE_VERIFY_TRIES verification attempts (each attempt
+# after the first follows a re-send); a store that still disagrees appends a
+# `blocked: model-drift` status so the watcher escalates and the brief is withheld,
+# never a quiet continue on the wrong model. FM_SPAWN_JCODE_VERIFY_SETTLE is the
+# settle before each store read (the store write races the slash submit).
 FM_SPAWN_JCODE_VERIFY_TRIES=${FM_SPAWN_JCODE_VERIFY_TRIES:-3}
 FM_SPAWN_JCODE_VERIFY_SETTLE=${FM_SPAWN_JCODE_VERIFY_SETTLE:-3}
 # Skip the watcher guard when re-exec'd for one pair of a batch (FM_SPAWN_NO_GUARD is
@@ -675,22 +681,43 @@ launch_template() {
 # jcode_post_launch_delivery: apply the resolved launch profile and deliver the
 # brief to a just-launched jcode session, the work its launch command cannot do.
 #
-# Ordering matters: model and effort are applied BEFORE the brief so the first
-# real turn already runs on the intended route. Each message is one line typed
-# into the composer and submitted through the target backend's own verified
-# submit path, so a swallowed Enter is retried exactly as it is for a steer.
-# Each `/`-prefixed line gets the same popup settle bin/fm-send.sh uses, because
-# jcode opens a slash-autocomplete popup within ~0.1s of the first character
-# (verified: `/model claude-opus-4-8 high` typed and submitted correctly with a
-# 1.2s settle, while a too-fast Enter lands in the popup instead).
+# Ordering is a HARD GATE when a model or effort is explicitly requested: the
+# model and effort are pinned AND VERIFIED against the session store BEFORE the
+# brief is ever submitted, so the first real turn cannot run on the wrong route.
+# Each message is one line typed into the composer and submitted through the
+# target backend's own verified submit path, so a swallowed Enter is retried
+# exactly as it is for a steer. Each `/`-prefixed line gets the same popup settle
+# bin/fm-send.sh uses, because jcode opens a slash-autocomplete popup within
+# ~0.1s of the first character (verified: `/model claude-opus-4-8 high` typed and
+# submitted correctly with a 1.2s settle, while a too-fast Enter lands in the
+# popup instead).
 #
-# The slash commands are delivered BEST-EFFORT: a swallowed or falsely-pending
-# /model or /effort is warned about but must NEVER abort brief delivery. The
-# brief is the payload; effort and model are secondary. The original bug
-# (observed twice 2026-08-10, data/learnings.md) was exactly the opposite: the
-# FIRST slash command verified as `pending` (jcode's slash-popup submit race),
-# the function returned early, and the brief - the last and longest message -
-# was never delivered at all, leaving the pane idle holding nothing.
+# WHY verify BEFORE the brief (the fix for the recurring model-drift incidents):
+# jcode DEFERS a /model or /effort change behind the agent lock while a turn is
+# running (projects/jcode server provider_control.rs handle_set_model /
+# handle_set_reasoning_effort spawn a deferred mutation when agent.try_lock()
+# fails). Submitting the brief STARTS a turn, so any /model|/effort sent after it
+# queues and does not apply until the turn ends - the exact silent no-op behind
+# the 2026-08-23 "MODEL DRIFT INCIDENT" (three tooling lanes ran the wrong model
+# at max effort for hours) and the earlier "verdict pending + brief raced ahead"
+# reports. While the session is IDLE (before the brief) a /model|/effort applies
+# and persists to the store immediately (agent/provider.rs set_model ->
+# persist_session_best_effort, set_reasoning_effort -> session.save), and the
+# store already carries model/reasoning_effort at session creation. So the pin is
+# reliable only when it is proven before the first turn.
+#
+# The jcode session store (~/.jcode/sessions/<sid>.json, fields model and
+# reasoning_effort; sid resolved with fm_resolve_crew_session_id) is the ONLY
+# truth for what a session runs; pane echo is not proof. For an explicit profile
+# the store is polled until it CONFIRMS the requested axis values, re-sending the
+# idle /model|/effort between reads, bounded by FM_SPAWN_JCODE_VERIFY_TRIES. Only
+# on a positive match are the CONFIRMED values stamped into the task meta as
+# model=/effort= (fm_meta_get is last-write-wins, so the append overrides the
+# requested values the spawn recorded) and the brief delivered. On exhaustion -
+# a lost slash race, an unresolvable session, or an unreadable store - the
+# function appends `blocked: model-drift wanted=<m>/<e> actual=<m>/<e>` to the
+# task status file (the watcher escalates it) and WITHHOLDS the brief, returning
+# failure: a loud blocked lane, never silent wrong-model work.
 #
 # The brief is delivered as a POINTER to data/<id>/brief.md rather than as the
 # brief text: the brief is many lines, and every backend's composer submit is
@@ -701,30 +728,16 @@ launch_template() {
 # harness. It is submitted through jcode_submit_brief_verified, which confirms
 # the composer actually cleared and re-submits Enter if it did not.
 #
-# VERIFY-AND-RETRY after the brief: a slash command that loses jcode's
-# slash-popup submit race is a silent no-op - the pane looks fine and the
-# session runs on whatever model/effort it already had (incident 2026-08-23,
-# data/learnings.md "MODEL DRIFT INCIDENT": three tooling lanes ran the wrong
-# model at max effort for hours). The jcode session store
-# (~/.jcode/sessions/session_<sid>.json, fields model and reasoning_effort;
-# sid resolved with fm_resolve_crew_session_id) is the ONLY truth for what a
-# session actually runs; pane echo is not proof. So after the brief lands, the
-# store is read back and compared against the requested axis values: on a
-# mismatch the /model|/effort slash commands are re-sent and the store re-read,
-# bounded by FM_SPAWN_JCODE_VERIFY_TRIES. A verified profile is stamped into
-# the task meta as the CONFIRMED model=/effort= (fm_meta_get is last-write-wins,
-# so the append overrides the requested values the spawn recorded). On
-# exhaustion the function appends `blocked: model-drift wanted=<m>/<e>
-# actual=<m>/<e>` to the task status file, which the watcher escalates, and
-# returns failure - a loud blocked lane, never silent wrong-model work. An
-# unresolvable session id or unreadable store is NOT a mismatch: verification
-# is skipped with a warning (never guessed), and the watcher's heartbeat drift
-# sweep re-checks later.
+# A DEFAULT profile (no explicit model and no explicit effort) has nothing to
+# pin: verification is skipped and the brief is delivered directly, so a normal
+# spawn stays byte-identical - no store read, no meta stamp, no escalation. The
+# account pin, when present, rides the same idle pre-brief send but is best-effort
+# and unverified (the store carries no account field to read it back).
 jcode_post_launch_delivery() {  # <target> <brief-path> <model> <effort> [<account>] [<worktree> <spawn_ts> <status-file> <meta-file>]
   local target=$1 brief=$2 model=$3 effort=$4 account=${5:-} i=0 state=unknown verdict line
   local worktree=${6:-} spawn_ts=${7:-} status_file=${8:-} meta_file=${9:-}
   local slash_lines=() verify_lines=() want_model=- want_effort=- actual_model='' actual_effort=''
-  local attempt=0 ok=0 sid tmp kv drift_msg
+  local attempt=0 ok=0 sid='' tmp kv drift_msg brief_line
   # Wait for the TUI: until its composer row exists there is nothing to type
   # into, and a message typed into the still-starting client is lost.
   while [ "$i" -lt "$FM_SPAWN_JCODE_READY_POLLS" ]; do
@@ -737,13 +750,18 @@ jcode_post_launch_delivery() {  # <target> <brief-path> <model> <effort> [<accou
     echo "warning: jcode composer did not appear within ${FM_SPAWN_JCODE_READY_POLLS}s on $target; the launch profile and brief were not delivered" >&2
     return 1
   fi
+  # Encode the brief pointer up front so an encode failure aborts before any
+  # slash command is sent (nothing half-applied) rather than after a verified pin.
+  brief_line=$(printf 'Read %s and follow it as your task brief.' "$brief" \
+    | "$FM_ROOT/bin/fm-operational-input.sh" encode launch-brief) \
+    || { echo "warning: could not encode the jcode launch brief for $target" >&2; return 1; }
   # Account pin FIRST: the orchestrator (quota-axi decide, consulted before
   # launch) chose a non-exhausted Claude account for this jcode worker, applied
   # here through jcode's own per-session `/account claude switch <label>` slash
-  # command - the same reversible control surface bin/fm-switch-account.sh drives,
-  # so the worker's first real turn already runs on the intended account. Empty
+  # command - the same reversible control surface bin/fm-switch-account.sh drives.
+  # It may reset the provider session, so it precedes the model/effort pin. Empty
   # (orchestrator unavailable/keep decision) leaves the session on its default
-  # account, the fail-soft path.
+  # account. It is best-effort and NOT verified (no store field to read it back).
   if [ -n "$account" ]; then
     slash_lines+=("/account claude switch $account")
   fi
@@ -757,89 +775,119 @@ jcode_post_launch_delivery() {  # <target> <brief-path> <model> <effort> [<accou
     verify_lines+=("/effort $effort")
     want_effort=$effort
   fi
-  # Slash commands: best-effort, one at a time, each with the slash-popup settle.
-  # A pending/send-failed verdict is reported and delivery CONTINUES to the brief.
+  # Send the account + model + effort lines ONCE while the session is still IDLE
+  # (no brief yet, so no turn has started and jcode defers nothing). Best-effort
+  # submit, each with the slash-popup settle; a pending/send-failed verdict is
+  # warned about because the pre-brief store read below is the real gate.
   for line in "${slash_lines[@]}"; do
     verdict=$(fm_backend_send_text_submit "$BACKEND" "$target" "$line" 3 0.4 1.2 2>/dev/null) || verdict=send-failed
     case "$verdict" in
       pending|send-failed)
-        echo "warning: jcode did not confirm '$line' on $target (verdict $verdict); continuing to deliver the brief regardless" >&2
+        echo "warning: jcode did not confirm '$line' on $target (verdict $verdict); the pre-brief store check is the real gate" >&2
         ;;
     esac
     sleep 1
   done
-  line=$(printf 'Read %s and follow it as your task brief.' "$brief" \
-    | "$FM_ROOT/bin/fm-operational-input.sh" encode launch-brief) \
-    || { echo "warning: could not encode the jcode launch brief for $target" >&2; return 1; }
-  if ! jcode_submit_brief_verified "$target" "$line"; then
-    echo "warning: jcode did not confirm the brief submitted on $target (the composer still held the unsubmitted brief after ${FM_SPAWN_JCODE_BRIEF_SUBMIT_TRIES} attempts); inspect the pane before relying on the task" >&2
+  # DEFAULT profile (no explicit model AND no explicit effort): nothing to pin,
+  # so skip verification and deliver the brief. This keeps a normal spawn
+  # byte-identical - no store read, no meta stamp, no escalation.
+  if [ "${#verify_lines[@]}" -eq 0 ]; then
+    if ! jcode_submit_brief_verified "$target" "$brief_line"; then
+      echo "warning: jcode did not confirm the brief submitted on $target (the composer still held the unsubmitted brief after ${FM_SPAWN_JCODE_BRIEF_SUBMIT_TRIES} attempts); inspect the pane before relying on the task" >&2
+      return 1
+    fi
+    return 0
+  fi
+  # EXPLICIT model/effort: HARD GATE, verify BEFORE the brief. Verification needs
+  # the worktree+spawn_ts anchors to resolve the session id and a status file to
+  # fail loud into; the real spawn always passes them. If they are missing we
+  # cannot verify an explicit pin, so WITHHOLD the brief rather than risk
+  # wrong-model work.
+  if [ -z "$worktree" ] || [ -z "$spawn_ts" ] || [ -z "$status_file" ]; then
+    echo "warning: cannot verify the jcode launch profile on $target (wanted ${want_model}/${want_effort}); the worktree/spawn_ts/status anchors are missing, so the brief is withheld" >&2
     return 1
   fi
-  # VERIFY-AND-RETRY: prove the launch profile actually applied. Verification
-  # needs a requested axis, the worktree+spawn_ts anchors to resolve the session
-  # id, and a status file to fail loud into; without any of these it is skipped
-  # with a warning, exactly the fail-soft cost the adapter already accepts.
-  if [ "${#verify_lines[@]}" -gt 0 ] && [ -n "$worktree" ] && [ -n "$spawn_ts" ] && [ -n "$status_file" ]; then
-    sid=$(fm_resolve_crew_session_id "$worktree" "$spawn_ts" 2>/dev/null || true)
-    if [ -n "$sid" ]; then
-      while [ "$attempt" -lt "$FM_SPAWN_JCODE_VERIFY_TRIES" ]; do
-        attempt=$((attempt + 1))
-        # Settle before EVERY read: the store write races the slash submit.
-        sleep "$FM_SPAWN_JCODE_VERIFY_SETTLE"
-        tmp=$(fm_session_store_profile "$sid" 2>/dev/null || true)
-        if [ -z "$tmp" ]; then
-          echo "warning: jcode session store unreadable for $sid on $target; cannot verify the launch profile (wanted ${want_model}/${want_effort})" >&2
-          return 0
-        fi
-        actual_model='' actual_effort=''
-        while IFS= read -r kv; do
-          case "$kv" in
-            model=*) actual_model=${kv#model=} ;;
-            effort=*) actual_effort=${kv#effort=} ;;
-          esac
-        done <<EOF
+  # Poll the store until it CONFIRMS the requested profile, re-sending the idle
+  # /model|/effort between reads. The session id is resolved inside the loop so a
+  # store write that lags the composer coming up is tolerated. Because the brief
+  # has NOT been submitted, the agent is idle and every re-send applies and
+  # persists immediately (jcode defers /model|/effort only while a turn runs).
+  # Bounded by FM_SPAWN_JCODE_VERIFY_TRIES; the last actual_* read feeds the
+  # blocked line.
+  while [ "$attempt" -lt "$FM_SPAWN_JCODE_VERIFY_TRIES" ]; do
+    attempt=$((attempt + 1))
+    # Settle before EVERY read: the store write races the slash submit.
+    sleep "$FM_SPAWN_JCODE_VERIFY_SETTLE"
+    if [ -z "$sid" ]; then
+      sid=$(fm_resolve_crew_session_id "$worktree" "$spawn_ts" 2>/dev/null || true)
+    fi
+    if [ -z "$sid" ]; then
+      # No resolvable session yet: the store may not be written. Retry without a
+      # re-send (the idle send already landed if the session exists); on
+      # exhaustion this fails loud below with actual=-/-.
+      actual_model='' actual_effort=''
+      [ "$attempt" -lt "$FM_SPAWN_JCODE_VERIFY_TRIES" ] && continue
+      break
+    fi
+    tmp=$(fm_session_store_profile "$sid" 2>/dev/null || true)
+    if [ -z "$tmp" ]; then
+      # Store unreadable this read: retry (it may still be settling); on
+      # exhaustion this fails loud below rather than passing an unverified pin.
+      actual_model='' actual_effort=''
+      [ "$attempt" -lt "$FM_SPAWN_JCODE_VERIFY_TRIES" ] && continue
+      break
+    fi
+    actual_model='' actual_effort=''
+    while IFS= read -r kv; do
+      case "$kv" in
+        model=*) actual_model=${kv#model=} ;;
+        effort=*) actual_effort=${kv#effort=} ;;
+      esac
+    done <<EOF
 $tmp
 EOF
-        ok=0
-        { [ "$want_model" = - ] || { [ "$actual_model" = "$want_model" ] || ok=1; }; }
-        { [ "$want_effort" = - ] || { [ "$actual_effort" = "$want_effort" ] || ok=1; }; }
-        if [ "$ok" -eq 0 ]; then
-          # Verified: stamp the CONFIRMED values into the meta so later readers
-          # (heartbeat drift watch) compare against what this session REALLY
-          # runs, not what the spawn wanted. Last-write-wins parsing (fm_meta_get
-          # tails the file), so these appends override the requested values.
-          if [ -n "$meta_file" ]; then
-            if [ "$want_model" != - ]; then echo "model=$actual_model" >> "$meta_file"; fi
-            if [ "$want_effort" != - ]; then echo "effort=$actual_effort" >> "$meta_file"; fi
-          fi
-          return 0
-        fi
-        if [ "$attempt" -lt "$FM_SPAWN_JCODE_VERIFY_TRIES" ]; then
-          echo "warning: jcode launch profile mismatch on $target (store shows model=$actual_model effort=$actual_effort, wanted ${want_model}/${want_effort}); re-sending the slash commands (attempt $attempt of $FM_SPAWN_JCODE_VERIFY_TRIES)" >&2
-          for line in "${verify_lines[@]}"; do
-            verdict=$(fm_backend_send_text_submit "$BACKEND" "$target" "$line" 3 0.4 1.2 2>/dev/null) || verdict=send-failed
-            case "$verdict" in
-              pending|send-failed)
-                echo "warning: jcode did not confirm '$line' on $target (verdict $verdict)" >&2
-                ;;
-            esac
-            sleep 1
-          done
-        fi
-      done
-      # Exhausted: the store still disagrees with the requested profile. FAIL
-      # LOUD - a `blocked: model-drift` status line is captain-relevant, so the
-      # watcher escalates it; the same line goes to the spawn caller. A loud
-      # blocked lane beats silent wrong-model hours.
-      drift_msg="blocked: model-drift wanted=${want_model}/${want_effort} actual=${actual_model:--}/${actual_effort:--}"
-      echo "$drift_msg" >> "$status_file"
-      echo "warning: $drift_msg on $target; the launch profile did not verify after ${FM_SPAWN_JCODE_VERIFY_TRIES} attempts" >&2
-      return 1
-    else
-      echo "warning: could not resolve the jcode session id for $target; launch-profile verification skipped (the heartbeat drift watch re-checks later)" >&2
+    ok=0
+    { [ "$want_model" = - ] || { [ "$actual_model" = "$want_model" ] || ok=1; }; }
+    { [ "$want_effort" = - ] || { [ "$actual_effort" = "$want_effort" ] || ok=1; }; }
+    if [ "$ok" -eq 0 ]; then
+      # VERIFIED. Stamp the CONFIRMED values into the meta so later readers
+      # (heartbeat drift watch) compare against what this session REALLY runs,
+      # not what the spawn wanted. Last-write-wins parsing (fm_meta_get tails the
+      # file), so these appends override the requested values. THEN deliver the
+      # brief - only now, with the pin proven.
+      if [ -n "$meta_file" ]; then
+        if [ "$want_model" != - ]; then echo "model=$actual_model" >> "$meta_file"; fi
+        if [ "$want_effort" != - ]; then echo "effort=$actual_effort" >> "$meta_file"; fi
+      fi
+      if ! jcode_submit_brief_verified "$target" "$brief_line"; then
+        echo "warning: jcode did not confirm the brief submitted on $target (the composer still held the unsubmitted brief after ${FM_SPAWN_JCODE_BRIEF_SUBMIT_TRIES} attempts); inspect the pane before relying on the task" >&2
+        return 1
+      fi
+      return 0
     fi
-  fi
-  return 0
+    if [ "$attempt" -lt "$FM_SPAWN_JCODE_VERIFY_TRIES" ]; then
+      echo "warning: jcode launch profile mismatch on $target (store shows model=$actual_model effort=$actual_effort, wanted ${want_model}/${want_effort}); re-sending the slash commands while idle (attempt $attempt of $FM_SPAWN_JCODE_VERIFY_TRIES)" >&2
+      for line in "${verify_lines[@]}"; do
+        verdict=$(fm_backend_send_text_submit "$BACKEND" "$target" "$line" 3 0.4 1.2 2>/dev/null) || verdict=send-failed
+        case "$verdict" in
+          pending|send-failed)
+            echo "warning: jcode did not confirm '$line' on $target (verdict $verdict)" >&2
+            ;;
+        esac
+        sleep 1
+      done
+    fi
+  done
+  # Exhausted without a confirmed profile - a lost slash race, an unresolvable
+  # session, or an unreadable store. FAIL LOUD and WITHHOLD the brief: a
+  # `blocked: model-drift` status line is captain-relevant, so the watcher
+  # escalates it; the same line goes to the spawn caller. actual_* is the last
+  # store read (or `-` when the session/store was never readable). A loud blocked
+  # lane beats silent wrong-model hours.
+  drift_msg="blocked: model-drift wanted=${want_model}/${want_effort} actual=${actual_model:--}/${actual_effort:--}"
+  echo "$drift_msg" >> "$status_file"
+  echo "warning: $drift_msg on $target; the launch profile did not verify after ${FM_SPAWN_JCODE_VERIFY_TRIES} attempts, so the brief was withheld" >&2
+  return 1
 }
 
 # jcode_submit_brief_verified: type the brief once, submit it, then INDEPENDENTLY
