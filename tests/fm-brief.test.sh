@@ -553,6 +553,78 @@ test_briefs_route_heavy_runs_through_the_runner() {
   pass "fm-brief.sh: ship and scout briefs route heavy runs through the serialization point"
 }
 
+# The Token-efficiency section is rtk-aware and detected at scaffold time. When rtk is
+# present (FM_BRIEF_RTK=1) the ship and scout briefs must tell the worker to prefer
+# rtk-wrapped runs and must keep it subordinate to Rule 8 (rtk goes INSIDE fm-heavy-run,
+# which still owns the real exit status). When rtk is absent (FM_BRIEF_RTK=0) the same
+# section must reassure the worker that plain commands are fine, and must NOT push rtk, so
+# a host without rtk is never told to run a tool it lacks. The secondmate charter never
+# carries the section - it supervises rather than runs suites.
+test_briefs_carry_rtk_token_efficiency_section() {
+  local home brief kind
+  home="$TMP_ROOT/rtk-token-home"
+  mkdir -p "$home/data"
+
+  # rtk PRESENT: ship and scout both prefer rtk and keep it under fm-heavy-run.
+  for kind in ship scout; do
+    if [ "$kind" = ship ]; then
+      FM_HOME="$home" FM_BRIEF_RTK=1 "$ROOT/bin/fm-brief.sh" brief-rtk-on-ship some-proj >/dev/null 2>&1 \
+        || fail "fm-brief.sh ship scaffold (rtk on) exited non-zero"
+      brief="$home/data/brief-rtk-on-ship/brief.md"
+    else
+      FM_HOME="$home" FM_BRIEF_RTK=1 "$ROOT/bin/fm-brief.sh" brief-rtk-on-scout some-proj --scout >/dev/null 2>&1 \
+        || fail "fm-brief.sh scout scaffold (rtk on) exited non-zero"
+      brief="$home/data/brief-rtk-on-scout/brief.md"
+    fi
+    assert_grep "# Token efficiency" "$brief" \
+      "$kind brief (rtk on) must carry the Token efficiency section"
+    assert_grep 'token-optimizing CLI proxy' "$brief" \
+      "$kind brief (rtk on) must name rtk as the token-optimizing proxy"
+    # shellcheck disable=SC2016 # Literal backticks and the command name must stay unexpanded.
+    assert_grep '`rtk test <runner>`' "$brief" \
+      "$kind brief (rtk on) must recommend rtk test for failures-only output"
+    assert_grep "is installed here" "$brief" \
+      "$kind brief (rtk on) must state rtk is installed on this host"
+    # rtk must not undermine the heavy-run serialization point or its real exit status.
+    assert_grep "Heavy runs still go THROUGH" "$brief" \
+      "$kind brief (rtk on) must keep rtk subordinate to the fm-heavy-run serialization point"
+    assert_grep "real exit status" "$brief" \
+      "$kind brief (rtk on) must remind the worker fm-heavy-run still owns the real exit status"
+    assert_no_grep "plain commands are completely fine" "$brief" \
+      "$kind brief (rtk on) must not carry the rtk-absent wording"
+  done
+
+  # rtk ABSENT: ship and scout both say plain commands are fine and do NOT push rtk.
+  for kind in ship scout; do
+    if [ "$kind" = ship ]; then
+      FM_HOME="$home" FM_BRIEF_RTK=0 "$ROOT/bin/fm-brief.sh" brief-rtk-off-ship some-proj >/dev/null 2>&1 \
+        || fail "fm-brief.sh ship scaffold (rtk off) exited non-zero"
+      brief="$home/data/brief-rtk-off-ship/brief.md"
+    else
+      FM_HOME="$home" FM_BRIEF_RTK=0 "$ROOT/bin/fm-brief.sh" brief-rtk-off-scout some-proj --scout >/dev/null 2>&1 \
+        || fail "fm-brief.sh scout scaffold (rtk off) exited non-zero"
+      brief="$home/data/brief-rtk-off-scout/brief.md"
+    fi
+    assert_grep "# Token efficiency" "$brief" \
+      "$kind brief (rtk off) must still carry the Token efficiency section"
+    assert_grep "plain commands are completely fine" "$brief" \
+      "$kind brief (rtk off) must reassure the worker that plain commands are fine"
+    assert_no_grep "is installed here" "$brief" \
+      "$kind brief (rtk off) must not claim rtk is installed"
+    # shellcheck disable=SC2016 # Literal backticks and the command name must stay unexpanded.
+    assert_no_grep '`rtk test <runner>`' "$brief" \
+      "$kind brief (rtk off) must not tell a worker to run rtk it lacks"
+  done
+
+  # The secondmate charter never carries the section.
+  FM_HOME="$home" FM_BRIEF_RTK=1 FM_SECONDMATE_CHARTER='Supervise alpha.' \
+    "$ROOT/bin/fm-brief.sh" brief-rtk-sm --secondmate --no-projects >/dev/null 2>&1 \
+    || fail "fm-brief.sh secondmate scaffold exited non-zero"
+  assert_no_grep "# Token efficiency" "$home/data/brief-rtk-sm/brief.md" \
+    "secondmate charter must not carry the crew Token efficiency section"
+  pass "fm-brief.sh: ship and scout briefs carry the rtk-aware Token efficiency section, secondmate does not"
+}
+
 # These four standing captain rules used to exist only as hand-typed steers, so a
 # freshly spawned crewmate never saw them. They must be structural in the scaffold.
 test_briefs_bind_the_shared_machine_rules() {
@@ -799,4 +871,5 @@ test_pause_verb_override_renders_all_brief_scaffolds
 test_scout_and_secondmate_load_decision_hold_policy
 test_scout_and_secondmate_scaffold
 test_briefs_route_heavy_runs_through_the_runner
+test_briefs_carry_rtk_token_efficiency_section
 test_briefs_bind_the_shared_machine_rules

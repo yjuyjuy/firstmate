@@ -68,6 +68,16 @@
 # coordination announce.
 # Every ship and scout scaffold additionally requires the final report to declare whether
 # the work was built test-first and whether it has end-to-end coverage.
+# Every ship and scout scaffold carries a short "Token efficiency" section. When rtk (the
+# token-optimizing CLI proxy, ~/RTK.md) is present at scaffold time, it tells the worker to
+# prefer rtk-wrapped runs (rtk test / rtk err for suites, rtk grep / rtk rg / rtk log for
+# search and logs) so filtered output reaches its context instead of a raw dump - the
+# largest win on lanes with huge test output such as hyfin-server. When rtk is absent it
+# says plain commands are fine, so
+# a worker on a host without rtk is never told to run a tool it lacks. Detection is a
+# scaffold-time `command -v rtk`; FM_BRIEF_RTK={1,0} overrides it as a test seam. The
+# heavy-command serialization rule (Rule 8) is unchanged and still owns the real exit
+# status: rtk wraps the command INSIDE fm-heavy-run, it does not replace it.
 # Every ship and scout scaffold also carries the standing captain rules that bind every
 # worker, so they are structural instead of hand-pasted per dispatch: never force anything
 # (push to a NEW branch when blocked, never force-push, never force-release, never decide on
@@ -383,6 +393,39 @@ EOF
 )
 fi
 
+# rtk token-efficiency section. rtk (the token-optimizing CLI proxy, ~/RTK.md) filters
+# large or noisy command output down to a summary before it reaches a worker's context,
+# so a huge test suite does not bury the lane in passing-test noise. When rtk is present
+# we tell the worker to prefer it; when it is absent we say plain commands are fine, so a
+# worker on a host without rtk is never told to reach for a tool it lacks. Detection is a
+# scaffold-time probe of THIS host, which is the crew host too; FM_BRIEF_RTK={1,0}
+# overrides it as a test seam. Both bodies are quoted heredocs, so their backtick-wrapped
+# commands and apostrophes stay literal and the issue #166 parse class does not apply.
+if [ -n "${FM_BRIEF_RTK:-}" ]; then
+  RTK_PRESENT=$FM_BRIEF_RTK
+elif command -v rtk >/dev/null 2>&1; then
+  RTK_PRESENT=1
+else
+  RTK_PRESENT=0
+fi
+if [ "$RTK_PRESENT" = 1 ]; then
+RTK_SECTION=$(cat <<'EOF'
+# Token efficiency
+`rtk` (token-optimizing CLI proxy, see `~/RTK.md`) is installed here. Prefer it for commands whose output is large or noisy, so a filtered summary reaches your context instead of a raw dump. The biggest win is a large test suite such as hyfin-server, where a raw run can bury your context in passing-test noise.
+- Tests: `rtk test <runner>` shows only failures; `rtk err <cmd>` shows only errors and warnings.
+- Search, logs, and VCS: `rtk grep`, `rtk rg`, `rtk log`, `rtk git`, and `rtk gh` give compact output.
+- Heavy runs still go THROUGH `fm-heavy-run.sh` (Rule 8); put `rtk` inside it by making the `-- <command>` an rtk-wrapped run, for example `-- rtk test <runner>`. fm-heavy-run still returns the command's real exit status, so act on that, not only the filtered text.
+- Do not wrap interactive commands, output you need verbatim, or short commands where filtering saves nothing; `rtk proxy <cmd>` runs a command raw when you need the full output.
+EOF
+)
+else
+RTK_SECTION=$(cat <<'EOF'
+# Token efficiency
+`rtk`, the token-optimizing CLI proxy some lanes use to filter noisy output, is not installed here, so plain commands are completely fine - run them directly. Still keep output lean where you can: prefer targeted greps and scoped test runs over dumping whole files or full suites into your context.
+EOF
+)
+fi
+
 if [ "$KIND" = scout ]; then
 cat > "$BRIEF" <<EOF
 You are a crewmate: an autonomous worker agent managed by firstmate. Work on your own; do not wait for a human.
@@ -433,6 +476,8 @@ The report is the only thing that survives, so anything worth keeping must be in
 10. Announce live browser use in the status file so the shared-machine log shows browser activity:
    \`working: BROWSER START - {what you will drive}\` before it, \`working: BROWSER END - {outcome}\`
    after it. This is a non-blocking coordination announce only - never wait on firstmate for a slot.
+
+$RTK_SECTION
 
 $CAPTAIN_RULES
 
@@ -649,6 +694,8 @@ $RULE1
 10. Announce live browser use in the status file so the shared-machine log shows browser activity:
    \`working: BROWSER START - {what you will drive}\` before it, \`working: BROWSER END - {outcome}\`
    after it. This is a non-blocking coordination announce only - never wait on firstmate for a slot.
+
+$RTK_SECTION
 
 $CAPTAIN_RULES
 
