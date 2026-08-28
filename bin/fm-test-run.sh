@@ -265,6 +265,7 @@ tests/fm-send-popup-settle.test.sh
 tests/fm-send-settle.test.sh
 tests/fm-send-strict.test.sh
 tests/fm-spawn-batch.test.sh
+tests/fm-steer-templates.test.sh
 tests/fm-stow-contract.test.sh
 tests/fm-supervision-instructions.test.sh
 tests/fm-test-run.test.sh
@@ -316,6 +317,7 @@ tests/fm-lint.test.sh
 tests/fm-nm-test-contract.test.sh
 tests/fm-captain-translation-contract.test.sh
 tests/fm-no-mistakes-ownership.test.sh
+tests/fm-steer-templates.test.sh
 EOF
 }
 
