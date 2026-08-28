@@ -65,6 +65,8 @@
 # declared scratch and the report at data/<task-id>/report.md is the work
 # product. Teardown proceeds only once the report exists and the shared
 # unresolved-decision completion gate verifies its captain-held inventory.
+# A report missing its mandatory TL;DR header block (see bin/fm-brief.sh --scout)
+# only warns; the block is a supervisor-relay aid, not a landed-work check.
 # Before destructive cleanup, teardown validates task check artifacts and any
 # matching quarantine entries as ordinary single-link files on the state
 # device. It refuses and preserves task state when that proof fails; otherwise
@@ -1567,6 +1569,14 @@ if [ "$KIND" = scout ] && [ "$FORCE" != "--force" ]; then
     echo "REFUSED: scout task $ID has no report at $REPORT." >&2
     echo "The report is the work product. Have the crewmate write it, or use --force after explicit discard approval." >&2
     exit 1
+  fi
+  # Warn (never refuse) when the report lacks the mandatory TL;DR header block
+  # (see bin/fm-brief.sh --scout). A TL;DR lets the supervisor relay the verdict
+  # without reading a 200+ line report whole. Match a `TL;DR` heading in the
+  # first 15 lines, case-insensitively, tolerating markdown heading markers.
+  if ! head -n 15 "$REPORT" | grep -qiE '^[[:space:]]*#*[[:space:]]*TL;?DR\b'; then
+    echo "WARNING: scout task $ID report at $REPORT has no TL;DR header block in its first 15 lines." >&2
+    echo "The supervisor relies on that block to relay the verdict without deep-reading. Proceeding anyway." >&2
   fi
   if ! FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" FM_DATA_OVERRIDE="$DATA" \
       FM_CONFIG_OVERRIDE="$CONFIG" "$SCRIPT_DIR/fm-decision-hold.sh" verify "$ID" >/dev/null; then

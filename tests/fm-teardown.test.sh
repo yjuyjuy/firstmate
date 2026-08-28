@@ -616,6 +616,49 @@ test_local_only_fork_remote_allows() {
   pass "local-only worktree with HEAD on a fork remote is torn down (fix holds)"
 }
 
+# A scout report that opens with a TL;DR header block tears down cleanly with no
+# warning: the supervisor can relay the verdict without deep-reading.
+test_scout_report_with_tldr_no_warning() {
+  local case_dir rc
+  case_dir=$(make_case scout-tldr-ok)
+  write_meta "$case_dir" scout scout
+  printf 'decisions_reviewed=1\n' >> "$case_dir/state/task-x1.meta"
+  mkdir -p "$case_dir/data/task-x1"
+  printf '# TL;DR\nverdict: fine\nrec: ship\n\n## Detail\nbody\n' > "$case_dir/data/task-x1/report.md"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "scout-tldr-ok: teardown should succeed with a report present"
+  ! grep -q REFUSED "$case_dir/stderr" || fail "scout-tldr-ok: teardown printed a REFUSED line"
+  ! grep -qi 'no TL;DR' "$case_dir/stderr" || fail "scout-tldr-ok: teardown warned despite a TL;DR block"
+  pass "scout report with a TL;DR header block tears down with no warning"
+}
+
+# A scout report missing the TL;DR block WARNS but never refuses: the block is a
+# supervisor-relay aid, not a landed-work check.
+test_scout_report_without_tldr_warns_but_allows() {
+  local case_dir rc
+  case_dir=$(make_case scout-tldr-missing)
+  write_meta "$case_dir" scout scout
+  printf 'decisions_reviewed=1\n' >> "$case_dir/state/task-x1.meta"
+  mkdir -p "$case_dir/data/task-x1"
+  printf '# Findings\nlong report body with no summary up top\n' > "$case_dir/data/task-x1/report.md"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "scout-tldr-missing: teardown must still succeed (warn, not refuse)"
+  ! grep -q REFUSED "$case_dir/stderr" || fail "scout-tldr-missing: teardown refused instead of warning"
+  grep -q 'WARNING:.*no TL;DR' "$case_dir/stderr" \
+    || fail "scout-tldr-missing: teardown did not warn about the missing TL;DR block"
+  pass "scout report without a TL;DR block warns but is still torn down"
+}
+
 test_teardown_prompts_tasks_axi_done_when_compatible() {
   local case_dir out
   case_dir=$(make_case tasks-axi-reminder)
@@ -2347,6 +2390,8 @@ test_failed_auto_close_still_completes_teardown() {
 }
 
 test_local_only_fork_remote_allows
+test_scout_report_with_tldr_no_warning
+test_scout_report_without_tldr_warns_but_allows
 test_pushed_unmerged_releases_and_records_merge_queue
 test_extra_worktree_returns_both
 test_no_extra_worktree_unchanged

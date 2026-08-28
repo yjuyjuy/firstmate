@@ -10,6 +10,10 @@
 #        fm-brief.sh <task-id> --secondmate {<project>...|--no-projects}
 #   --scout writes the scout contract instead: the deliverable is a report at
 #   data/<task-id>/report.md (no branch, no push, no PR) and the worktree is scratch.
+#   The scout report must open with a mandatory TL;DR header block (<=5 lines:
+#   verdict, key numbers, recommendation, risk, pointer to detail) so the supervisor
+#   relays the verdict without deep-reading; bin/fm-teardown.sh warns (never refuses)
+#   when the report lacks that block.
 #   --secondmate writes a persistent secondmate charter. The project list
 #   is cloned into the secondmate home, while the natural-language scope
 #   tells the main firstmate when to route work there; routine churn stays in its own home;
@@ -442,6 +446,15 @@ A gap does not block anything, but name the gap and its reason; the captain revi
 
 # Definition of done
 Write your findings to \`$DATA/$ID/report.md\`.
+
+The report MUST open with a mandatory TL;DR header block, at most 5 lines, so the
+supervisor can relay your verdict without reading the whole report. The first line
+must be a \`TL;DR\` heading (\`# TL;DR\` or \`## TL;DR\`). The block states, tersely:
+verdict, key numbers, recommendation, risk, and a pointer to the detail sections
+below. Everything else - what you did, evidence, file:line references - follows
+that block. Teardown warns (it does not refuse) if the TL;DR block is missing, but
+a scout report without it is a defect: write it.
+
 The report must stand alone: what you did, what you found, the evidence (commands run, output, file:line references), and what you recommend.
 Before reporting done, read and follow \`$FM_ROOT/.agents/skills/decision-hold-lifecycle/SKILL.md\` and pass its shared completion gate for the report and any visual review.
 When the report is complete, append \`done: {one-line conclusion}\` to the status file and stop.
