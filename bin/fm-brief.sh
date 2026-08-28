@@ -85,7 +85,9 @@
 # bin/fm-heavy-run.sh, test parallelism is capped at VITEST_MAX_WORKERS=2, every test run
 # is announced with TEST START / TEST END status lines, and a live browser reproduction
 # is announced with BROWSER START / BROWSER END status lines as a non-blocking
-# coordination announce.
+# coordination announce, and bulky evidence (full test output, diffs, long logs)
+# goes to a digest-once file via bin/fm-evidence.sh so the status line carries a
+# one-line verdict plus the path instead of a dump firstmate re-reads every wake.
 # Every ship and scout scaffold additionally requires the final report to declare whether
 # the work was built test-first and whether it has end-to-end coverage.
 # Every ship and scout scaffold carries a short "Token efficiency" section. When rtk (the
@@ -495,6 +497,12 @@ The report is the only thing that survives, so anything worth keeping must be in
    \`$FM_ROOT/bin/fm-heavy-run.sh --task $ID -- <command>\` (it prints a queued notice while you wait; that is normal, not a hang). Cap \`VITEST_MAX_WORKERS=2\` (never 4).
 9. Announce test runs: \`working: TEST START - {what, rough scale}\` before, \`working: TEST END - {outcome}\` after.
 10. Announce live browser use: \`working: BROWSER START - {what}\` before, \`working: BROWSER END - {outcome}\` after - a non-blocking announce, never wait on firstmate for a slot.
+11. Never paste bulky evidence - full test output, diffs, long logs - into a status line or report;
+   firstmate re-reads the status file on every wake, so a dump burns supervisor context each time.
+   Write the evidence to a file instead: \`<evidence> | $FM_ROOT/bin/fm-evidence.sh $ID <name>\`
+   (or pass a source path as the third argument) writes \`$DATA/$ID/evidence/<name>.txt\` and prints
+   the path. The status line then carries a one-line verdict plus that path, never the full dump,
+   for example \`working: TEST END - 3 failures, evidence $DATA/$ID/evidence/suite-run.txt\`.
 
 $RTK_SECTION
 
@@ -778,6 +786,12 @@ $RULE1
 9. Announce test runs: \`working: TEST START - {what, rough scale}\` before, \`working: TEST END - {outcome}\` after.
 10. Announce live browser use: \`working: BROWSER START - {what}\` before, \`working: BROWSER END - {outcome}\` after - a non-blocking announce, never wait on firstmate for a slot.
 11. If any push is refused, STOP and report it - never run \`no-mistakes axi sync --recover\` to take custody back and bypass the refusal, and never hand-push to the default branch. A refused push means a gate said no; push your \`fm/$ID\` branch and let the configured merge authority land it. (A worktree pre-push guard enforces this: a direct push to the default branch is blocked and non-zero.)
+12. Never paste bulky evidence - full test output, diffs, long logs - into a status line or report;
+   firstmate re-reads the status file on every wake, so a dump burns supervisor context each time.
+   Write the evidence to a file instead: \`<evidence> | $FM_ROOT/bin/fm-evidence.sh $ID <name>\`
+   (or pass a source path as the third argument) writes \`$DATA/$ID/evidence/<name>.txt\` and prints
+   the path. The status line then carries a one-line verdict plus that path, never the full dump,
+   for example \`working: TEST END - 3 failures, evidence $DATA/$ID/evidence/suite-run.txt\`.
 
 $RTK_SECTION
 

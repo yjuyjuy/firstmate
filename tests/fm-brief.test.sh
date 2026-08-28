@@ -770,6 +770,10 @@ test_briefs_bind_the_shared_machine_rules() {
       "$kind brief must keep the browser announce non-blocking"
     assert_no_grep 'working: BROWSER WAIT' "$brief" \
       "$kind brief must not make the crewmate wait for a browser slot"
+    assert_grep 'bin/fm-evidence.sh' "$brief" \
+      "$kind brief must teach the digest-once evidence convention via fm-evidence.sh"
+    assert_grep 'never the full dump' "$brief" \
+      "$kind brief must forbid pasting the full dump into the status line"
   done
 
   brief="$home/data/brief-rules-ship/brief.md"
