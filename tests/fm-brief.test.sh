@@ -256,6 +256,41 @@ test_faster_paths_use_configured_authority_without_stacked_review() {
   pass "fm-brief.sh: faster paths use configured authority without stacked review"
 }
 
+# PR descriptions are long-run documentation: lanes where a PR body is written
+# (direct-PR, direct-push) must require the worker to generate the skeleton
+# with fm-pr-description.sh and complete every section substantively before
+# the PR opens. no-mistakes and local-only lanes write no PR body themselves,
+# so they must not carry the step.
+test_pr_description_skeleton_required_on_body_writing_lanes() {
+  local home id brief
+  home="$TMP_ROOT/pr-description-home"
+  write_registry "$home"
+  for id_proj in "brief-prdesc-d1:direct-proj" "brief-prdesc-d2:push-proj" "brief-prdesc-d3:local-proj" "brief-prdesc-d4:some-proj"; do
+    id=${id_proj%%:*}
+    proj=${id_proj##*:}
+    FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" "$proj" >/dev/null 2>&1
+    brief="$home/data/$id/brief.md"
+    case $proj in
+      direct-proj|push-proj)
+        assert_grep "$ROOT/bin/fm-pr-description.sh $id" "$brief" \
+          "$id: brief must instruct the worker to generate the PR-description skeleton"
+        assert_grep "Fill in EVERY section substantively" "$brief" \
+          "$id: brief must require substantive completion of every section"
+        assert_grep "long-run documentation" "$brief" \
+          "$id: brief must state the PR description is long-run documentation"
+        assert_grep "stub description is a defect" "$brief" \
+          "$id: brief must forbid stub descriptions"
+        assert_grep "The filled, reviewed description is part of the definition of done" "$brief" \
+          "$id: filled + reviewed description must be part of the definition of done"
+        ;;
+      *)
+        assert_no_grep "fm-pr-description.sh" "$brief" \
+          "$id: non-body-writing lane must not carry the skeleton step" ;;
+    esac
+  done
+  pass "fm-brief.sh: PR-description skeleton required on body-writing lanes only"
+}
+
 # Pin the specific line the bug lived on: the no-mistakes DOD's no-mistakes
 # reference must render as plain prose with no dangling apostrophe artifact.
 test_no_mistakes_dod_wording() {
@@ -861,6 +896,7 @@ test_direct_push_dod_semantics
 test_direct_push_autoland_dod_semantics
 test_hyfin_live_stack_repro_block
 test_faster_paths_use_configured_authority_without_stacked_review
+test_pr_description_skeleton_required_on_body_writing_lanes
 test_no_mistakes_dod_wording
 test_no_mistakes_dod_requires_preflight
 test_ship_project_memory_wording

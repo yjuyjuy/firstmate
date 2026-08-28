@@ -106,6 +106,7 @@ The shared no-mistakes gate refusal for fleet lifecycle entrypoints is summarize
 | `fm-pr-poll.sh`          | Provide the byte-static watcher program for validated PR/MR-poll sidecars           |
 | `fm-pr-check-migrate.sh` | Quarantine older task polls without execution and rebuild only canonical polls       |
 | `fm-pr-check.sh`         | Record validated `pr=` and `pr_head=` values, then atomically arm a static merge poll |
+| `fm-pr-description.sh`   | Generate a structured PR-description skeleton from `data/<id>/brief.md` (summary, acceptance criteria, enrichment links, fill-in sections) and write it to `data/<id>/pr-description.md`, which crewmates complete substantively before a PR opens |
 | `fm-pr-merge.sh`         | Record PR metadata, then merge a task's canonical full GitHub or Bitbucket URL; `--orphan` and a records-gone auto-detect merge a cleaned-up task's PR after a pre-merge green/mergeable check, recording evidence to `data/orphan-merges.log` |
 | `fm-promote.sh`          | Promote a scout task in place to a protected ship task                               |
 | `fm-teardown.sh`         | Fail-closed teardown: return landed or fully pushed ship worktrees, require completed scout deliverables, retire secondmate homes |

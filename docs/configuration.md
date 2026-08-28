@@ -67,6 +67,7 @@ data/                personal fleet records; LOCAL, gitignored as a whole
   decision-desk-ledger.md  human-readable value ledger for the decision-desk secondmate, one row per routed request with its status and optional overturned annotation; firstmate-private, owned by fm-decision-desk-ledger.sh (route/resolve/overturn/tally), created lazily on first route
   <id>/brief.md      per-task crewmate brief, or per-secondmate charter brief when kind=secondmate
   <id>/report.md     scout task deliverable, written by the crewmate; survives teardown
+  <id>/pr-description.md  PR-description skeleton for a ship task, generated from data/<id>/brief.md by bin/fm-pr-description.sh and completed substantively by the crewmate; used as the PR body on direct-PR and direct-push lanes; survives teardown
 projects/            cloned repos; gitignored; READ-ONLY for you
 .treehouse/          this home's own worktree pools for those clones; gitignored; created by treehouse, pinned per clone by bin/fm-treehouse-pin.sh so a spawn cannot draw a worktree of another copy of the repo (docs/treehouse-pools.md)
 state/               volatile runtime signals; gitignored

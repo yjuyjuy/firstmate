@@ -50,6 +50,13 @@
 # green (bin/fm-merge-local.sh). Guardrails baked into the generated contract: green
 # only, own branch only, --no-ff only, conflict escalates, never delete a branch.
 # Ship briefs begin with a worktree-isolation assertion before the branch step.
+# Ship briefs on lanes where a PR body is written (direct-PR, and direct-push whose
+# PR firstmate opens) require the worker to generate the PR-description skeleton with
+# bin/fm-pr-description.sh and complete every section substantively. A skeleton is a
+# floor, never a license for a stub description: the PR description is long-run
+# documentation, so the worker must fill it in and re-read it once before the PR opens,
+# and the filled, reviewed description is part of the definition of done. no-mistakes
+# briefs do not carry this step because the pipeline owns the PR body it creates.
 # hyfin and hyfin-server ship briefs additionally carry a "Live stack repro" block
 # with the exact commands to stand up an own local stack (recaptcha auto-bypasses
 # locally, no AWS creds needed), so a live merchant repro is never falsely declared
@@ -526,7 +533,9 @@ case "$MODE" in
 # Definition of done
 This project ships **direct-PR**: you raise the PR yourself, without the no-mistakes pipeline.
 The task is complete only when committed on your branch.
-When it is implemented and committed, push your branch and open a PR with \`gh-axi\`, then append \`done: PR {url}\` to the status file and stop.
+When it is implemented and committed, generate the PR description skeleton with \`$FM_ROOT/bin/fm-pr-description.sh $ID\`.
+It writes \`$DATA/$ID/pr-description.md\`. Fill in EVERY section substantively and re-read the result once before opening the PR: the PR description is long-run documentation, and a stub description is a defect. The filled, reviewed description is part of the definition of done.
+Then push your branch and open a PR with \`gh-axi\` using the completed body, e.g. \`gh-axi pr create --body-file "$DATA/$ID/pr-description.md"\`, then append \`done: PR {url}\` to the status file and stop.
 Do NOT run /no-mistakes. The configured merge authority decides whether to merge the PR; firstmate relays the outcome.
 EOF
 )
@@ -596,6 +605,7 @@ $DP_BODY
 
 After the pipeline reports \`passed\`, push your validated branch explicitly - a pipeline "push" only reaches the local internal gate:
   \`git push origin HEAD:fm/$ID\`
+Then run \`$FM_ROOT/bin/fm-pr-description.sh $ID\` and Fill in EVERY section substantively in \`$DATA/$ID/pr-description.md\`, then re-read it once: firstmate uses that file as the PR body when it opens the Bitbucket PR for your branch; the PR description is long-run documentation, and a stub description is a defect. The filled, reviewed description is part of the definition of done.
 Then append \`done: pushed origin fm/$ID @ {short-sha}\` (the branch head commit) to the status file and stop. You are finished.
 Do NOT wait for a PR url or checks-green - none will arrive. The configured merge authority lands the branch on the forge; firstmate verifies it on origin.
 EOF
