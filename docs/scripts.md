@@ -65,6 +65,7 @@ The shared no-mistakes gate refusal for fleet lifecycle entrypoints is summarize
 | `fm-marker-lib.sh`       | Compatibility entry point for the from-firstmate carrier owned by `fm-operational-input.sh` |
 | `fm-pending-reply-lib.sh` | Parent-owned secondmate pending-reply expectations, recovery, and one-shot escalation |
 | `fm-secondmate-report.sh` | Optional helper to append a correlated parent status or document-pointer report       |
+| `fm-evidence.sh`         | Digest-once evidence helper: write bulky test output/diffs/logs (stdin or a source path) to `data/<task-id>/evidence/<name>.txt` and print the path, so status lines carry a one-line verdict plus that path instead of a re-read dump |
 | `fm-gate-refuse-lib.sh`  | Shared no-mistakes gate-context refusal for fleet lifecycle entrypoints               |
 | `fm-prepush-guard-lib.sh` | Install a worktree-scoped pre-push hook (`fm_install_prepush_guard`) that refuses an out-of-band worker push to the repository default branch; allows the no-mistakes gate mirror, an `fm/<id>` branch, and the `FM_ALLOW_DEFAULT_PUSH=1` autoland land; sourced by `fm-spawn.sh`, never executed |
 | `fm-nm-preflight.sh`     | Clear a lane to run no-mistakes: refuse a detached HEAD, optionally re-assert the worktree belongs to the intended clone, warn about an unrelated in-flight run, and print the drive-by-id instruction |
