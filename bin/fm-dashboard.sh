@@ -152,6 +152,7 @@ dash_rows() {
     BEGIN { us = sprintf("%c", 31) }             # unit separator: tie-break glue
     {
       state = $4
+      if (state != "queued" && state != "in_flight") next
       if (filter == "queued" && state != "queued") next
       if (filter == "in_flight" && state != "in_flight") next
       # Build one tab-free sort key so `sort` orders on it and `cut` drops it

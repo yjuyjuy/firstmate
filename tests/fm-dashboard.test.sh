@@ -52,11 +52,12 @@ case "$verb" in
     case "$file" in
       *primary*)
         cat <<'OUT'
-count: 3
-tasks[3]{id,state,kind,repo,priority,title,created}:
+count: 4
+tasks[4]{id,state,kind,repo,priority,title,created}:
   alpha-1,queued,ship,webapp,1,Fix login bug,2026-08-20
   beta-2,in_flight,scout,"-","-",Investigate slow query,2026-08-10
   gamma-3,queued,ship,"acme, inc","-","Title, with comma and \"quotes\" and \\slash",2026-08-25
+  delta-4,done,ship,webapp,1,Completed and shipped,2026-08-01
 help[1]:
   - Run tasks-axi show <id>
 OUT
@@ -210,6 +211,27 @@ test_csv_dialect_decodes_to_single_rows() {
   pass "tasks-axi CSV dialect (commas, quotes, backslashes) decodes into clean single rows"
 }
 
+# --- terminal-state tasks are excluded from the backlog ---------------------
+test_terminal_state_tasks_never_appear() {
+  local base="$TMP_ROOT/terminal" primary sd rows
+  primary=$(build_fleet "$base")
+  sd="$base/state"; mkdir -p "$sd"
+  export TA_LOG="$base/talog"; : > "$TA_LOG"
+  printf priority > "$sd/sort"; printf all > "$sd/filter"
+  run_dash "$primary" "$sd" --snapshot
+  # delta-4 is a done-state task returned by `list --all`; the 'all' filter means
+  # all BACKLOG (queued+in_flight), so it must never surface as a row.
+  rows=$(run_dash "$primary" "$sd" --rows)
+  assert_not_contains "$rows" "delta-4" "filter=all must exclude done-state delta-4"
+  assert_contains "$rows" "alpha-1" "filter=all must still include queued alpha-1"
+  assert_contains "$rows" "beta-2" "filter=all must still include in-flight beta-2"
+  # It is likewise absent under the queued and in_flight filters.
+  run_dash "$primary" "$sd" --cycle-filter
+  rows=$(run_dash "$primary" "$sd" --rows)
+  assert_not_contains "$rows" "delta-4" "filter=queued must exclude done-state delta-4"
+  pass "terminal-state tasks (done/cancelled) never appear in the backlog"
+}
+
 # --- state filter cycle -----------------------------------------------------
 test_state_filter_cycles_and_filters() {
   local base="$TMP_ROOT/filter" primary sd
@@ -325,6 +347,7 @@ test_snapshot_merges_and_tags_homes
 test_reads_flow_only_through_tasks_axi
 test_empty_secondmate_queue_is_graceful
 test_csv_dialect_decodes_to_single_rows
+test_terminal_state_tasks_never_appear
 test_state_filter_cycles_and_filters
 test_sort_cycles_and_orders
 test_preview_reads_selected_row_full_body
