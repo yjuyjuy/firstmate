@@ -21,6 +21,7 @@ The shared no-mistakes gate refusal for fleet lifecycle entrypoints is summarize
 | `fm-backlog-handoff.sh`  | Validate and delegate queued backlog-item moves into a secondmate home               |
 | `fm-decision-hold.sh`    | Create, verify, complete, and resolve durable captain-held decisions                 |
 | `fm-decision-desk-ledger.sh` | Log decision-desk requests at routing time and surface a routed/ruled/overturned tally on demand |
+| `fm-dashboard.sh`        | The captain's dashboard TUI: merge every home's queued/in-flight backlog into one fzf list with sort/filter cycling and a `tasks-axi show --full` preview, snapshot-at-launch with a manual refresh, read-only over every home (ADR-0032, tracer bullet issue #198) |
 | `fm-brief.sh`            | Scaffold ship, scout, secondmate-charter, and Herdr-lab briefs                       |
 | `fm-work-report-counts.sh` | Emit reproducible work-report throughput counts (first-parent commits, batch-unrolled fm/ lane landings) for one repo over one resolved window as JSON (work-report skill) |
 | `fm-herdr-lab.sh`        | Provision and guardedly operate an isolated, never-default Herdr lab session         |
