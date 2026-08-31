@@ -93,6 +93,7 @@ install_guard_scripts() {
   cp "$ROOT/bin/fm-harness.sh" "$dir/bin/fm-harness.sh"
   cp "$ROOT/bin/fm-primary-scope-lib.sh" "$dir/bin/fm-primary-scope-lib.sh"
   cp "$ROOT/bin/fm-supervision-lib.sh" "$dir/bin/fm-supervision-lib.sh"
+  cp "$ROOT/bin/fm-watch-scope-lib.sh" "$dir/bin/fm-watch-scope-lib.sh"
   cp "$ROOT/bin/fm-wake-lib.sh" "$dir/bin/fm-wake-lib.sh"
   # fm-wake-lib.sh sources this at load time; without it the guard's own libraries
   # fail to load and the hook emits a sourcing error where it should stay silent.
@@ -202,6 +203,41 @@ record_watcher_lock() {
   printf '%s\n' "$identity" > "$dir/state/.watch.lock/pid-identity"
 }
 
+# Launch a stand-in for THIS home's arm process: a live `bash <abs>/bin/fm-watch-arm.sh`
+# whose /proc cmdline carries that exact absolute path as an argument, so
+# fm_home_arm_pids (which the guard consults for wake-path ownership) selects it,
+# without running the real arm. The guard copies the real fm-watch-arm.sh into
+# <dir>/bin, so overwrite it with a harmless sleep body for the duration of the
+# test - the enumeration matches on the cmdline path, not the file contents.
+# Echoes the pid.
+launch_fake_arm() {  # <dir>
+  local dir=$1 arm_path pid i
+  arm_path="$(cd "$dir/bin" && pwd)/fm-watch-arm.sh"
+  cat > "$arm_path" <<'SH'
+#!/usr/bin/env bash
+sleep 120
+SH
+  chmod +x "$arm_path"
+  bash "$arm_path" </dev/null >/dev/null 2>&1 &
+  pid=$!
+  disown "$pid" 2>/dev/null || true
+  i=0
+  while [ "$i" -lt 50 ] && ! kill -0 "$pid" 2>/dev/null; do sleep 0.02; i=$((i + 1)); done
+  printf '%s\n' "$pid"
+}
+
+# Record a live present-daemon lock for this home, so fm_wake_path_owned's
+# present-daemon check reads it as a live owner (via the shared afk-daemon
+# liveness helper the guard already sources).
+record_present_daemon_lock() {  # <dir> <pid> <identity>
+  local dir=$1 pid=$2 identity=$3 root
+  root=$(cd "$dir" && pwd)
+  mkdir -p "$dir/state/.present-daemon.lock"
+  printf '%s\n' "$pid" > "$dir/state/.present-daemon.lock/pid"
+  printf '%s\n' "$root" > "$dir/state/.present-daemon.lock/fm-home"
+  printf '%s\n' "$identity" > "$dir/state/.present-daemon.lock/pid-identity"
+}
+
 test_hook_silent_when_no_work_in_flight() {
   local dir out status
   dir=$(make_primary_dir "$TMP_ROOT/hook-idle")
@@ -236,7 +272,7 @@ test_hook_blocks_when_dead_lock_has_fresh_beacon() {
 }
 
 test_hook_silent_with_live_lock_and_fresh_beacon() {
-  local dir pid identity out status
+  local dir pid identity armpid out status
   dir=$(make_primary_dir "$TMP_ROOT/hook-live-lock-fresh")
   : > "$dir/state/task1.meta"
   sleep 60 &
@@ -248,12 +284,98 @@ test_hook_silent_with_live_lock_and_fresh_beacon() {
   }
   record_watcher_lock "$dir" "$pid" "$identity"
   touch "$dir/state/.last-watcher-beat"
+  # A live watcher lock and fresh beacon are necessary but not sufficient: the
+  # guard also requires a wake-path owner. A live this-home arm is that owner.
+  armpid=$(launch_fake_arm "$dir")
+  out=$(run_hook "$dir" false); status=$?
+  kill "$pid" "$armpid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  expect_code 0 "$status" "hook must exit 0 with a live watcher lock, fresh beacon, and a live arm owner"
+  [ -z "$out" ] || fail "hook produced output despite a live fresh watcher lock and arm owner: $out"
+  pass "fm-turnend-guard: silent no-op with a live watcher lock, fresh beacon, and a wake-path owner"
+}
+
+# --- P4: wake-path ownership (a live watcher is not enough) ------------------
+#
+# The incident had a live, fresh-beacon watcher and STILL went deaf because
+# nothing owned a path that would complete to wake the idle model. The guard must
+# alarm on exactly that state, and stay silent when a real owner (present daemon,
+# away daemon, or a live this-home arm) exists.
+
+test_blocks_when_watcher_alive_but_no_wake_owner() {
+  local dir pid identity out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-wake-path-blind")
+  : > "$dir/state/task1.meta"
+  sleep 60 &
+  pid=$!
+  identity=$(watcher_identity "$dir" "$pid") || {
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    fail "could not identify live watcher holder"
+  }
+  record_watcher_lock "$dir" "$pid" "$identity"
+  touch "$dir/state/.last-watcher-beat"
+  # NO arm, NO present daemon, NO away daemon: the watcher is alive but nothing
+  # will complete to wake the session. This is the exact incident state.
   out=$(run_hook "$dir" false); status=$?
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
-  expect_code 0 "$status" "hook must exit 0 with a live identity-matched watcher lock and fresh beacon"
-  [ -z "$out" ] || fail "hook produced output despite a live fresh watcher lock: $out"
-  pass "fm-turnend-guard: silent no-op with a live watcher lock and fresh beacon"
+  expect_code 2 "$status" "hook must block when a watcher is alive but no wake path is owned"
+  assert_contains "$out" "nothing will complete to wake this session" "banner must name the wake-path failure"
+  assert_contains "$out" "TURN WOULD END BLIND" "block banner must read as an alarm"
+  pass "fm-turnend-guard: blocks when a watcher is alive but no wake-path owner exists (the incident regression)"
+}
+
+test_passes_when_present_daemon_owns() {
+  local dir pid identity dpid didentity out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-wake-path-present-daemon")
+  : > "$dir/state/task1.meta"
+  sleep 60 &
+  pid=$!
+  identity=$(watcher_identity "$dir" "$pid") || {
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    fail "could not identify live watcher holder"
+  }
+  record_watcher_lock "$dir" "$pid" "$identity"
+  touch "$dir/state/.last-watcher-beat"
+  # A live present-mode daemon owns re-arming: the wake path is owned.
+  sleep 60 &
+  dpid=$!
+  didentity=$(watcher_identity "$dir" "$dpid") || {
+    kill "$pid" "$dpid" 2>/dev/null || true
+    fail "could not identify live present-daemon holder"
+  }
+  record_present_daemon_lock "$dir" "$dpid" "$didentity"
+  out=$(run_hook "$dir" false); status=$?
+  kill "$pid" "$dpid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  wait "$dpid" 2>/dev/null || true
+  expect_code 0 "$status" "hook must pass when a live present daemon owns the wake path"
+  [ -z "$out" ] || fail "hook produced output despite a live present-daemon owner: $out"
+  pass "fm-turnend-guard: passes when a live present-mode daemon owns the wake path"
+}
+
+test_passes_when_arm_alive() {
+  local dir pid identity armpid out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-wake-path-arm")
+  : > "$dir/state/task1.meta"
+  sleep 60 &
+  pid=$!
+  identity=$(watcher_identity "$dir" "$pid") || {
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    fail "could not identify live watcher holder"
+  }
+  record_watcher_lock "$dir" "$pid" "$identity"
+  touch "$dir/state/.last-watcher-beat"
+  armpid=$(launch_fake_arm "$dir")
+  out=$(run_hook "$dir" false); status=$?
+  kill "$pid" "$armpid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  expect_code 0 "$status" "hook must pass when a live this-home arm owns the wake path"
+  [ -z "$out" ] || fail "hook produced output despite a live arm owner: $out"
+  pass "fm-turnend-guard: passes when a live this-home arm owns the wake path"
 }
 
 test_hook_blocks_with_live_lock_and_stale_beacon() {
@@ -397,7 +519,7 @@ test_hook_secondmate_loop_guard_allows_retry() {
 # harness property recorded empirically in docs/turnend-guard.md; it needs a live
 # session and cannot be a hermetic CI assertion.
 test_hook_secondmate_reinvoke_recovery_loop() {
-  local dir pid identity out status
+  local dir pid identity armpid out status
   dir=$(make_secondmate_dir "$TMP_ROOT/hook-secondmate-reinvoke")
   : > "$dir/state/child1.meta"
   sleep 60 &
@@ -409,17 +531,20 @@ test_hook_secondmate_reinvoke_recovery_loop() {
   }
   record_watcher_lock "$dir" "$pid" "$identity"
   touch "$dir/state/.last-watcher-beat"
+  # Stop #1: a live watcher AND a live arm task (its completion is the wake path
+  # the secondmate relies on) - the guard must stay silent.
+  armpid=$(launch_fake_arm "$dir")
   out=$(run_hook "$dir" false); status=$?
-  expect_code 0 "$status" "secondmate turn must end silently while its watcher is live (Stop #1)"
+  expect_code 0 "$status" "secondmate turn must end silently while its watcher and arm are live (Stop #1)"
   [ -z "$out" ] || {
-    kill "$pid" 2>/dev/null || true
+    kill "$pid" "$armpid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
     fail "guard nagged a healthy secondmate at Stop #1: $out"
   }
-  # The watcher exits on the wake (its normal lifecycle) and a SECOND child event
-  # lands. On the re-invoked recovery turn the secondmate must re-arm; if it did
-  # not, the guard blocks that turn's end and forces the re-arm (Stop #2).
-  kill "$pid" 2>/dev/null || true
+  # The watcher AND its arm exit on the wake (their normal lifecycle) and a SECOND
+  # child event lands. On the re-invoked recovery turn the secondmate must re-arm;
+  # if it did not, the guard blocks that turn's end and forces the re-arm (Stop #2).
+  kill "$pid" "$armpid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
   rm -rf "$dir/state/.watch.lock"
   : > "$dir/state/child2.meta"
@@ -1051,7 +1176,7 @@ SH
 }
 
 test_hook_afk_without_daemon_silent_with_live_watcher() {
-  local dir pid identity out status
+  local dir pid identity armpid out status
   dir=$(make_primary_dir "$TMP_ROOT/hook-afk-nodaemon-live")
   : > "$dir/state/task1.meta"
   : > "$dir/state/.afk"
@@ -1064,12 +1189,15 @@ test_hook_afk_without_daemon_silent_with_live_watcher() {
   }
   record_watcher_lock "$dir" "$pid" "$identity"
   touch "$dir/state/.last-watcher-beat"
+  # Daemon-free away mode keeps this session's own watcher as supervision, so a
+  # live this-home arm is the wake-path owner that makes it non-blind.
+  armpid=$(launch_fake_arm "$dir")
   out=$(run_hook "$dir" false); status=$?
-  kill "$pid" 2>/dev/null || true
+  kill "$pid" "$armpid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
-  expect_code 0 "$status" "away mode without a daemon must accept a live watcher with a fresh beacon"
+  expect_code 0 "$status" "away mode without a daemon must accept a live watcher with a fresh beacon and a live arm"
   [ -z "$out" ] || fail "hook produced output despite healthy daemon-free away-mode supervision: $out"
-  pass "fm-turnend-guard: away mode without a daemon is silent with a live watcher and fresh beacon"
+  pass "fm-turnend-guard: away mode without a daemon is silent with a live watcher, fresh beacon, and a wake-path owner"
 }
 
 test_hook_afk_without_daemon_blocks_with_rearm_reason() {
@@ -1222,6 +1350,9 @@ test_hook_silent_when_no_work_in_flight
 test_hook_blocks_when_fresh_beacon_has_no_live_lock
 test_hook_blocks_when_dead_lock_has_fresh_beacon
 test_hook_silent_with_live_lock_and_fresh_beacon
+test_blocks_when_watcher_alive_but_no_wake_owner
+test_passes_when_present_daemon_owns
+test_passes_when_arm_alive
 test_hook_blocks_with_live_lock_and_stale_beacon
 test_hook_blocks_when_unhealthy_in_primary
 test_supervision_state_free_without_lock

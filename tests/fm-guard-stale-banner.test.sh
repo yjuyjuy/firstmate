@@ -295,6 +295,104 @@ test_banner_without_daemon_names_the_watcher() {
   pass "fm-guard stale banner: daemon-free away mode names the watcher repair path"
 }
 
+# --- P4: wake-path ownership warn-only mirror -------------------------------
+# fm-guard's fresh-watcher branch must also verify a wake path is owned. When a
+# watcher is alive but NO owner exists (no present daemon, away daemon, or live
+# this-home arm), it warns - but only behind a grace/dedup gate, so a sub-second
+# wake-handoff gap never trips a spurious warning.
+
+# Record a live, identity-matched, fresh-beacon watcher lock for a guard case, so
+# the fresh-watcher branch (not the stale banner) runs. Echoes the watcher pid.
+seed_fresh_watcher() {  # <dir>
+  local dir=$1 home root pid identity
+  home=$(case_home "$dir")
+  root=$(case_root "$dir")
+  # Redirect the placeholder's fds off the command-substitution pipe, or
+  # $(seed_fresh_watcher) would block until this sleep exits.
+  sleep 60 >/dev/null 2>&1 &
+  pid=$!
+  identity=$(FM_STATE_OVERRIDE="$home/state" bash -c '. "$1"; fm_pid_identity "$2"' _ "$ROOT/bin/fm-pid-lib.sh" "$pid")
+  mkdir -p "$home/state/.watch.lock"
+  printf '%s\n' "$pid" > "$home/state/.watch.lock/pid"
+  printf '%s\n' "$home" > "$home/state/.watch.lock/fm-home"
+  printf '%s\n' "$root/bin/fm-watch.sh" > "$home/state/.watch.lock/watcher-path"
+  printf '%s\n' "$identity" > "$home/state/.watch.lock/pid-identity"
+  touch "$home/state/.last-watcher-beat"
+  printf '%s\n' "$pid"
+}
+
+# Launch a stand-in this-home arm whose cmdline carries <root>/bin/fm-watch-arm.sh
+# (the absolute path fm_home_arm_pids matches, since the guard copy resolves its
+# own SCRIPT_DIR to <root>/bin). Echoes the pid.
+seed_fresh_arm() {  # <dir>
+  local dir=$1 root arm_path pid
+  root=$(case_root "$dir")
+  mkdir -p "$root/bin"
+  arm_path="$(cd "$root/bin" && pwd)/fm-watch-arm.sh"
+  printf '#!/usr/bin/env bash\nsleep 120\n' > "$arm_path"
+  chmod +x "$arm_path"
+  bash "$arm_path" </dev/null >/dev/null 2>&1 &
+  pid=$!
+  disown "$pid" 2>/dev/null || true
+  printf '%s\n' "$pid"
+}
+
+# fm-guard.sh resolves SCRIPT_DIR to its own directory, so run a copy under
+# <root>/bin for the arm-path scoping to line up with seed_fresh_arm.
+run_guard_case_own_bin() {  # <dir> <wake-path-grace>
+  local dir=$1 grace=$2 root
+  root=$(case_root "$dir")
+  mkdir -p "$root/bin" "$root/docs"
+  cp "$ROOT"/bin/fm-guard.sh "$root/bin/" 2>/dev/null || true
+  cp "$ROOT"/bin/fm-*-lib.sh "$root/bin/" 2>/dev/null || true
+  cp "$ROOT"/bin/fm-supervision-instructions.sh "$ROOT"/bin/fm-harness.sh "$root/bin/" 2>/dev/null || true
+  cp -R "$ROOT/docs/supervision-protocols" "$root/docs/supervision-protocols" 2>/dev/null || true
+  FM_ROOT_OVERRIDE="$root" FM_HOME="$(case_home "$dir")" FM_GUARD_GRACE=999 \
+    FM_GUARD_WAKE_PATH_GRACE="$grace" "$root/bin/fm-guard.sh" 2>&1
+}
+
+test_wake_path_warns_when_watcher_alive_but_unowned() {
+  local dir wpid out
+  dir=$(make_guard_case wake-path-unowned)
+  wpid=$(seed_fresh_watcher "$dir")
+  # First call with grace 0 records the sighting and stays silent (grace); the
+  # second call, now past the (zero) grace on a persistent unowned state, warns.
+  run_guard_case_own_bin "$dir" 0 >/dev/null 2>&1
+  out=$(run_guard_case_own_bin "$dir" 0)
+  kill "$wpid" 2>/dev/null || true
+  wait "$wpid" 2>/dev/null || true
+  assert_contains "$out" "WATCHER ALIVE BUT NO WAKE-PATH OWNER" \
+    "a fresh watcher with a persistent unowned wake path must warn"
+  pass "fm-guard: warns when a watcher is alive but no wake-path owner exists"
+}
+
+test_wake_path_silent_when_arm_alive() {
+  local dir wpid apid out
+  dir=$(make_guard_case wake-path-arm)
+  wpid=$(seed_fresh_watcher "$dir")
+  apid=$(seed_fresh_arm "$dir")
+  out=$(run_guard_case_own_bin "$dir" 0)
+  kill "$wpid" "$apid" 2>/dev/null || true
+  wait "$wpid" 2>/dev/null || true
+  assert_not_contains "$out" "WATCHER ALIVE BUT NO WAKE-PATH OWNER" \
+    "a live this-home arm owns the wake path, so no warning"
+  pass "fm-guard: silent when a live this-home arm owns the wake path"
+}
+
+test_wake_path_grace_suppresses_first_sighting() {
+  local dir wpid out
+  dir=$(make_guard_case wake-path-grace)
+  wpid=$(seed_fresh_watcher "$dir")
+  # Default long grace: the FIRST observation of the unowned state only records
+  # the epoch and stays silent, so a transient handoff gap never warns.
+  out=$(run_guard_case_own_bin "$dir" 600)
+  kill "$wpid" 2>/dev/null || true
+  wait "$wpid" 2>/dev/null || true
+  assert_not_contains "$out" "WATCHER ALIVE BUT NO WAKE-PATH OWNER" \
+    "the first unowned sighting within the grace window must stay silent"
+  pass "fm-guard: a first unowned sighting within grace stays silent (handoff gap never warns)"
+}
+
 test_first_stale_call_prints_full_banner
 test_repeated_same_episode_prints_reminder_only
 test_healthy_recovery_rearms_next_stale_episode
@@ -307,3 +405,6 @@ test_healthy_read_only_does_not_clear_marker
 test_read_only_never_mutates_stale_banner_state_files
 test_banner_with_live_daemon_names_the_daemon
 test_banner_without_daemon_names_the_watcher
+test_wake_path_warns_when_watcher_alive_but_unowned
+test_wake_path_silent_when_arm_alive
+test_wake_path_grace_suppresses_first_sighting

@@ -34,6 +34,43 @@ CONTINUE_LINE=${FM_GUARD_CONTINUE_LINE:-This is a supervision warning only; the 
 # Cleared when the home leaves the unhealthy state so a later episode re-arms.
 STALE_BANNER_MARKER="$STATE/.guard-watcher-stale-banner"
 
+# Volatile, home-scoped marker for the wake-path-unowned warning. It records the
+# epoch when the alive-watcher-but-no-wake-owner state was FIRST observed, plus a
+# "warned" sentinel once the warning has fired. This gives both a grace window (a
+# sub-second wake-handoff gap never trips it, because the state must persist past
+# FM_GUARD_WAKE_PATH_GRACE before the first warning) and a dedup (the warning
+# prints once per contiguous unowned episode). Cleared whenever the wake path is
+# owned again, so a later unowned episode re-arms.
+WAKE_PATH_MARKER="$STATE/.guard-wake-path-unowned"
+WAKE_PATH_GRACE=${FM_GUARD_WAKE_PATH_GRACE:-60}
+case "$WAKE_PATH_GRACE" in ''|*[!0-9]*) WAKE_PATH_GRACE=60 ;; esac
+
+# fm_guard_wake_path_clear: forget any recorded unowned state.
+fm_guard_wake_path_clear() {
+  rm -f "$WAKE_PATH_MARKER" 2>/dev/null || true
+}
+
+# fm_guard_wake_path_should_warn: exit 0 exactly once per contiguous unowned
+# episode, and only after the unowned state has persisted past the grace window.
+# First observation records the epoch and stays silent (grace). A later
+# observation past the grace prints once, then records a "warned" sentinel so
+# subsequent calls in the same episode stay silent.
+fm_guard_wake_path_should_warn() {
+  local now first
+  now=$(date +%s 2>/dev/null) || return 1
+  first=$(cat "$WAKE_PATH_MARKER" 2>/dev/null || true)
+  case "$first" in
+    warned) return 1 ;;
+    ''|*[!0-9]*)
+      printf '%s\n' "$now" > "$WAKE_PATH_MARKER" 2>/dev/null || true
+      return 1
+      ;;
+  esac
+  [ $((now - first)) -ge "$WAKE_PATH_GRACE" ] || return 1
+  printf 'warned\n' > "$WAKE_PATH_MARKER" 2>/dev/null || true
+  return 0
+}
+
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
 # shellcheck source=bin/fm-tangle-lib.sh
@@ -209,9 +246,21 @@ if [ "$watcher_fresh" = false ]; then
       "$beacon_desc" "$GRACE" >&2
   fi
 else
-  # Healthy again while work is still in flight: end the episode so a later
+  # Healthy again while work is still in flight: end the stale episode so a later
   # restale re-prints the full banner.
   [ "$READ_ONLY" -eq 1 ] || fm_guard_clear_stale_banner
+  # A fresh watcher is necessary but not sufficient: verify a wake path is owned
+  # (present daemon, away daemon, or a live this-home arm). When the watcher is
+  # alive but NO owner exists, warn - but only behind the grace/dedup gate, so a
+  # sub-second wake-handoff gap (arm completed, model not yet re-armed) never trips
+  # a spurious warning. fm_wake_path_owned itself errs toward owned on any probe
+  # uncertainty, so this warns only on a genuine, persistent unowned state.
+  if fm_wake_path_owned "$STATE" "$SCRIPT_DIR"; then
+    [ "$READ_ONLY" -eq 1 ] || fm_guard_wake_path_clear
+  elif [ "$READ_ONLY" -ne 1 ] && fm_guard_wake_path_should_warn; then
+    printf 'WARNING: WATCHER ALIVE BUT NO WAKE-PATH OWNER - %d task(s) in flight, a watcher holds the lock, but no live present daemon, away daemon, or arm task will complete to wake this session. Re-arm one bin/fm-watch-arm.sh cycle. %s\n' \
+      "$in_flight" "$CONTINUE_LINE" >&2
+  fi
 fi
 
 # Queued wakes are an independent hazard; warn whenever they are pending, even if

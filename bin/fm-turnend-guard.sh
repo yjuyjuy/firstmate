@@ -86,7 +86,21 @@ fm_primary_scope_matches "$FM_ROOT" "$STATE" || exit 0
 
 fm_supervision_status "$STATE" "$GRACE"
 [ "$FM_SUP_IN_FLIGHT" -gt 0 ] || exit 0
-fm_watcher_healthy "$STATE" "$WATCH" "$GRACE" "$FM_HOME" && exit 0
+if fm_watcher_healthy "$STATE" "$WATCH" "$GRACE" "$FM_HOME"; then
+  # A live, identity-matched, fresh-beacon watcher is necessary but NOT sufficient
+  # to be non-blind: the incident had exactly that and still went deaf because
+  # nothing owned a path that would COMPLETE to wake the idle model. So verify
+  # wake-path ownership too. If a wakeable owner exists (present daemon, away
+  # daemon, or a live this-home arm), the turn can end. If the watcher is alive
+  # but NO owner exists, fall through to the blind banner with a wake-path-specific
+  # detail. fm_wake_path_owned errs toward owned on any probe uncertainty, so this
+  # never nags on a transient handoff; a genuinely dead watcher is still caught by
+  # the beacon check above and below.
+  if fm_wake_path_owned "$STATE" "$SCRIPT_DIR"; then
+    exit 0
+  fi
+  wake_path_blind=1
+fi
 
 # Away mode alone does NOT mean a daemon owns supervision. A home whose captain
 # session runs outside any injectable supervisor pane deliberately runs away mode
@@ -102,7 +116,12 @@ fm_afk_daemon_owns_supervision "$STATE" "$SCRIPT_DIR" && afk=1
 # The live-watcher test above already ran and failed, so a fresh beacon means the
 # watcher that produced it is gone rather than that no watcher ever beat; saying
 # "no live watcher" while printing a fresh beacon age would contradict itself.
-if [ "$FM_SUP_WATCHER_FRESH" = true ]; then
+# The wake-path-blind case is different: the watcher IS alive and holding the
+# lock, but nothing will complete to wake this session, so its detail must say
+# that instead of claiming the watcher is gone.
+if [ "${wake_path_blind:-0}" -eq 1 ]; then
+  detail='a watcher is alive but nothing will complete to wake this session (no live present daemon, away daemon, or arm task owns the wake path)'
+elif [ "$FM_SUP_WATCHER_FRESH" = true ]; then
   detail=$(printf 'the watcher that last beat %s is no longer holding this home lock' "$FM_SUP_BEACON_DESC")
 else
   detail=$(printf 'no live watcher holds this home lock (last beat: %s)' "$FM_SUP_BEACON_DESC")
