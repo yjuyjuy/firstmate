@@ -101,7 +101,12 @@ test_interactive_implies_unsupervised() {
   status=$?
   [ "$status" -ne 0 ] || fail "spawn with no brief should still fail"
   assert_not_contains "$out" "error: --interactive" "--interactive should be an accepted flag"
-  assert_not_contains "$out" "unknown" "--interactive should not be an unknown flag"
+  # If --interactive were NOT a recognized flag it would fall through to the
+  # positional bucket and be misread as a harness argument, surfacing as
+  # "harness '--interactive'". A recognized flag leaves the harness at its
+  # default (which reads 'unknown' in a config-less environment such as clean
+  # CI, so a bare "unknown" substring is not a valid signal here).
+  assert_not_contains "$out" "harness '--interactive'" "--interactive must not be misread as a positional harness argument"
   pass "--interactive is accepted for a spawn"
 }
 
