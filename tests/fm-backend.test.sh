@@ -112,7 +112,7 @@ BASE_REF=$(resolve_base_ref) \
 # tmux-only conformance run the tmux adapter's behavior is what is under test,
 # and that is unchanged by any later (e.g. non-tmux backend) addition to
 # fm-backend.sh's own dispatch surface.
-OLD_BIN_UNCHANGED_SIBLINGS="fm-gate-refuse-lib.sh fm-guard.sh fm-lock-lib.sh fm-tasks-axi-lib.sh fm-pr-lib.sh fm-tangle-lib.sh fm-tmux-lib.sh fm-composer-lib.sh fm-wake-lib.sh fm-classify-lib.sh fm-supervision-lib.sh fm-ff-lib.sh fm-config-inherit-lib.sh fm-project-mode.sh fm-harness.sh fm-crew-state.sh fm-decision-hold.sh fm-backend.sh fm-transition-lib.sh fm-x-lib.sh fm-check-lib.sh fm-secondmate-context-lib.sh fm-afk-daemon-lib.sh fm-hourly-lib.sh fm-merge-queue-lib.sh fm-mutex-lib.sh fm-pid-lib.sh fm-cadence-lib.sh fm-completions-lib.sh fm-telemetry-lib.sh fm-token-sessions-lib.sh"
+OLD_BIN_UNCHANGED_SIBLINGS="fm-gate-refuse-lib.sh fm-guard.sh fm-lock-lib.sh fm-tasks-axi-lib.sh fm-pr-lib.sh fm-tangle-lib.sh fm-tmux-lib.sh fm-composer-lib.sh fm-wake-lib.sh fm-classify-lib.sh fm-supervision-lib.sh fm-ff-lib.sh fm-config-inherit-lib.sh fm-project-mode.sh fm-harness.sh fm-crew-state.sh fm-decision-hold.sh fm-backend.sh fm-transition-lib.sh fm-x-lib.sh fm-check-lib.sh fm-secondmate-context-lib.sh fm-afk-daemon-lib.sh fm-hourly-lib.sh fm-merge-queue-lib.sh fm-mutex-lib.sh fm-pid-lib.sh fm-cadence-lib.sh fm-completions-lib.sh fm-telemetry-lib.sh fm-token-sessions-lib.sh fm-pane-crash-lib.sh fm-watch-scope-lib.sh"
 # A pull-request merge may add a new main-only dependency that the branch's older baseline does not have yet.
 # fm-operational-input.sh is the current owner fm-marker-lib.sh sources; an
 # older baseline whose marker lib still carried that content itself does not
