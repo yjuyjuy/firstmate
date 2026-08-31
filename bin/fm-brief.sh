@@ -452,7 +452,7 @@ The report is the only thing that survives, so anything worth keeping must be in
 4. Report status by appending one line: \`echo "{state}: {one short line}" >> $STATUS_FILE\`
    States: working, needs-decision, blocked, $PAUSED_VERB, done, failed. Each append wakes firstmate, so report only
    supervisor-actionable phase changes plus the needs-decision/blocked/$PAUSED_VERB/done/failed states; no FYI lines.
-   Use \`$PAUSED_VERB: {why}\` (vs \`blocked:\`) is ONLY for deliberately idling on a known external wait that self-clears;
+   Use \`$PAUSED_VERB: {why}\` (distinct from \`blocked:\`) ONLY when deliberately idling on a known external wait that self-clears;
    use \`blocked:\` when stuck. An auth session-limit, usage-window/quota exhaustion, or revoked/expired token is
    captain-fixable, so report it \`blocked:\`, NEVER \`$PAUSED_VERB:\`.
 5. If you hit the same obstacle twice, append \`blocked: {why}\` and stop.
@@ -650,7 +650,7 @@ $RULE1
    States: working, needs-decision, blocked, $PAUSED_VERB, done, failed. Each append wakes firstmate, so report only
    supervisor-actionable phase changes plus the needs-decision/blocked/$PAUSED_VERB/done/failed states; no FYI lines.
    A mid-task \`working:\` line (including setup complete) is nonterminal: continue until a defined \`done:\` gate.
-   Use \`$PAUSED_VERB: {why}\` (vs \`blocked:\`) is ONLY for deliberately idling on a known external wait that self-clears;
+   Use \`$PAUSED_VERB: {why}\` (distinct from \`blocked:\`) ONLY when deliberately idling on a known external wait that self-clears;
    use \`blocked:\` when stuck. An auth session-limit, usage-window/quota exhaustion, or revoked/expired token is
    captain-fixable, so report it \`blocked:\`, NEVER \`$PAUSED_VERB:\`.
 5. If you hit the same obstacle twice, append \`blocked: {why}\` and stop.
