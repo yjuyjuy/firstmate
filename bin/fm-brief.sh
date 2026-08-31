@@ -178,14 +178,40 @@ STATUS_FILE=$(shell_quote "$STATE/$ID.status")
 CAPTAIN_RULES=$(cat <<'EOF'
 # Standing captain rules
 
-Bind the whole task; not optional; outrank convenience.
+These bind you for the whole task. They are not optional and they outrank convenience.
 
-- **C1. Never force anything.** No force-push, no forced release, never delete a branch on your own (captain's call). If a push is rejected, push to a NEW branch and report its name. Guarded tooling removing its own worktrees or landed/pruned refs (`bin/fm-teardown.sh`, `bin/fm-fleet-sync.sh`) is exempt.
-- **C2. Understand the WHY before acting.** If the reason for an instruction is unclear, STOP and ask firstmate for a grilling session. Asking is never a failure.
-- **C3. Plan before you change code.** MANDATORY: use `wayfinder` if your runtime provides it, else plan by your own means.
-- **C4. Write prose in caveman ultra style.** Drop articles/filler/hedging; fragments fine; state each fact once; keep every technical fact. Binds status lines, replies to firstmate, and reports; in reports, identifiers/paths/commands/status lines/error strings stay VERBATIM. Use normal prose for anything a tool/forge/CI parses (code, commit messages, PR bodies, `AGENTS.md`, ADRs, `docs/`), for security warnings and irreversible-action confirmations, and where dropping conjunctions makes order ambiguous. Never abbreviate identifiers/APIs/CLI commands/error strings. Full rule: section 9 of firstmate `AGENTS.md`.
-- **C5. Never bind port 443 or 3000** (captain's servers). Use a non-default port.
-- **C6. If this task came from a Mattermost thread**, FIRST re-read the full thread; never trust the queue-time summary. If already fixed, verify and ADD the missing end-to-end coverage rather than closing.
+- **C1. Never force anything.** Never force-push, never force a release, and never decide on
+   your own to delete a branch - deleting a branch is the captain decision alone. If a push
+   is rejected or a branch is otherwise blocked, push to a NEW branch instead and report the
+   new branch name, so nothing that exists can be lost. Running the guarded
+   machinery as designed, such as `bin/fm-teardown.sh` or `bin/fm-fleet-sync.sh` removing
+   their own worktrees and already-landed or pruned refs through their existing safety
+   checks, is ordinary tooling behavior and is not what this rule prohibits.
+- **C2. Understand the WHY before acting.** Never work the wording of this brief mechanically.
+   If the reason behind an instruction is not clear enough to act on, STOP and ask firstmate
+   for a grilling session. Asking is far cheaper than a wrong implementation and is never
+   treated as a failure.
+- **C3. Plan before you change code.** Planning first is MANDATORY, whatever runtime you are
+   running on. If your runtime provides the `wayfinder` skill, invoke it to plan the work.
+   If it does not, plan by your own means before touching code; the mandate stands either way.
+- **C4. Write your prose in caveman ultra style.** Drop articles, filler, hedging, and
+   pleasantries; fragments are fine; state each fact once; keep every technical fact. This
+   binds your status lines, your replies to firstmate, AND your reports, including the scout
+   report at `data/<id>/report.md`. Inside a report, exact identifiers, paths, commands,
+   status lines, and error strings stay VERBATIM - they are evidence, not prose. Written in
+   normal correct prose instead: code, code comments, commit messages, PR titles and bodies,
+   any project `AGENTS.md` or `CLAUDE.md`, ADRs, files under `docs/`, and
+   anything a tool, forge, or CI parses. Normal prose too for security warnings,
+   irreversible-action confirmations, and any multi-step sequence where dropping conjunctions would make the
+   order ambiguous. Never invent abbreviations and never
+   abbreviate identifiers, API names, CLI commands, or error strings.
+   Section 9 of the firstmate repo `AGENTS.md` owns this rule in full.
+- **C5. Never bind port 443 or 3000.** Those ports are reserved for the servers the captain
+   runs personally. Any server you start runs on a non-default port.
+- **C6. If this task came from a Mattermost thread**, your FIRST action is to re-read the full
+   thread; never trust the queue-time summary in this brief. If the reported bug turns out to
+   be already fixed, verify that and ADD the missing end-to-end coverage rather than closing
+   the task as done.
 EOF
 )
 
@@ -199,9 +225,31 @@ CAPTAIN_RULES_SECONDMATE=$(cat <<'EOF'
 
 These bind you and every crewmate you dispatch.
 
-- **C1. Never force anything.** Never force-push, never force a release, never decide on your own to delete a branch (the captain's decision alone). When a push is blocked, push to a NEW branch and report it so nothing existing is lost. Guarded machinery removing its own worktrees or already-landed/pruned refs through its own checks (`bin/fm-teardown.sh`, `bin/fm-fleet-sync.sh`) is ordinary tooling, not what this prohibits.
-- **C2. Understand the WHY before acting.** Never work routed instructions mechanically. If the reason is unclear, STOP and ask the main firstmate for a grilling session via the escalation path below - append a `needs-decision` line to the main status file, carrying the same `corr=<id>` token when the questioned request arrived marked. Never ask only in this chat: the main firstmate does not read it. Asking is never a failure.
-- **C4. Write prose in caveman ultra style.** Drop articles, filler, hedging, pleasantries; fragments fine; state each fact once; keep every technical fact. Binds your status lines, replies to the main firstmate, and every report you or your crewmates produce (including `data/<id>/report.md`). In a report, exact identifiers, paths, commands, status lines, and error strings stay VERBATIM as evidence. Use normal prose for anything a tool/forge/CI parses (code, code comments, commit messages, PR titles/bodies, project `AGENTS.md`/`CLAUDE.md`, ADRs, `docs/`), for security warnings and irreversible-action confirmations, and for any multi-step sequence where dropping conjunctions makes order ambiguous. Never invent abbreviations; never abbreviate identifiers, API names, CLI commands, or error strings. Full rule: section 9 of the firstmate repo `AGENTS.md`.
+- **C1. Never force anything.** Never force-push, never force a release, and never decide on
+   your own to delete a branch - deleting a branch is the captain decision alone. When a push
+   is blocked, push to a NEW branch and report it, so nothing that exists can be lost.
+   Running the guarded machinery as designed, such as `bin/fm-teardown.sh` or
+   `bin/fm-fleet-sync.sh` removing their own worktrees and already-landed or pruned refs
+   through their existing safety checks, is ordinary tooling behavior and is not what this
+   rule prohibits.
+- **C2. Understand the WHY before acting.** Never work routed instructions mechanically. When
+   the reason behind a request is not clear enough to act on, STOP and ask the main firstmate
+   for a grilling session through the escalation path below - append a `needs-decision` status
+   line to the main status file, carrying the same `corr=<id>` token when the request you are
+   questioning arrived marked. Never ask only in this chat: the main firstmate does not read
+   it, so a chat-only question is lost. Asking is never treated as a failure.
+- **C4. Write your prose in caveman ultra style.** Drop articles, filler, hedging, and
+   pleasantries; fragments are fine; state each fact once; keep every technical fact. This
+   binds your status lines, your replies to the main firstmate, AND every report you or your
+   crewmates produce, including the scout report at `data/<id>/report.md`. Inside a report,
+   exact identifiers, paths, commands, status lines, and error strings stay VERBATIM - they
+   are evidence, not prose. Written in normal correct prose instead: code, code comments,
+   commit messages, PR titles and bodies, any project `AGENTS.md` or `CLAUDE.md`, ADRs, files
+   under `docs/`, and anything a tool, forge, or CI parses. Normal prose too for security warnings,
+   irreversible-action confirmations, and any multi-step sequence where dropping
+   conjunctions would make the order ambiguous. Never invent abbreviations and never
+   abbreviate identifiers, API names, CLI commands, or error strings.
+   Section 9 of the firstmate repo `AGENTS.md` owns this rule in full.
 EOF
 )
 
@@ -404,18 +452,18 @@ The report is the only thing that survives, so anything worth keeping must be in
 4. Report status by appending one line: \`echo "{state}: {one short line}" >> $STATUS_FILE\`
    States: working, needs-decision, blocked, $PAUSED_VERB, done, failed. Each append wakes firstmate, so report only
    supervisor-actionable phase changes plus the needs-decision/blocked/$PAUSED_VERB/done/failed states; no FYI lines.
-   \`$PAUSED_VERB: {why}\` (vs \`blocked:\`) is ONLY for deliberately idling on a known external wait that self-clears;
+   Use \`$PAUSED_VERB: {why}\` (vs \`blocked:\`) is ONLY for deliberately idling on a known external wait that self-clears;
    use \`blocked:\` when stuck. An auth session-limit, usage-window/quota exhaustion, or revoked/expired token is
    captain-fixable, so report it \`blocked:\`, NEVER \`$PAUSED_VERB:\`.
 5. If you hit the same obstacle twice, append \`blocked: {why}\` and stop.
 6. If a decision belongs to a human (product choices, destructive actions), append \`needs-decision: {options}\`
-   and stop. On reply or when a blocker clears, append \`resolved: {how}\` (same \`[key=<slug>]\` if you opened with one).
+   and stop. On reply or a blocker clears, append \`resolved: {how}\` (same \`[key=<slug>]\` if you opened with one).
 7. Never stop, restart, or update the shared \`no-mistakes\` daemon. On ANY daemon error, append
    \`blocked: {the daemon error}\` and stop.
 8. Run heavy commands (unit/e2e suites, lint, builds) through
-   \`$FM_ROOT/bin/fm-heavy-run.sh --task $ID -- <command>\` (a queued notice is normal). Cap \`VITEST_MAX_WORKERS=2\` (never 4).
+   \`$FM_ROOT/bin/fm-heavy-run.sh --task $ID -- <command>\` (it prints a queued notice while you wait; that is normal, not a hang). Cap \`VITEST_MAX_WORKERS=2\` (never 4).
 9. Announce test runs: \`working: TEST START - {what, rough scale}\` before, \`working: TEST END - {outcome}\` after.
-10. Announce live browser use: \`working: BROWSER START - {what}\` before, \`working: BROWSER END - {outcome}\` after.
+10. Announce live browser use: \`working: BROWSER START - {what}\` before, \`working: BROWSER END - {outcome}\` after - a non-blocking announce, never wait on firstmate for a slot.
 
 $RTK_SECTION
 
@@ -472,8 +520,8 @@ EOF
 2. Run \`no-mistakes doctor\`; if it reports the repo is not initialized here, run \`no-mistakes init\`."
     # Shared direct-push pipeline body: identical whether or not the lane self-lands.
     DP_BODY=$(cat <<EOF
-YOU own the entire finish on a direct-push lane: committing and pushing are NOT done. Drive it in one flow: implement, commit, run the FULL /no-mistakes pipeline, then complete the closing steps - do not stop for firstmate.
-The pipeline's \`pr\`/\`ci\` steps not applying is expected; a run ending \`passed\` with them skipped is COMPLETE. A run reporting \`missing NO_MISTAKES_BITBUCKET_EMAIL\` is expected and NOT a blocker.
+YOU own the entire finish on a direct-push lane. Committing locally is NEVER done, and pushing is NEVER done either. Drive the whole sequence yourself in one continuous flow: implement, commit, run the FULL /no-mistakes pipeline yourself, then complete the closing steps - do not stop for firstmate.
+The pipeline's \`pr\`/\`ci\` steps not applying is expected; a run ending \`passed\` with those steps skipped is COMPLETE. A run reporting \`missing NO_MISTAKES_BITBUCKET_EMAIL\` is expected and is NOT a blocker.
 
 Follow /no-mistakes' own version-matched guidance for mechanics (\`no-mistakes axi run --help\`, each \`axi\` response's \`help\`). Firstmate-specific rules on top:
 - Before invoking, run \`$FM_ROOT/bin/fm-nm-preflight.sh\`; if it refuses, do NOT invoke - append \`blocked: {the refusal}\` and stop. It refuses when a run is in flight on a different branch; never respond to or abort that run.
@@ -546,16 +594,30 @@ EOF
     RULE1='1. Never push to the default branch. Never merge a PR.'
     DOD=$(cat <<EOF
 # Definition of done
-Complete only when committed on your branch. Append \`done: {summary}\` and stop; firstmate then tells you to run /no-mistakes to validate and ship a PR.
+The task is complete only when committed on your branch.
+When you believe it is complete, append \`done: {summary}\` to the status file and stop.
+Firstmate will then instruct you to run /no-mistakes to validate and ship a PR.
 
-Follow /no-mistakes' own version-matched guidance for mechanics (\`no-mistakes axi run --help\`, each \`axi\` response's \`help\`). Firstmate-specific rules on top:
-- Before invoking, run \`$FM_ROOT/bin/fm-nm-preflight.sh\`; if it refuses, do NOT invoke - append \`blocked: {the refusal}\` and stop. A run on a DIFFERENT branch is not a refusal; never respond to or abort it.
-- Drive YOUR run by its id (a bare \`axi status\` can resolve to another lane's run).
-- ALWAYS pass \`--intent "{one-line description}"\` on EVERY \`axi run\`.
-- Respond to gates; never hand-edit/commit/fix findings while a run is active.
-- ask-user findings are NOT yours: escalate via rule 6, then feed the decision with \`no-mistakes axi respond\`. Avoid \`--yes\`.
+Before you invoke /no-mistakes, run \`$FM_ROOT/bin/fm-nm-preflight.sh\` from this worktree.
+If it refuses, do NOT invoke /no-mistakes: append \`blocked: {the refusal it printed}\` and stop.
+It refuses a detached HEAD and a worktree that belongs to another copy of the repo.
+A run in flight on a DIFFERENT branch is not a refusal: no-mistakes serializes per repo+branch, so your branch validates alongside it. The guard names that run as a warning - never respond to or abort that run, because its findings belong to the lane that started it.
 
-When /no-mistakes reports CI green (do not keep monitoring to merge), append \`done: PR {url} checks green\` and stop.
+Drive YOUR run by its id. \`no-mistakes axi run\` reports the run it started; from then on read it with \`no-mistakes axi status --run <id>\` and \`no-mistakes axi logs --run <id> --step <step>\`.
+A bare \`axi status\` resolves repo-wide whenever your branch has no run of its own, so it can hand you a concurrent lane run as if it were yours.
+
+ALWAYS pass \`--intent "{one-line description of what this change does}"\` when you invoke \`no-mistakes axi run\`, on EVERY run. It is required, never optional: without it the pipeline spends an extra model call deriving the intent itself, wasting tokens and latency on every run. Write the intent yourself from the Task above.
+
+You drive no-mistakes by responding to its gates, not by implementing fixes.
+Follow the guidance no-mistakes itself provides for the mechanics: it loads when you invoke /no-mistakes, and \`no-mistakes axi run --help\` plus the \`help\` lines in each \`axi\` response are authoritative and version-matched to the installed binary.
+Do not hand-edit, commit, or fix findings yourself while a run is active - the pipeline applies every fix.
+
+Two firstmate-specific rules layer on top of that guidance:
+- ask-user findings are not yours to answer: escalate to firstmate (rule 6) and stop.
+  When the decision comes back, feed it to the gate with \`no-mistakes axi respond\` and let the pipeline apply it - do not route the question to "the user" or implement the fix yourself.
+- Avoid \`--yes\`: the captain, not you, owns the ask-user decisions it would silently auto-resolve.
+
+After /no-mistakes reports CI green (the CI-ready return point - do not wait for it to keep monitoring in the background until merge), append \`done: PR {url} checks green\` and stop. You are finished.
 EOF
 )
     ;;
@@ -574,7 +636,9 @@ $HYFIN_REPRO
 # Setup
 You are in a disposable git worktree of $REPO, at a detached HEAD on a clean default branch.
 
-**Verify isolation before anything else.** Run \`pwd -P\` and \`git rev-parse --show-toplevel\`; both must resolve to the disposable task worktree you were launched in (a treehouse pool path or Orca-managed worktree), NOT the primary checkout firstmate operates from (the path check is authoritative; \`--git-dir\`/\`--git-common-dir\` do not prove isolation). If either is the primary checkout or not the worktree you were launched in, STOP - do not branch or commit - append \`blocked: launched in primary checkout, not an isolated worktree\` to the status file and stop.
+**Verify isolation before anything else.** Run \`pwd -P\` and \`git rev-parse --show-toplevel\`; both must resolve to the disposable task worktree you were launched in, such as a treehouse pool path or an Orca-managed worktree, not the primary checkout firstmate operates from.
+The path check is authoritative: \`git rev-parse --git-dir\` and \`git rev-parse --git-common-dir\` can help inspect the repo, but they do not prove you are outside the primary checkout.
+If the top-level path is the primary checkout or not the worktree you were launched in, STOP - do not branch or commit here - append \`blocked: launched in primary checkout, not an isolated worktree\` to the status file and stop.
 
 1. First action: create your branch: \`git checkout -b fm/$ID\`$SETUP2
 
@@ -585,30 +649,35 @@ $RULE1
 4. Report status by appending one line: \`echo "{state}: {one short line}" >> $STATUS_FILE\`
    States: working, needs-decision, blocked, $PAUSED_VERB, done, failed. Each append wakes firstmate, so report only
    supervisor-actionable phase changes plus the needs-decision/blocked/$PAUSED_VERB/done/failed states; no FYI lines.
-   A mid-task \`working:\` line is nonterminal: continue until a defined \`done:\` gate.
-   \`$PAUSED_VERB: {why}\` (vs \`blocked:\`) is ONLY for deliberately idling on a known external wait that self-clears;
+   A mid-task \`working:\` line (including setup complete) is nonterminal: continue until a defined \`done:\` gate.
+   Use \`$PAUSED_VERB: {why}\` (vs \`blocked:\`) is ONLY for deliberately idling on a known external wait that self-clears;
    use \`blocked:\` when stuck. An auth session-limit, usage-window/quota exhaustion, or revoked/expired token is
    captain-fixable, so report it \`blocked:\`, NEVER \`$PAUSED_VERB:\`.
 5. If you hit the same obstacle twice, append \`blocked: {why}\` and stop.
 6. If a decision belongs to a human (product choices, destructive actions, ask-user findings), append
-   \`needs-decision: {options}\` and stop. On reply or when a blocker clears, append \`resolved: {how}\`
+   \`needs-decision: {options}\` and stop. On reply or a blocker clears, append \`resolved: {how}\`
    (same \`[key=<slug>]\` if you opened with one).
 7. Never stop, restart, or update the shared \`no-mistakes\` daemon. On ANY daemon error, append
    \`blocked: {the daemon error}\` and stop.
 8. Run heavy commands (unit/e2e suites, lint, builds) through
-   \`$FM_ROOT/bin/fm-heavy-run.sh --task $ID -- <command>\` (a queued notice is normal). Cap \`VITEST_MAX_WORKERS=2\` (never 4).
+   \`$FM_ROOT/bin/fm-heavy-run.sh --task $ID -- <command>\` (it prints a queued notice while you wait; that is normal, not a hang). Cap \`VITEST_MAX_WORKERS=2\` (never 4).
 9. Announce test runs: \`working: TEST START - {what, rough scale}\` before, \`working: TEST END - {outcome}\` after.
-10. Announce live browser use: \`working: BROWSER START - {what}\` before, \`working: BROWSER END - {outcome}\` after.
+10. Announce live browser use: \`working: BROWSER START - {what}\` before, \`working: BROWSER END - {outcome}\` after - a non-blocking announce, never wait on firstmate for a slot.
 
 $RTK_SECTION
 
 $CAPTAIN_RULES
 
 # Project memory
-If \`AGENTS.md\`/\`CLAUDE.md\` exists, or this task produced durable project knowledge useful to almost every future session, run \`$FM_ROOT/bin/fm-ensure-agents-md.sh .\` in the worktree (prefer pointers over copied detail; add its \`## Maintaining this file\` section if missing). Skip for trivial tasks.
+If \`AGENTS.md\` or \`CLAUDE.md\` already exists, or if this task produced durable project-intrinsic knowledge, run \`$FM_ROOT/bin/fm-ensure-agents-md.sh .\` in the worktree.
+Record only project knowledge useful to almost every future session.
+For anything the codebase already shows, prefer a pointer to the authoritative file, command, or doc over copying the detail.
+If you touch a project \`AGENTS.md\` that lacks \`## Maintaining this file\`, add that short self-governance section from \`$FM_ROOT/bin/fm-ensure-agents-md.sh\` in the same pass.
+Keep it proportionate: skip \`AGENTS.md\` edits for trivial tasks that produced no durable project knowledge.
 
 # Test coverage declaration
-Your final report must state plainly whether this change was built test-first and whether it has end-to-end coverage. A gap does not block the merge, but name it and its reason.
+Your final report must state plainly whether you built this change test-first and whether it has end-to-end coverage.
+A gap does not block the merge, but name the gap and its reason; the captain reviews every untested product change.
 
 $DOD
 EOF
