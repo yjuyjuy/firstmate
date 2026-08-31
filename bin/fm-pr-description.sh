@@ -282,7 +282,7 @@ fi
 
 # --- Related tickets: issue URLs, #NNN refs, tracker-style ids ----------------
 ISSUE_URLS=$(printf '%s' "$MATTERMOST" | grep -oE 'https://[^[:space:]")]+/issues/[0-9]+' | tr -d '.,;' | sort -u || true)
-HASH_REFS=$(printf '%s' "$MATTERMOST" | grep -oE '(^|[^A-Za-z0-9_])#[0-9]+' | grep -oE '#[0-9]+' | sort -un || true)
+HASH_REFS=$(printf '%s' "$MATTERMOST" | grep -oE '(^|[^A-Za-z0-9_])#[0-9]+' | grep -oE '#[0-9]+' | sort -u || true)
 TICKET_IDS=$(printf '%s' "$MATTERMOST" | grep -oE '(^|[^A-Za-z0-9_])[A-Z][A-Z0-9]{1,9}-[0-9]{1,6}' | grep -oE '[A-Z][A-Z0-9]{1,9}-[0-9]{1,6}' | sort -u || true)
 
 TICKETS_LINES=""
