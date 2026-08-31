@@ -146,9 +146,10 @@ Independently, `fm-spawn.sh`, `fm-send.sh`, and `fm-teardown.sh` source `bin/fm-
 A normal primary checkout or crewmate worktree has neither signal and remains unaffected.
 The helper's header owns the exact signal detection, relocated-home limitation, test-harness bypass, and relationship to no-mistakes' HEAD-continuity guard.
 
-## Two task shapes
+## Three task shapes
 
 Ship tasks change projects and ship by project mode (`no-mistakes`, `direct-PR`, `direct-push`, or `local-only`); scout tasks investigate, plan, reproduce bugs, or audit, then leave a report at `data/<id>/report.md` and never push.
+Interactive tasks are captain-driven: the captain performs each step in a hands-off (`--unsupervised`) pane while an in-pane agent hands over the exact next step and verifies the result, leaving a session log at `data/<id>/report.md`; they share scout's scratch-worktree, report-deliverable teardown contract exactly (see AGENTS.md task lifecycle).
 
 ## Dispatch profiles
 
