@@ -22,7 +22,7 @@ The shared no-mistakes gate refusal for fleet lifecycle entrypoints is summarize
 | `fm-decision-hold.sh`    | Create, verify, complete, and resolve durable captain-held decisions                 |
 | `fm-decision-desk-ledger.sh` | Log decision-desk requests at routing time and surface a routed/ruled/overturned tally on demand |
 | `fm-dashboard.sh`        | The captain's dashboard TUI: fzf panels cycled by keybind over every home read-only (ADR-0032). The backlog panel merges every home's queued/in-flight tasks with sort/filter cycling; the captain-decisions panel merges captain-kind holds, decision-desk requests, and unanswered transcript questions, each row tagged with home and source. Snapshot-at-launch with a manual refresh (issues #198, #199) |
-| `fm-brief.sh`            | Scaffold ship, scout, secondmate-charter, and Herdr-lab briefs                       |
+| `fm-brief.sh`            | Scaffold ship, scout, interactive, secondmate-charter, and Herdr-lab briefs          |
 | `fm-work-report-counts.sh` | Emit reproducible work-report throughput counts (first-parent commits, batch-unrolled fm/ lane landings) for one repo over one resolved window as JSON (work-report skill) |
 | `fm-herdr-lab.sh`        | Provision and guardedly operate an isolated, never-default Herdr lab session         |
 | `fm-install-herdr.sh`    | Install CI's exact-version Herdr pin with official asset URL, SHA-256, and protocol checks |
