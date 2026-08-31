@@ -30,7 +30,15 @@
 #   fm-decision-desk-ledger.sh resolve <subject> <status>   # ruled|insufficient-source|escalated
 #   fm-decision-desk-ledger.sh overturn <subject>            # mark last matching row overturned=yes
 #   fm-decision-desk-ledger.sh tally                         # N routed, M ruled, K overturned
+#   fm-decision-desk-ledger.sh list [--all]                  # pending requests as TSV; --all = every row
 #   fm-decision-desk-ledger.sh path                          # print the ledger file path
+#
+# `list` is the read path for consumers (e.g. the dashboard's captain-decisions
+# panel) that must not hand-parse this Markdown table: it emits one
+# tab-separated "subject<TAB>question<TAB>when<TAB>status" line per request.
+# With no flag it lists only PENDING requests (status routed, still awaiting a
+# ruling); `--all` lists every recorded request. Nothing is printed when the
+# ledger does not exist yet.
 #
 # `resolve` and `overturn` update the LAST row matching <subject>, so a re-used
 # subject updates its most recent request. A resolve with no matching row is
@@ -46,7 +54,7 @@ LEDGER="$DATA/decision-desk-ledger.md"
 VALID_STATUSES="routed ruled insufficient-source escalated"
 
 usage() {
-  sed -n '2,33p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,41p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 # True when a value is a safe single table cell (no pipe, no newline). Keeps the
@@ -183,6 +191,32 @@ cmd_tally() {
   printf '  overturned: %s\n' "$overturned"
 }
 
+# cmd_list [--all]: the read path for consumers. Emit one TSV line per request,
+# "subject<TAB>question<TAB>when<TAB>status", decoded here so no consumer parses
+# the Markdown table. Default lists only pending (status routed) requests; --all
+# lists every row. Absent ledger prints nothing.
+cmd_list() {
+  local all=
+  case "${1:-}" in
+    --all) all=1 ;;
+    '') : ;;
+    *) echo "list: unknown option: $1" >&2; return 2 ;;
+  esac
+  [ -f "$LEDGER" ] || return 0
+  awk -v all="$all" '
+    BEGIN { FS="|" }
+    /^\| / && $0 !~ /^\| --- / && $0 !~ /^\| when \(UTC\)/ {
+      # Cells: $1="" $2=when $3=subject $4=question $5=status $6=overturned
+      when=$2; subj=$3; q=$4; st=$5
+      gsub(/^ +| +$/, "", when); gsub(/^ +| +$/, "", subj)
+      gsub(/^ +| +$/, "", q);    gsub(/^ +| +$/, "", st)
+      if (subj == "") next
+      if (all == "" && st != "routed") next
+      printf "%s\t%s\t%s\t%s\n", subj, q, when, st
+    }
+  ' "$LEDGER"
+}
+
 main() {
   local cmd=${1:-}
   shift || true
@@ -191,6 +225,7 @@ main() {
     resolve) cmd_resolve "$@" ;;
     overturn) cmd_overturn "$@" ;;
     tally) cmd_tally "$@" ;;
+    list) cmd_list "$@" ;;
     path) printf '%s\n' "$LEDGER" ;;
     -h | --help | help | '') usage ;;
     *) echo "unknown command: $cmd" >&2; usage >&2; return 2 ;;

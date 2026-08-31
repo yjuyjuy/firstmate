@@ -142,6 +142,51 @@ test_pipe_field_refused() {
   pass "a pipe in a field is refused so the table stays parseable"
 }
 
+# list is the read path for consumers (the dashboard's decisions panel). It must
+# emit "subject<TAB>question<TAB>when<TAB>status" per request, default to pending
+# rows only, and print nothing when the ledger does not exist.
+test_list_default_pending_only() {
+  local data="$TMP_ROOT/i"
+  mkdir -p "$data"
+  run "$data" route pend-1 "pending question?"
+  run "$data" route ruled-1 "resolved question?"
+  run "$data" resolve ruled-1 ruled
+  local out
+  out=$(run "$data" list) || fail "list failed"
+  # Pending row present with its question; resolved row absent by default.
+  printf '%s\n' "$out" | grep -q $'^pend-1\tpending question?\t.*\trouted$' \
+    || fail "list default must emit the pending row as subject<TAB>question<TAB>when<TAB>status: $out"
+  printf '%s\n' "$out" | grep -q 'ruled-1' \
+    && fail "list default must exclude a resolved (non-routed) request"
+  [ "$(printf '%s\n' "$out" | grep -c .)" -eq 1 ] \
+    || fail "list default must emit exactly the one pending row"
+  pass "list defaults to pending requests as TSV subject/question/when/status"
+}
+
+test_list_all_includes_resolved() {
+  local data="$TMP_ROOT/j"
+  mkdir -p "$data"
+  run "$data" route a-1 "q a"
+  run "$data" route b-2 "q b"
+  run "$data" resolve b-2 ruled
+  local out
+  out=$(run "$data" list --all) || fail "list --all failed"
+  printf '%s\n' "$out" | grep -q $'^a-1\t' || fail "list --all must include the routed row"
+  printf '%s\n' "$out" | grep -q $'^b-2\tq b\t.*\truled$' \
+    || fail "list --all must include the resolved row with its status: $out"
+  pass "list --all lists every request including resolved ones"
+}
+
+test_list_absent_ledger_prints_nothing() {
+  local data="$TMP_ROOT/k"
+  mkdir -p "$data"
+  local out rc=0
+  out=$(run "$data" list) || rc=$?
+  [ "$rc" -eq 0 ] || fail "list on an absent ledger must exit 0, got $rc"
+  [ -z "$out" ] || fail "list on an absent ledger must print nothing, got: $out"
+  pass "list on an absent ledger prints nothing and succeeds"
+}
+
 test_route_appends_routed_row
 test_resolve_updates_status
 test_overturn_marks_yes
@@ -150,3 +195,6 @@ test_reused_subject_updates_latest
 test_resolve_missing_is_noop
 test_invalid_status_refused
 test_pipe_field_refused
+test_list_default_pending_only
+test_list_all_includes_resolved
+test_list_absent_ledger_prints_nothing

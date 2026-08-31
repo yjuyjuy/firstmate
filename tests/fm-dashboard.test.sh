@@ -318,6 +318,8 @@ test_help_and_unknown_arg() {
   out=$("$DASH" --help)
   assert_contains "$out" "the captain's dashboard TUI" "--help must print the header"
   assert_contains "$out" "single-parser rule" "--help must document the read discipline"
+  assert_contains "$out" "decisions" "--help must document the decisions panel"
+  assert_contains "$out" "ctrl-p" "--help must document the panel-cycle keybind"
   rc=0
   "$DASH" --bogus >/dev/null 2>&1 || rc=$?
   expect_code 2 "$rc" "an unknown argument must fail with exit 2"
@@ -343,6 +345,428 @@ test_interactive_exits_clean_without_fzf() {
   pass "interactive entry exits clean (rc 2, no leftover process) when fzf is absent"
 }
 
+# ============================================================================
+# Decisions panel (firstmate issue #199). The panel merges three sources, each
+# read ONLY through its owner: captain-kind holds via tasks-axi, decision-desk
+# requests via fm-decision-desk-ledger.sh, unanswered questions via the
+# transcript feed producer. These tests stub all three owners (mirroring how the
+# backlog tests stub tasks-axi) and drive the non-interactive subcommands.
+# ============================================================================
+
+# A stub tasks-axi for the decisions panel: it answers `list --state held` with
+# per-home captain-kind held tasks (schema id,state,kind,repo,priority,title,
+# hold_kind,hold_reason) and `show --full` with a recognizable body, ignoring the
+# poisoned on-disk backlog so a direct parse would be caught.
+make_stub_tasks_axi_decisions() {  # <fakebin-dir>
+  local fb=$1
+  cat > "$fb/tasks-axi" <<'SH'
+#!/usr/bin/env bash
+echo "tasks-axi $*" >> "$TA_LOG"
+verb=$1; shift
+file=""
+args=("$@")
+for ((i=0; i<${#args[@]}; i++)); do
+  case "${args[$i]}" in
+    --file) file="${args[$((i+1))]}" ;;
+    --file=*) file="${args[$i]#--file=}" ;;
+  esac
+done
+case "$verb" in
+  list)
+    # Held (captain-decision) rows per home. gamma-hold's reason carries a comma,
+    # quotes, and a backslash to prove the CSV dialect decodes.
+    case "$file" in
+      *primary*)
+        cat <<'OUT'
+count: 2
+tasks[2]{id,state,kind,repo,priority,title,hold_kind,hold_reason}:
+  p-hold,queued,captain,webapp,1,Auth model,captain,"OAuth or session, cookies?"
+  p-ops,queued,ops,"-","-",Not a captain hold,ops,routine ops hold
+help[1]:
+  - Run tasks-axi show <id>
+OUT
+        ;;
+      *emptysm*)
+        echo "count: 0"
+        echo "tasks: 0 tasks in this backlog"
+        ;;
+      *sm*)
+        cat <<'OUT'
+count: 1
+tasks[1]{id,state,kind,repo,priority,title,hold_kind,hold_reason}:
+  sm-hold,queued,captain,"-","-",Schema shape,captain,flat or nested?
+help[1]:
+  - Run tasks-axi show <id>
+OUT
+        ;;
+      *)
+        echo "count: 0"
+        echo "tasks: 0 tasks in this backlog"
+        ;;
+    esac
+    ;;
+  show)
+    id=$1
+    echo "task:"
+    echo "  id: $id"
+    echo "  hold_kind: captain"
+    echo "  body: FULL HOLD BODY for $id"
+    ;;
+  *)
+    echo "stub tasks-axi: unhandled verb $verb" >&2
+    exit 3
+    ;;
+esac
+SH
+  chmod +x "$fb/tasks-axi"
+}
+
+# A stub decision-desk ledger tool: emits pending desk requests as the owner's
+# TSV (subject<TAB>question<TAB>when<TAB>status) for the resolving home, keyed off
+# FM_DATA_OVERRIDE so per-home reads are distinguishable and recorded.
+make_stub_ledger() {  # <fakebin-dir>
+  local fb=$1
+  cat > "$fb/ledger" <<'SH'
+#!/usr/bin/env bash
+echo "ledger $* data=$FM_DATA_OVERRIDE" >> "$LEDGER_LOG"
+[ "$1" = list ] || exit 0
+case "$FM_DATA_OVERRIDE" in
+  *primary*)
+    printf 'p-migration\tdrop legacy table?\t2026-08-31T00:00:00Z\trouted\n'
+    ;;
+  *sm*)
+    printf 'sm-desk\tnew index?\t2026-08-30T00:00:00Z\trouted\n'
+    ;;
+esac
+SH
+  chmod +x "$fb/ledger"
+}
+
+# A stub transcript producer: emits the home's jsonl for `list`, keyed off the
+# FM_DESK_TRANSCRIPT feed path so per-home state reads are distinguishable. The
+# primary feed carries one unanswered question, one answered question, and a
+# later answer record for a previously-unanswered question (append-only "answer"
+# model), so the panel must collapse to the latest record per question.
+make_stub_transcript() {  # <fakebin-dir>
+  local fb=$1
+  cat > "$fb/transcript" <<'SH'
+#!/usr/bin/env bash
+echo "transcript $* feed=$FM_DESK_TRANSCRIPT" >> "$TR_LOG"
+[ "$1" = list ] || exit 0
+case "$FM_DESK_TRANSCRIPT" in
+  *primary*)
+    printf '%s\n' '{"ts":1,"kind":"question","q":"which region?","a":""}'
+    printf '%s\n' '{"ts":2,"kind":"turn","who":"captain","text":"hi","unread":false}'
+    printf '%s\n' '{"ts":3,"kind":"question","q":"already answered?","a":"yes"}'
+    printf '%s\n' '{"ts":4,"kind":"question","q":"pick a name?","a":""}'
+    printf '%s\n' '{"ts":5,"kind":"question","q":"pick a name?","a":"acme"}'
+    ;;
+  *sm*)
+    printf '%s\n' '{"ts":1,"kind":"question","q":"deploy where?","a":""}'
+    ;;
+esac
+SH
+  chmod +x "$fb/transcript"
+}
+
+# Build a fleet for the decisions panel: a primary home plus one populated and
+# (optionally) one empty secondmate, all with poisoned on-disk sources. Echoes
+# the primary home path.
+build_decisions_fleet() {  # <root> [empty-sm]
+  local base=$1 want_empty=${2:-no}
+  local primary="$base/primary" sm="$base/sm" esm="$base/emptysm"
+  mkdir -p "$primary/data" "$primary/state" "$sm/data" "$sm/state" "$esm/data" "$esm/state"
+  # Poison every owned source so a direct parse would corrupt/crash it.
+  printf 'GARBAGE BACKLOG\n' > "$primary/data/backlog.md"
+  printf 'GARBAGE BACKLOG\n' > "$sm/data/backlog.md"
+  printf 'GARBAGE BACKLOG\n' > "$esm/data/backlog.md"
+  printf 'GARBAGE LEDGER <<>>\n' > "$primary/data/decision-desk-ledger.md"
+  printf 'GARBAGE JSONL {not json\n' > "$primary/state/desk-transcript.jsonl"
+  printf 'GARBAGE JSONL {not json\n' > "$sm/state/desk-transcript.jsonl"
+  {
+    printf -- '- designer - design (home: %s; scope: design; projects: alpha; added 2026-08-31)\n' "$sm"
+    if [ "$want_empty" = yes ]; then
+      printf -- '- triage - triage (home: %s; scope: triage; projects: beta; added 2026-08-31)\n' "$esm"
+    fi
+  } > "$primary/data/secondmates.md"
+  printf '%s\n' "$primary"
+}
+
+# Run a dashboard subcommand with all three stub owners on the resolution seam.
+run_dash_decisions() {  # <primary> <statedir> <args...>
+  local primary=$1 statedir=$2; shift 2
+  FM_HOME="$primary" \
+  FM_DATA_OVERRIDE="$primary/data" \
+  FM_STATE_OVERRIDE="$primary/state" \
+  FM_DASHBOARD_TASKS_AXI="$FAKEBIN/tasks-axi" \
+  FM_DASHBOARD_LEDGER="$FAKEBIN/ledger" \
+  FM_DASHBOARD_TRANSCRIPT="$FAKEBIN/transcript" \
+  TA_LOG="$TA_LOG" LEDGER_LOG="$LEDGER_LOG" TR_LOG="$TR_LOG" \
+    "$DASH" "$@" "$statedir"
+}
+
+# --- three sources merge, each tagged home + source ------------------------
+test_decisions_merge_and_tag_sources() {
+  local base="$TMP_ROOT/dmerge" primary sd
+  primary=$(build_decisions_fleet "$base")
+  sd="$base/state"; mkdir -p "$sd"
+  export TA_LOG="$base/talog" LEDGER_LOG="$base/ledgerlog" TR_LOG="$base/trlog"
+  : > "$TA_LOG"; : > "$LEDGER_LOG"; : > "$TR_LOG"
+  run_dash_decisions "$primary" "$sd" --decisions-snapshot
+  local cache="$sd/dcache" out
+  out=$(cat "$cache")
+  # A hold, a desk request, and a question from the PRIMARY home, each tagged.
+  assert_contains "$out" $'primary\thold\t' "a primary captain hold must be tagged primary/hold"
+  assert_contains "$out" $'primary\tdesk\t' "a primary desk request must be tagged primary/desk"
+  assert_contains "$out" $'primary\tquestion\t' "a primary question must be tagged primary/question"
+  # And the secondmate's captain hold appears, tagged with its registry id.
+  assert_contains "$out" $'designer\thold\t' "a secondmate captain hold must appear, tagged designer/hold"
+  assert_contains "$out" $'designer\tdesk\t' "a secondmate desk request must appear, tagged designer/desk"
+  assert_contains "$out" $'designer\tquestion\t' "a secondmate question must appear, tagged designer/question"
+  pass "all three sources merge fleet-wide, each row tagged with home and source"
+}
+
+# --- single-parser rule: reads flow ONLY through the owners -----------------
+test_decisions_reads_flow_only_through_owners() {
+  local base="$TMP_ROOT/downer" primary sd
+  primary=$(build_decisions_fleet "$base")
+  sd="$base/state"; mkdir -p "$sd"
+  export TA_LOG="$base/talog" LEDGER_LOG="$base/ledgerlog" TR_LOG="$base/trlog"
+  : > "$TA_LOG"; : > "$LEDGER_LOG"; : > "$TR_LOG"
+  run_dash_decisions "$primary" "$sd" --decisions-snapshot
+  # Each source was read through its owner, per home.
+  assert_grep "list --all --state held" "$TA_LOG" "holds must be read via tasks-axi list --state held"
+  assert_grep "ledger list" "$LEDGER_LOG" "desk requests must be read via the ledger owner's list"
+  assert_grep "transcript list" "$TR_LOG" "questions must be read via the transcript owner's list"
+  # None of the poisoned bytes leaked into the cache: no direct parse happened.
+  assert_no_grep "GARBAGE" "$sd/dcache" "poisoned source bytes leaked: a direct parse happened"
+  pass "decisions reads flow only through the three owners, never a direct parse"
+}
+
+# --- non-captain holds are excluded ----------------------------------------
+test_decisions_only_captain_holds() {
+  local base="$TMP_ROOT/dcap" primary sd
+  primary=$(build_decisions_fleet "$base")
+  sd="$base/state"; mkdir -p "$sd"
+  export TA_LOG="$base/talog" LEDGER_LOG="$base/ledgerlog" TR_LOG="$base/trlog"
+  : > "$TA_LOG"; : > "$LEDGER_LOG"; : > "$TR_LOG"
+  run_dash_decisions "$primary" "$sd" --decisions-snapshot
+  assert_grep "p-hold" "$sd/dcache" "a captain-kind hold must appear"
+  assert_no_grep "p-ops" "$sd/dcache" "a non-captain (ops) hold must be excluded"
+  pass "only captain-kind holds count as captain decisions"
+}
+
+# --- answered question drops (append-only latest-record-per-question) -------
+test_decisions_answered_question_excluded() {
+  local base="$TMP_ROOT/dans" primary sd out
+  primary=$(build_decisions_fleet "$base")
+  sd="$base/state"; mkdir -p "$sd"
+  export TA_LOG="$base/talog" LEDGER_LOG="$base/ledgerlog" TR_LOG="$base/trlog"
+  : > "$TA_LOG"; : > "$LEDGER_LOG"; : > "$TR_LOG"
+  run_dash_decisions "$primary" "$sd" --decisions-snapshot
+  out=$(cat "$sd/dcache")
+  assert_contains "$out" "which region?" "an unanswered question must appear"
+  assert_not_contains "$out" "already answered?" "an answered question must be excluded"
+  # 'pick a name?' was unanswered then answered by a later record: the latest
+  # record wins, so it drops.
+  assert_not_contains "$out" "pick a name?" "a later answer record must drop the question"
+  pass "answered questions (incl. later answer records) are excluded"
+}
+
+# --- CSV dialect in a hold reason decodes -----------------------------------
+test_decisions_hold_reason_csv_decodes() {
+  local base="$TMP_ROOT/dcsv" primary sd line
+  primary=$(build_decisions_fleet "$base")
+  sd="$base/state"; mkdir -p "$sd"
+  export TA_LOG="$base/talog" LEDGER_LOG="$base/ledgerlog" TR_LOG="$base/trlog"
+  : > "$TA_LOG"; : > "$LEDGER_LOG"; : > "$TR_LOG"
+  run_dash_decisions "$primary" "$sd" --decisions-snapshot
+  line=$(grep p-hold "$sd/dcache")
+  [ "$(printf '%s\n' "$line" | wc -l)" -eq 1 ] || fail "p-hold decoded to more than one row"
+  assert_contains "$line" "OAuth or session, cookies?" "a hold reason with an embedded comma must decode intact"
+  pass "a captain hold reason in the tasks-axi CSV dialect decodes into one clean row"
+}
+
+# --- source filter cycles and filters --------------------------------------
+test_decisions_source_filter_cycles() {
+  local base="$TMP_ROOT/dfilt" primary sd rows
+  primary=$(build_decisions_fleet "$base")
+  sd="$base/state"; mkdir -p "$sd"
+  export TA_LOG="$base/talog" LEDGER_LOG="$base/ledgerlog" TR_LOG="$base/trlog"
+  : > "$TA_LOG"; : > "$LEDGER_LOG"; : > "$TR_LOG"
+  printf decisions > "$sd/panel"; printf all > "$sd/dfilter"
+  run_dash_decisions "$primary" "$sd" --decisions-snapshot
+  # all -> every source shows.
+  rows=$(run_dash_decisions "$primary" "$sd" --rows)
+  assert_contains "$rows" "hold" "filter=all must include holds"
+  assert_contains "$rows" "desk" "filter=all must include desk requests"
+  assert_contains "$rows" "question" "filter=all must include questions"
+  # cycle -> hold only.
+  run_dash_decisions "$primary" "$sd" --cycle-filter
+  [ "$(cat "$sd/dfilter")" = hold ] || fail "decisions filter did not cycle to hold"
+  rows=$(run_dash_decisions "$primary" "$sd" --rows)
+  assert_contains "$rows" "p-hold" "filter=hold must keep holds"
+  assert_not_contains "$rows" "p-migration" "filter=hold must drop desk requests"
+  assert_not_contains "$rows" "which region" "filter=hold must drop questions"
+  # cycle -> desk, -> question, -> back to all.
+  run_dash_decisions "$primary" "$sd" --cycle-filter
+  [ "$(cat "$sd/dfilter")" = desk ] || fail "decisions filter did not cycle to desk"
+  run_dash_decisions "$primary" "$sd" --cycle-filter
+  [ "$(cat "$sd/dfilter")" = question ] || fail "decisions filter did not cycle to question"
+  run_dash_decisions "$primary" "$sd" --cycle-filter
+  [ "$(cat "$sd/dfilter")" = all ] || fail "decisions filter did not cycle back to all"
+  pass "decisions source filter cycles all->hold->desk->question->all and filters"
+}
+
+# --- preview renders the full body per source type -------------------------
+test_decisions_preview_per_source() {
+  local base="$TMP_ROOT/dprev" primary sd rowid out
+  primary=$(build_decisions_fleet "$base")
+  sd="$base/state"; mkdir -p "$sd"
+  export TA_LOG="$base/talog" LEDGER_LOG="$base/ledgerlog" TR_LOG="$base/trlog"
+  : > "$TA_LOG"; : > "$LEDGER_LOG"; : > "$TR_LOG"
+  run_dash_decisions "$primary" "$sd" --decisions-snapshot
+  local cache="$sd/dcache"
+  # hold body.
+  rowid=$(awk -F'\t' '$1=="primary" && $2=="hold" {print $3; exit}' "$cache")
+  out=$("$DASH" --preview decision "$cache" "$rowid")
+  assert_contains "$out" "FULL HOLD BODY for p-hold" "a hold preview must render its tasks-axi show body"
+  # desk body.
+  rowid=$(awk -F'\t' '$1=="primary" && $2=="desk" {print $3; exit}' "$cache")
+  out=$("$DASH" --preview decision "$cache" "$rowid")
+  assert_contains "$out" "drop legacy table?" "a desk preview must render the request question"
+  # question body.
+  rowid=$(awk -F'\t' '$1=="primary" && $2=="question" {print $3; exit}' "$cache")
+  out=$("$DASH" --preview decision "$cache" "$rowid")
+  assert_contains "$out" "which region?" "a question preview must render the question text"
+  # An unknown rowid prints nothing and does not fail.
+  out=$("$DASH" --preview decision "$cache" "nope:x:9")
+  [ -z "$out" ] || fail "an unknown decision rowid must print nothing"
+  pass "decision preview renders the full body for each source type"
+}
+
+# --- released hold / resolved request / answered question drop on refresh ---
+test_decisions_refresh_drops_cleared_items() {
+  local base="$TMP_ROOT/drefresh" primary sd out
+  primary=$(build_decisions_fleet "$base")
+  sd="$base/state"; mkdir -p "$sd"
+  export TA_LOG="$base/talog" LEDGER_LOG="$base/ledgerlog" TR_LOG="$base/trlog"
+  : > "$TA_LOG"; : > "$LEDGER_LOG"; : > "$TR_LOG"
+  printf decisions > "$sd/panel"; printf all > "$sd/dfilter"
+  run_dash_decisions "$primary" "$sd" --decisions-snapshot
+  out=$(cat "$sd/dcache")
+  assert_contains "$out" "p-hold" "the hold must be present before it clears"
+  assert_contains "$out" "p-migration" "the desk request must be present before it clears"
+  # Swap the stub owners for ones that report EVERYTHING cleared, then refresh
+  # via the ctrl-r subcommand. The cleared items must vanish.
+  cat > "$FAKEBIN/tasks-axi" <<'SH'
+#!/usr/bin/env bash
+[ "$1" = list ] && { echo "count: 0"; echo "tasks: 0 tasks in this backlog"; }
+[ "$1" = show ] && echo "task:"
+exit 0
+SH
+  chmod +x "$FAKEBIN/tasks-axi"
+  cat > "$FAKEBIN/ledger" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+  chmod +x "$FAKEBIN/ledger"
+  cat > "$FAKEBIN/transcript" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+  chmod +x "$FAKEBIN/transcript"
+  run_dash_decisions "$primary" "$sd" --snapshot-reload >/dev/null
+  out=$(cat "$sd/dcache")
+  assert_not_contains "$out" "p-hold" "a released hold must drop after refresh"
+  assert_not_contains "$out" "p-migration" "a resolved request must drop after refresh"
+  assert_not_contains "$out" "which region" "an answered question must drop after refresh"
+  [ "$(printf '%s' "$out" | grep -c . || true)" -eq 0 ] || fail "cleared fleet must leave no decision rows"
+  # Restore the panel stubs for any later test in the run.
+  make_stub_tasks_axi_decisions "$FAKEBIN"
+  make_stub_ledger "$FAKEBIN"
+  make_stub_transcript "$FAKEBIN"
+  pass "a released hold, resolved request, and answered question all drop after refresh"
+}
+
+# --- panel cycle preserves the session and flips rows + header --------------
+test_panel_cycle_flips_rows_and_header() {
+  local base="$TMP_ROOT/dpanel" primary sd hdr rows
+  primary=$(build_decisions_fleet "$base")
+  sd="$base/state"; mkdir -p "$sd"
+  export TA_LOG="$base/talog" LEDGER_LOG="$base/ledgerlog" TR_LOG="$base/trlog"
+  : > "$TA_LOG"; : > "$LEDGER_LOG"; : > "$TR_LOG"
+  printf backlog > "$sd/panel"
+  printf priority > "$sd/sort"; printf all > "$sd/filter"; printf all > "$sd/dfilter"
+  run_dash_decisions "$primary" "$sd" --snapshot
+  # Backlog panel: header names sort, rows are backlog rows (the held p-hold task
+  # is queued so it appears in the backlog list too).
+  hdr=$(run_dash_decisions "$primary" "$sd" --header)
+  assert_contains "$hdr" "Fleet backlog" "the backlog header must name the backlog panel"
+  assert_contains "$hdr" "ctrl-s sort" "the backlog header must name the sort keybind"
+  # Cycle to decisions: state flips, and the decisions cache is built lazily.
+  run_dash_decisions "$primary" "$sd" --cycle-panel
+  [ "$(cat "$sd/panel")" = decisions ] || fail "ctrl-p did not flip the panel to decisions"
+  [ -f "$sd/dcache" ] || fail "cycling to decisions must build its cache lazily"
+  hdr=$(run_dash_decisions "$primary" "$sd" --header)
+  assert_contains "$hdr" "Captain decisions" "the decisions header must name the decisions panel"
+  assert_contains "$hdr" "ctrl-t source" "the decisions header must name the source keybind"
+  rows=$(run_dash_decisions "$primary" "$sd" --rows)
+  assert_contains "$rows" "decision" "the decisions rows must carry the decision marker column"
+  assert_contains "$rows" "which region" "the decisions rows must show a question decision"
+  # Cycle back to backlog: rows return to backlog form; the shared state (the
+  # separate caches) is intact, proving the session is not lost/rebuilt.
+  run_dash_decisions "$primary" "$sd" --cycle-panel
+  [ "$(cat "$sd/panel")" = backlog ] || fail "ctrl-p did not flip back to backlog"
+  rows=$(run_dash_decisions "$primary" "$sd" --rows)
+  assert_contains "$rows" "p-hold" "returning to backlog must show backlog rows again"
+  pass "panel cycle flips rows and header without losing the session state"
+}
+
+# --- empty sources render cleanly ------------------------------------------
+test_decisions_empty_sources_are_graceful() {
+  local base="$TMP_ROOT/dempty" primary sd rows rc
+  # A fleet whose only registered secondmate is the empty one, and whose owners
+  # all report nothing for it.
+  primary="$base/primary"
+  mkdir -p "$primary/data" "$primary/state"
+  printf 'GARBAGE\n' > "$primary/data/backlog.md"
+  : > "$primary/data/secondmates.md"
+  export TA_LOG="$base/talog" LEDGER_LOG="$base/ledgerlog" TR_LOG="$base/trlog"
+  : > "$TA_LOG"; : > "$LEDGER_LOG"; : > "$TR_LOG"
+  # Owners that report nothing at all.
+  cat > "$FAKEBIN/tasks-axi" <<'SH'
+#!/usr/bin/env bash
+echo "tasks-axi $*" >> "$TA_LOG"
+[ "$1" = list ] && { echo "count: 0"; echo "tasks: 0 tasks in this backlog"; }
+exit 0
+SH
+  chmod +x "$FAKEBIN/tasks-axi"
+  cat > "$FAKEBIN/ledger" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+  chmod +x "$FAKEBIN/ledger"
+  cat > "$FAKEBIN/transcript" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+  chmod +x "$FAKEBIN/transcript"
+  sd="$base/state"; mkdir -p "$sd"
+  printf decisions > "$sd/panel"; printf all > "$sd/dfilter"
+  rc=0
+  run_dash_decisions "$primary" "$sd" --decisions-snapshot || rc=$?
+  [ "$rc" -eq 0 ] || fail "an empty decisions snapshot must not fail, got rc $rc"
+  [ "$(wc -l < "$sd/dcache")" -eq 0 ] || fail "an empty fleet must produce zero decision rows"
+  rows=$(run_dash_decisions "$primary" "$sd" --rows)
+  [ -z "$rows" ] || fail "an empty decisions panel must render no rows, got: $rows"
+  # Restore the panel stubs for any later test in the run.
+  make_stub_tasks_axi_decisions "$FAKEBIN"
+  make_stub_ledger "$FAKEBIN"
+  make_stub_transcript "$FAKEBIN"
+  pass "empty decision sources render cleanly with no rows and no failure"
+}
+
 test_snapshot_merges_and_tags_homes
 test_reads_flow_only_through_tasks_axi
 test_empty_secondmate_queue_is_graceful
@@ -353,3 +777,18 @@ test_sort_cycles_and_orders
 test_preview_reads_selected_row_full_body
 test_help_and_unknown_arg
 test_interactive_exits_clean_without_fzf
+
+# Decisions panel (#199): install its three stub owners, then run its suite.
+make_stub_ledger "$FAKEBIN"
+make_stub_transcript "$FAKEBIN"
+make_stub_tasks_axi_decisions "$FAKEBIN"
+test_decisions_merge_and_tag_sources
+test_decisions_reads_flow_only_through_owners
+test_decisions_only_captain_holds
+test_decisions_answered_question_excluded
+test_decisions_hold_reason_csv_decodes
+test_decisions_source_filter_cycles
+test_decisions_preview_per_source
+test_decisions_refresh_drops_cleared_items
+test_panel_cycle_flips_rows_and_header
+test_decisions_empty_sources_are_graceful
