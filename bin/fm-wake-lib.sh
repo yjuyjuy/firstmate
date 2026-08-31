@@ -74,6 +74,22 @@ fm_wake_append() {
   return "$status"
 }
 
+# Read the durable wake-queue high-water sequence. state/.wake-queue.seq is a
+# strictly-monotonic counter fm_wake_append bumps under the queue lock on every
+# enqueue; fm-wake-drain.sh truncates the QUEUE file but NEVER resets this seq.
+# So a caller that snapshots this value and later sees a higher one knows a NEW
+# durable wake was enqueued in between, even across an intervening drain. Read
+# with no lock: the value is monotonic, so a stale-low read only ever costs one
+# extra poll iteration, never a missed wake. An absent or malformed seq reads 0.
+fm_wake_queue_seq() {
+  local seq
+  seq=$(cat "$STATE/.wake-queue.seq" 2>/dev/null || echo 0)
+  case "$seq" in
+    ''|*[!0-9]*) seq=0 ;;
+  esac
+  printf '%s\n' "$seq"
+}
+
 fm_wake_restore_queue() {
   local drained=$1 restore
   restore="$STATE/.wake-queue.restore.$(fm_current_pid)"

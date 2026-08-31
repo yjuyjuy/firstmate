@@ -26,6 +26,11 @@
 #   watcher: started pid=<N> (beacon fresh)              - it launched one and confirmed it
 #   watcher: attached pid=<N> (beacon <age>s)            - a live+fresh successor holds the lock;
 #                                                          this arm attaches and follows it
+#   watcher: attached wake surfaced (queue seq A -> B)   - the followed watcher enqueued a new
+#                                                          durable wake; this arm completes
+#                                                          (exit 0, wake-shaped) so the harness
+#                                                          re-drives the idle model, exactly like
+#                                                          the started path's actionable exit
 #   watcher: FAILED - no live watcher with a fresh beacon  - could not confirm one
 #   watcher: FAILED - cycle ended without an actionable reason
 #                                                        - a clean cycle ended with no wake and no
@@ -60,6 +65,18 @@
 # bin/fm-watch.sh`: that pattern matches every firstmate home's watcher
 # (secondmate homes run the same script) and would kill siblings.
 #
+# --converge: collapse a MULTI-watcher tangle for THIS home and leave exactly one
+# owner. --restart can only stop the single pid recorded in the lock, so an
+# orphan immediately re-grabs the lock and a single-pid restart can never
+# converge a 4-watcher tangle. --converge enumerates every watcher AND every
+# stale arm-loop for this home by ABSOLUTE-PATH cmdline match (bin/fm-watch-scope-lib.sh),
+# kills the arm-loops FIRST (they are the re-attach engines that would restart a
+# killed watcher and re-tangle), then the surplus watchers, keeping one genuinely
+# healthy survivor when one exists, then falls through to arm exactly one owner.
+# It mirrors --restart's TERM->grace->KILL escalation and, like --restart, only
+# ever signals absolute-path-matched this-home pids, never a cross-home
+# `pkill -f`. It is a manual/agent-invoked repair, wired into no automatic path.
+#
 # --drain: fold the mandatory pre-arm wake drain (bin/fm-wake-drain.sh) into this
 # one invocation so one logical supervision step is a single call rather than a
 # drain, an arm, and a forced re-arm each time a wake lands inside the arm's
@@ -73,6 +90,8 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
+# shellcheck source=bin/fm-watch-scope-lib.sh
+. "$SCRIPT_DIR/fm-watch-scope-lib.sh"
 
 WATCH="$SCRIPT_DIR/fm-watch.sh"
 WATCH_LOCK="$STATE/.watch.lock"
@@ -267,12 +286,36 @@ fail_unexplained_cycle() {
   return 1
 }
 
-# Stay alive across identity-matched healthy holders. If one cycle ends, attach
-# to a verified successor. With no successor, fail loudly instead of returning a
-# clean empty completion that an adapter could mistake for a no-op.
+# Stay alive across identity-matched healthy holders, but COMPLETE (exit 0,
+# wake-shaped) the instant the followed watcher enqueues a new durable wake. On a
+# completion-wake harness (jcode/claude/grok) the background task's COMPLETION is
+# what re-drives the idle model, so an attach path that only ever looped and
+# exited on FAILURE left supervision healthy-looking but deaf: the followed
+# watcher cycled and enqueued wakes, yet nothing re-drove the session. The fix
+# mirrors the `started` exit by watching the monotonic wake-queue seq snapshotted
+# at attach entry: the first new wake completes this arm, its caller drains the
+# queue (which now holds the record) and re-arms, identical downstream handling to
+# the started path's actionable-* exit.
+#
+# The seq (not the queue CONTENT) is the signal on purpose: reading queue content
+# races the drain (a wake enqueued and drained between two polls would be missed
+# and the arm would hang again), while the seq is drain-immune because
+# fm-wake-drain.sh truncates the queue but never resets the seq. Worst case is one
+# redundant wake-drive, never a missed one - the correct never-blind bias.
+#
+# If one cycle ends without a wake, attach to a verified successor. With no
+# successor, fail loudly instead of returning a clean empty completion that an
+# adapter could mistake for a no-op.
 attach_and_wait() {
-  local attached_pid=$1
+  local attached_pid=$1 attach_seq_baseline current_seq
+  attach_seq_baseline=$(fm_wake_queue_seq)
   while :; do
+    current_seq=$(fm_wake_queue_seq)
+    if [ "$current_seq" -gt "$attach_seq_baseline" ]; then
+      cycle_log_append 0 none attached-wake-surfaced "attached:$attached_pid"
+      echo "watcher: attached wake surfaced (queue seq $attach_seq_baseline -> $current_seq)"
+      exit 0
+    fi
     if healthy_watcher; then
       if [ "$HEALTHY_PID" != "$attached_pid" ]; then
         cycle_log_append unknown unknown lock-replaced "attached:$HEALTHY_PID"
@@ -348,10 +391,79 @@ for arg in "$@"; do
   case "$arg" in
     ''|arm|--arm) mode=arm ;;
     --restart) mode=restart ;;
+    --converge) mode=converge ;;
     --drain) drain_first=1 ;;
-    *) echo "usage: $(basename "$0") [--drain] [--restart]" >&2; exit 2 ;;
+    *) echo "usage: $(basename "$0") [--drain] [--restart|--converge]" >&2; exit 2 ;;
   esac
 done
+
+# Signal one this-home pid down with the same TERM->grace->KILL escalation
+# --restart uses, so a wedged watcher/arm that ignores TERM is still collapsed.
+# Every pid passed here is already absolute-path scoped to this home by the
+# caller (fm_home_watcher_pids / fm_home_arm_pids), so this never reaches a
+# sibling home. Best-effort: a pid that dies on its own between enumeration and
+# here is a success, not an error.
+converge_signal_down() {
+  local pid=$1 i
+  fm_pid_alive "$pid" || return 0
+  kill -TERM "$pid" 2>/dev/null || true
+  i=0
+  while [ "$i" -lt 50 ] && fm_pid_alive "$pid"; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  if fm_pid_alive "$pid"; then
+    kill -KILL "$pid" 2>/dev/null || true
+    i=0
+    while [ "$i" -lt 50 ] && fm_pid_alive "$pid"; do
+      sleep 0.1
+      i=$((i + 1))
+    done
+  fi
+}
+
+# Collapse a multi-watcher tangle for THIS home, then fall through to the normal
+# arm logic (which arms exactly one owner). Enumeration is absolute-path scoped,
+# so a sibling home or secondmate is never touched.
+#
+# Kill ORDERING is the safety-critical subtlety: arm-loops must die FIRST. An arm
+# loop whose followed watcher you kill immediately starts a replacement (the
+# started path) and re-tangles, so leaving even one arm-loop alive while killing
+# watchers defeats the convergence. So: kill every this-home arm-loop (excluding
+# self), then every surplus watcher, keeping one genuinely healthy survivor when
+# one exists so an in-flight cycle is not needlessly torn down.
+converge_tangle() {
+  local survivor='' pid armpid watcher_pids arm_pids
+  # Pick the healthy survivor BEFORE any kill so a genuinely healthy watcher keeps
+  # its cycle. healthy_watcher sets HEALTHY_PID via the shared honesty gate.
+  if healthy_watcher; then
+    survivor=$HEALTHY_PID
+  fi
+
+  # 1. Kill every this-home arm-loop except this converging process itself. They
+  #    are the re-attach engines; all must die or the tangle rebuilds.
+  arm_pids=$(fm_home_arm_pids "$SCRIPT_DIR" "$ARM_PID")
+  for armpid in $arm_pids; do
+    [ "$armpid" = "$ARM_PID" ] && continue
+    converge_signal_down "$armpid"
+  done
+
+  # 2. Kill every this-home watcher except the chosen survivor.
+  watcher_pids=$(fm_home_watcher_pids "$SCRIPT_DIR")
+  for pid in $watcher_pids; do
+    [ -n "$survivor" ] && [ "$pid" = "$survivor" ] && continue
+    converge_signal_down "$pid"
+  done
+
+  # 3. If no healthy survivor remains, clear a dangling this-home lock so the arm
+  #    below starts a fresh watcher instead of seeing a dead-pid holder.
+  if [ -z "$survivor" ] || ! fm_pid_alive "$survivor"; then
+    clear_stale_recorded_watcher_lock
+  fi
+
+  echo "watcher: converge collapsed tangle for this home; arming one owner"
+}
+
 
 # --drain folds the mandatory pre-arm wake drain into this one invocation, so a
 # single logical supervision step is one call instead of a drain, an arm, and a
@@ -411,6 +523,15 @@ if [ "$mode" = restart ]; then
       clear_stale_recorded_watcher_lock
     fi
   fi
+fi
+
+if [ "$mode" = converge ]; then
+  # Collapse this home's watcher/arm-loop tangle, then behave exactly like a
+  # normal arm: attach to the healthy survivor if one remains, else start one
+  # fresh watcher. Leaving mode=converge would skip the attach branch below and
+  # start a second watcher behind a healthy survivor, so switch to arm here.
+  converge_tangle
+  mode=arm
 fi
 
 # If a genuinely live+fresh watcher already holds the lock, do not start a second

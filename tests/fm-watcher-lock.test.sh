@@ -706,6 +706,144 @@ test_attached_arm_signal_is_recorded_in_cycle_ledger() {
   pass "attached arm signals record a classified lifecycle entry"
 }
 
+# THE regression the incident's missing test would have caught: an origin=attached
+# arm that never completes on a wake is exactly the wake-blind state that took
+# supervision down for ~1 hour. When the followed watcher enqueues a new durable
+# wake, the attached arm must COMPLETE (exit 0, wake-shaped) so the harness
+# re-drives the idle model, mirroring the started path's actionable exit.
+test_attached_arm_completes_on_wake() {
+  local dir state fakebin out armout i wpid armpid status
+  dir=$(make_case attached-arm-completes-on-wake)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/watch.out"
+  armout="$dir/arm.out"
+  # A genuinely live watcher with a fresh beacon already holds the singleton, with
+  # long intervals so it never enqueues a wake of its own during the test.
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  wpid=$!
+  i=0
+  while [ "$i" -lt 60 ]; do
+    [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" = "$wpid" ] && [ -e "$state/.last-watcher-beat" ] && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" = "$wpid" ] || fail "seed watcher did not take the lock"
+  # The arm attaches to the live watcher and stays resident.
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_ARM_ATTACH_POLL=0.1 FM_ARM_CONFIRM_TIMEOUT=1 "$WATCH_ARM" > "$armout" &
+  armpid=$!
+  i=0
+  while [ "$i" -lt 80 ]; do
+    grep -qF "watcher: attached pid=$wpid" "$armout" 2>/dev/null && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  grep -qF "watcher: attached pid=$wpid" "$armout" || fail "arm did not report attach before the wake"
+  is_live_non_zombie "$armpid" || fail "arm exited before any wake was enqueued"
+  # Enqueue a NEW durable wake (bumps the monotonic queue seq). The attached arm
+  # must now COMPLETE (exit 0) with the wake-shaped surfaced line - the exact
+  # completion that re-drives an idle jcode/claude/grok session.
+  append_wake "$state" check testkey "check: synthetic" || fail "could not enqueue the wake"
+  wait_for_exit "$armpid" 80
+  status=$?
+  [ "$status" -eq 0 ] || fail "attached arm did not complete cleanly on a new wake (status $status): $(cat "$armout")"
+  grep -qF 'watcher: attached wake surfaced' "$armout" || fail "attached arm did not emit the wake-surfaced completion line: $(cat "$armout")"
+  ! grep -qF 'watcher: FAILED' "$armout" || fail "attached arm reported FAILED for a real wake"
+  grep -q "arm_pid=$armpid.*origin=attached.*reason=attached-wake-surfaced" "$state/.watch-cycle-exits.log" \
+    || fail "attached-wake-surfaced row was not recorded in the lifecycle ledger"
+  is_live_non_zombie "$wpid" || fail "completing the attached arm terminated the peer watcher"
+  kill "$wpid" 2>/dev/null || true
+  wait "$wpid" 2>/dev/null || true
+  pass "attached arm completes (exit 0, wake-shaped) the instant the followed watcher enqueues a wake"
+}
+
+# Drain-immunity: after the arm attaches, a wake enqueued and then IMMEDIATELY
+# drained (queue truncated) before the arm's next poll still completes it, because
+# the monotonic seq stays bumped even though the queue record is gone. This proves
+# the fix reads the seq, not the queue content a drain races away - the exact race
+# that would let a wake slip past a content-reading arm and hang it again.
+test_attached_arm_survives_drain_race() {
+  local dir state fakebin out armout i wpid armpid status
+  dir=$(make_case attached-arm-drain-race)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/watch.out"
+  armout="$dir/arm.out"
+  mark_pr_check_migration_complete "$state"
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  wpid=$!
+  i=0
+  while [ "$i" -lt 60 ]; do
+    [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" = "$wpid" ] && [ -e "$state/.last-watcher-beat" ] && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" = "$wpid" ] || fail "seed watcher did not take the lock"
+  # Attach first (the arm snapshots its baseline seq at entry), with a slow attach
+  # poll so the enqueue+drain below both land before the arm's next iteration.
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_ARM_ATTACH_POLL=2 FM_ARM_CONFIRM_TIMEOUT=1 "$WATCH_ARM" > "$armout" &
+  armpid=$!
+  i=0
+  while [ "$i" -lt 80 ]; do
+    grep -qF "watcher: attached pid=$wpid" "$armout" 2>/dev/null && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  grep -qF "watcher: attached pid=$wpid" "$armout" || fail "arm did not report attach before the drain race"
+  # Enqueue a wake (bumps seq past the arm's baseline) and drain it right away:
+  # the queue file is truncated but the seq stays bumped. The arm must still
+  # complete on its next poll purely from the seq.
+  append_wake "$state" check testkey "check: raced" || fail "could not enqueue the raced wake"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" >/dev/null 2>&1 || fail "drain of the raced wake failed"
+  [ ! -s "$state/.wake-queue" ] || fail "drain did not truncate the queue"
+  wait_for_exit "$armpid" 80
+  status=$?
+  [ "$status" -eq 0 ] || fail "arm did not complete on a wake after a drain race (status $status): $(cat "$armout")"
+  grep -qF 'watcher: attached wake surfaced' "$armout" || fail "arm did not surface the raced-and-drained wake: $(cat "$armout")"
+  kill "$wpid" 2>/dev/null || true
+  wait "$wpid" 2>/dev/null || true
+  pass "attached arm completes on a wake whose queue record was already drained (seq is drain-immune)"
+}
+
+# Negative: with NO new wake after attach, the arm must NOT busy-complete; it
+# stays resident, following the healthy watcher, until a real wake or failure.
+test_attached_arm_waits_when_no_wake() {
+  local dir state fakebin out armout i wpid armpid
+  dir=$(make_case attached-arm-waits-no-wake)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/watch.out"
+  armout="$dir/arm.out"
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  wpid=$!
+  i=0
+  while [ "$i" -lt 60 ]; do
+    [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" = "$wpid" ] && [ -e "$state/.last-watcher-beat" ] && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" = "$wpid" ] || fail "seed watcher did not take the lock"
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_ARM_ATTACH_POLL=0.1 FM_ARM_CONFIRM_TIMEOUT=1 "$WATCH_ARM" > "$armout" &
+  armpid=$!
+  i=0
+  while [ "$i" -lt 80 ]; do
+    grep -qF "watcher: attached pid=$wpid" "$armout" 2>/dev/null && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  grep -qF "watcher: attached pid=$wpid" "$armout" || fail "arm did not report attach"
+  # Give it a bounded interval with no new wake: it must remain live and never
+  # emit a wake-surfaced completion.
+  sleep 1
+  is_live_non_zombie "$armpid" || fail "attached arm spuriously completed with no new wake: $(cat "$armout")"
+  ! grep -qF 'watcher: attached wake surfaced' "$armout" || fail "attached arm surfaced a wake that never happened"
+  kill "$armpid" 2>/dev/null || true
+  wait "$armpid" 2>/dev/null || true
+  kill "$wpid" 2>/dev/null || true
+  wait "$wpid" 2>/dev/null || true
+  pass "attached arm stays resident when no new wake is enqueued (no busy-complete)"
+}
+
 test_arm_starts_and_self_heals() {
   # Arming with no confirmable watcher must FORK one and confirm it live + fresh
   # before reporting 'started' - whether the lock is empty (clean start) or held
@@ -936,6 +1074,96 @@ test_drain_and_arm_satisfies_turnend_guard_without_weakening_it() {
   kill "$armpid" "$lock_pid" 2>/dev/null || true
   wait "$armpid" 2>/dev/null || true
   pass "batched drain-and-arm satisfies the turn-end guard without weakening it"
+}
+
+# --- converge: multi-watcher tangle collapse (fm-watch-arm.sh --converge) -----
+# --restart can only stop the single pid recorded in the lock; --converge must
+# collapse ALL of THIS home's watchers and stale arm-loops, home-scoped by
+# absolute path, and leave exactly one owner. The cross-home-safety regression:
+# a decoy watcher launched from a DIFFERENT absolute path (a sibling home) must
+# stay ALIVE.
+
+home_watcher_pids() {  # <bin-dir>
+  bash -c '. "$1"; fm_home_watcher_pids "$2"' _ "$ROOT/bin/fm-watch-scope-lib.sh" "$1"
+}
+
+test_converge_home_scoped() {
+  local dir state fakebin decoy_home armout i decoy_pid seed_pid armpid pid
+  dir=$(make_case converge-home-scoped)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  armout="$dir/arm.out"
+  # A decoy watcher for a DIFFERENT home: same script NAME, different absolute
+  # path. --converge must never touch it. A stable sleep stand-in isolates the
+  # cross-home-safety property from the real watcher's own exit lifecycle.
+  decoy_home="$dir/decoy"
+  mkdir -p "$decoy_home/bin"
+  cat > "$decoy_home/bin/fm-watch.sh" <<'SH'
+#!/usr/bin/env bash
+sleep 120
+SH
+  chmod +x "$decoy_home/bin/fm-watch.sh"
+  bash "$decoy_home/bin/fm-watch.sh" </dev/null >/dev/null 2>&1 &
+  decoy_pid=$!
+  disown "$decoy_pid" 2>/dev/null || true
+  i=0
+  while [ "$i" -lt 50 ] && ! kill -0 "$decoy_pid" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+  is_live_non_zombie "$decoy_pid" || fail "decoy sibling-home watcher did not start"
+  # Seed a genuine multi-watcher tangle for THIS home (real fm-watch.sh from
+  # $ROOT/bin) plus a stale arm-loop, so converge has something to collapse.
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" </dev/null >/dev/null 2>&1 &
+  seed_pid=$!
+  disown "$seed_pid" 2>/dev/null || true
+  i=0
+  while [ "$i" -lt 60 ]; do
+    [ -e "$state/.watch.lock/pid" ] && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  # Now collapse THIS home's tangle and arm one owner. The arm resolves its own
+  # SCRIPT_DIR = $ROOT/bin, so its watchers run from $ROOT/bin/fm-watch.sh.
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" --converge > "$armout" 2>/dev/null &
+  armpid=$!
+  i=0
+  while [ "$i" -lt 80 ]; do
+    grep -qE 'watcher: (started|attached) pid=' "$armout" 2>/dev/null && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  grep -qF 'converge collapsed tangle' "$armout" || fail "converge did not report collapsing the tangle: $(cat "$armout")"
+  grep -qE 'watcher: (started|attached) pid=' "$armout" || fail "converge did not arm one owner: $(cat "$armout")"
+  # The decoy from another absolute path MUST still be alive.
+  is_live_non_zombie "$decoy_pid" || fail "converge WRONGLY killed a decoy sibling-home watcher (cross-home kill)"
+  kill "$decoy_pid" "$seed_pid" "$armpid" 2>/dev/null || true
+  wait "$armpid" 2>/dev/null || true
+  for pid in $(home_watcher_pids "$ROOT/bin"); do
+    kill "$pid" 2>/dev/null || true
+  done
+  pass "converge collapses this home's tangle by absolute path and never touches a decoy sibling-home watcher"
+}
+
+test_converge_arms_from_empty() {
+  local dir state fakebin armout i armpid lock_pid
+  dir=$(make_case converge-from-empty)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  armout="$dir/arm.out"
+  # No watcher running at all: --converge must simply start exactly one.
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_STATE_OVERRIDE="$state" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" --converge > "$armout" 2>/dev/null &
+  armpid=$!
+  i=0
+  while [ "$i" -lt 80 ]; do
+    grep -qF 'watcher: started pid=' "$armout" 2>/dev/null && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  grep -qF 'converge collapsed tangle' "$armout" || fail "converge-from-empty did not report the converge step: $(cat "$armout")"
+  grep -qF 'watcher: started pid=' "$armout" || fail "converge-from-empty did not start a watcher: $(cat "$armout")"
+  lock_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
+  kill -0 "$lock_pid" 2>/dev/null || fail "converge-from-empty armed watcher is not alive"
+  kill "$armpid" "$lock_pid" 2>/dev/null || true
+  wait "$armpid" 2>/dev/null || true
+  pass "converge starts exactly one watcher when none is running"
 }
 
 test_arm_waits_for_peer_beacon_after_child_stands_down() {
@@ -1290,12 +1518,17 @@ test_arm_self_eviction_is_loud_without_successor
 test_arm_classifies_tick_close_as_benign_completion
 test_arm_attaches_and_waits_for_live_fresh_watcher
 test_attached_arm_signal_is_recorded_in_cycle_ledger
+test_attached_arm_completes_on_wake
+test_attached_arm_survives_drain_race
+test_attached_arm_waits_when_no_wake
 test_arm_starts_and_self_heals
 test_arm_hup_cleans_child_and_temp_output
 test_arm_propagates_immediate_wake_before_confirmation
 test_drain_and_arm_empties_queue_and_leaves_one_watcher
 test_drain_and_arm_does_not_double_arm_behind_healthy_watcher
 test_drain_and_arm_satisfies_turnend_guard_without_weakening_it
+test_converge_home_scoped
+test_converge_arms_from_empty
 test_arm_waits_for_peer_beacon_after_child_stands_down
 test_arm_fails_loud_when_no_fresh_watcher_confirmable
 test_cycle_exit_ledger_links_successor_and_stays_bounded
