@@ -228,6 +228,43 @@ ordinary_wake_line() {
   esac
 }
 
+# The first-cycle directive is the sibling of ordinary_wake_line for the very
+# first supervision cycle of a turn. When a live present-mode daemon owns the
+# watcher, arming a second cycle would break single-owner, so the directive tells
+# the model NOT to self-arm and to rely on the daemon's pane-wake. Otherwise it
+# emits the harness-specific launch instruction, and the harness protocol below
+# is that directive's full expansion. Kept here so the first-cycle instruction
+# has a single source of truth rather than being restated in each snippet file.
+first_cycle_line() {
+  if [ "$PRESENT_DAEMON" -eq 1 ]; then
+    printf '%s\n' '- First cycle: the present-mode supervision daemon owns the watcher; do NOT launch bin/fm-watch-arm.sh. Drain the wake queue, then end the turn and rely on the daemon pane-wake.'
+    return 0
+  fi
+  case "$HARNESS" in
+    claude)
+      printf '%s\n' '- First cycle: launch exactly one bin/fm-watch-arm.sh Claude Code background task as directed below, never shell &.'
+      ;;
+    codex)
+      printf '%s\n' '- First cycle: take one foreground bin/fm-watch-checkpoint.sh checkpoint as directed below.'
+      ;;
+    jcode)
+      printf '%s\n' '- First cycle: two paired actions as directed below - launch bin/fm-watch-arm.sh as a Bash run_in_background task, then immediately set wake:true on that task id with the bg tool. Never leave the task at the default wake:false.'
+      ;;
+    pi)
+      printf '%s\n' '- First cycle: the Pi extension arms the watcher; follow the protocol below and do not arm manually.'
+      ;;
+    opencode)
+      printf '%s\n' '- First cycle: the OpenCode TUI plugin arms after idle; follow the protocol below and do not arm manually.'
+      ;;
+    grok)
+      printf '%s\n' '- First cycle: launch exactly one bin/fm-watch-arm.sh Grok tracked background task as directed below, never shell &.'
+      ;;
+    *)
+      printf '%s\n' '- First cycle: follow the first-cycle step in the harness protocol below; do not use shell &.'
+      ;;
+  esac
+}
+
 if [ "$REPAIR_LINE" -eq 1 ]; then
   repair_line
   exit 0
@@ -259,6 +296,7 @@ if [ "$X_MODE" -eq 1 ]; then
 else
   printf '%s\n' '- X mode: inactive; use the default watcher cadence.'
 fi
+first_cycle_line
 ordinary_wake_line
 printf '\n'
 render_snippet

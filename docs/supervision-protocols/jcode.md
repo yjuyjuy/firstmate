@@ -8,9 +8,10 @@ When this session owns supervision and away mode is not active:
 1. Drain first with `bin/fm-wake-drain.sh`, or with `bin/fm-wake-brief.sh` to get that same drain plus each woken task's status tail, current state, metadata, one host reading, and an endpoint sweep in one call.
    To fold that drain into the arm itself as one call, launch `bin/fm-watch-arm.sh --drain` as the background task in step 3a: it drains first, then arms exactly one watcher, so a wake landing inside the arm window does not become a drain/arm/retry loop.
 2. Source `__FM_X_MODE_ENV__` first when X mode is active.
-3. First cycle, as two paired actions:
+3. First cycle: follow the emitted First-cycle directive above, which accounts for a live present-mode daemon. When no daemon owns the watcher, that directive expands to the two paired actions:
    a. Launch `bin/fm-watch-arm.sh` as its own jcode `Bash` task with `run_in_background: true`, never bundled with another command and never with a shell `&`.
    b. Immediately call the `bg` tool with `action="subscribe"`, that task id, and `wake: true`, so the task's completion will re-drive this session.
+   When a live present-mode daemon owns the watcher, the directive instead says NOT to launch `bin/fm-watch-arm.sh`: drain the wake queue, end the turn, and rely on the daemon's pane-wake.
 4. Trust only the arm's one-line status: `watcher: started ...` or `watcher: attached ...` means one live cycle exists; on attach the background task follows verified identity-matched successors instead of exiting when the first cycle ends.
 5. After a successful start or attach status with `wake: true` set, end the turn. The armed background task is the live wait until it completes with an actionable wake or failure.
 6. Ordinary wake: when the `wake: true` background task completes with `signal:`, `stale:`, `check:`, or `heartbeat`, drain queued wakes, then start exactly one fresh armed cycle (the same two paired actions) before running other fleet commands to handle the wake.

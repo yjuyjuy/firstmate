@@ -199,6 +199,32 @@ test_pi_snippet_uses_effective_extension_path() {
   pass "pi supervision snippet renders the effective extension path"
 }
 
+# P2: a live present-mode daemon is the single watcher owner. The FIRST-cycle
+# directive must then tell the model NOT to self-arm and to rely on the daemon
+# pane-wake, so a present-mode session does not add a second watcher.
+test_first_cycle_defers_to_daemon_when_live() {
+  local out first
+  out=$("$RENDER" --harness jcode --present-daemon 1)
+  first=$(printf '%s\n' "$out" | grep -F -- '- First cycle:')
+  assert_contains "$first" "do NOT launch bin/fm-watch-arm.sh" "present-daemon first-cycle directive did not forbid self-arming"
+  assert_contains "$first" "daemon pane-wake" "present-daemon first-cycle directive did not name daemon pane-wake"
+  assert_not_contains "$first" "two paired actions" "present-daemon first-cycle directive still emitted the self-arm instruction"
+  pass "P2: first-cycle directive defers to a live present-mode daemon"
+}
+
+# Without a daemon the jcode first-cycle directive must still emit the two paired
+# self-arm actions, so a home without the feature is unchanged.
+test_first_cycle_arms_when_no_daemon() {
+  local out first
+  out=$("$RENDER" --harness jcode --present-daemon 0)
+  first=$(printf '%s\n' "$out" | grep -F -- '- First cycle:')
+  assert_contains "$first" "two paired actions" "no-daemon jcode first-cycle directive lost the self-arm instruction"
+  assert_contains "$first" "bin/fm-watch-arm.sh" "no-daemon jcode first-cycle directive lost the background arm"
+  assert_contains "$first" "wake:true" "no-daemon jcode first-cycle directive lost the mandatory wake:true step"
+  assert_not_contains "$first" "do NOT launch" "no-daemon jcode first-cycle directive wrongly forbade self-arming"
+  pass "P2: first-cycle directive arms one cycle when no daemon owns the watcher"
+}
+
 test_selected_harness_block_only
 test_unknown_fallback
 test_conditional_stanzas
@@ -209,3 +235,5 @@ test_grok_is_background_notify
 test_jcode_is_async_wake_adapter
 test_grok_command_sources_effective_config
 test_pi_snippet_uses_effective_extension_path
+test_first_cycle_defers_to_daemon_when_live
+test_first_cycle_arms_when_no_daemon
