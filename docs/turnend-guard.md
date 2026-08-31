@@ -32,6 +32,10 @@ That is the same identity-matched live lock and fresh beacon check used by `bin/
 A stale beacon blocks even if a watcher pid is still live.
 A fresh leftover beacon blocks if the watcher lock is missing, dead, or identity-mismatched.
 
+A live, fresh-beacon watcher is necessary but not sufficient to be non-blind: the guard then also requires `fm_wake_path_owned <state-dir> <bin-dir>` from `bin/fm-supervision-lib.sh`, which is true when a live present-mode daemon, a live away-mode daemon for this home, or a live this-home arm process (enumerated by absolute path through `bin/fm-watch-scope-lib.sh`) owns a path that will complete to wake the idle model.
+A healthy watcher with no such owner still blinds the session (the watcher cycles and enqueues wakes, but nothing re-drives it), so the guard blocks with a wake-path-specific detail instead of ending the turn.
+That predicate errs toward owned on any probe uncertainty, so it never nags on a transient wake handoff; a genuinely dead watcher is still caught by the beacon check.
+
 ## Away Mode
 
 Away mode alone does not transfer watcher ownership.

@@ -65,7 +65,8 @@ The shared no-mistakes gate refusal for fleet lifecycle entrypoints is summarize
 | `fm-secondmate-report.sh` | Optional helper to append a correlated parent status or document-pointer report       |
 | `fm-gate-refuse-lib.sh`  | Shared no-mistakes gate-context refusal for fleet lifecycle entrypoints               |
 | `fm-nm-preflight.sh`     | Clear a lane to run no-mistakes: refuse a detached HEAD, optionally re-assert the worktree belongs to the intended clone, warn about an unrelated in-flight run, and print the drive-by-id instruction |
-| `fm-watch-arm.sh`        | Verified home-scoped watcher arm wrapper with loud cycle endings and bounded lifecycle ledger |
+| `fm-watch-arm.sh`        | Verified home-scoped watcher arm wrapper with loud cycle endings and bounded lifecycle ledger; `--converge` collapses a multi-watcher/arm-loop tangle for this home and re-arms one owner |
+| `fm-watch-scope-lib.sh`  | Shared absolute-path home-scoped watcher/arm process enumeration (`fm_home_watcher_pids`/`fm_home_arm_pids`) so tangle-collapse and the wake-path guard share one audited never-cross-home scoping |
 | `fm-watch-checkpoint.sh` | Run one bounded foreground watcher checkpoint for Codex-style supervision            |
 | `fm-watch.sh`            | Singleton-safe always-on watcher: absorb benign wakes, queue and exit on actionable ones |
 | `fm-hourly-lib.sh`       | Own arming, cadence, suppression, and script mapping for the two session-lifetime hourly passes |
@@ -87,7 +88,7 @@ The shared no-mistakes gate refusal for fleet lifecycle entrypoints is summarize
 | `fm-resource-check.sh`   | Print one kernel-wide host CPU/memory/swap reading with the concurrent-agent ceiling it supports |
 | `fm-memory-report.sh`    | Rank every process by memory (phys_footprint on macOS, pss from /proc on Linux), attribute each to its fleet owner from durable records, and refuse rather than report a broken reading (docs/memory-report.md) |
 | `fm-tangle-lib.sh`       | Shared default-branch resolution and primary-checkout tangle classification          |
-| `fm-supervision-lib.sh`  | Shared in-flight-work-without-fresh-watcher-beacon predicate                         |
+| `fm-supervision-lib.sh`  | Shared in-flight-work-without-fresh-watcher-beacon predicate plus the wake-path-ownership predicate (`fm_wake_path_owned`: a fresh watcher is only non-blind when a live present daemon, away daemon, or this-home arm owns a completing wake path) |
 | `fm-ff-lib.sh`           | Shared guarded fast-forward helper for origin pulls and local secondmate syncs       |
 | `fm-lock-lib.sh`         | Shared "is this git lock provably abandoned?" proof used by teardown and fleet-sync   |
 | `fm-config-inherit-lib.sh` | Shared primary-to-secondmate inherited local-material propagation and config-reread delivery |

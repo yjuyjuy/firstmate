@@ -903,6 +903,7 @@ FM_SNAPSHOT_EVENT_OLD_THRESHOLD=600   # same OLD-marker threshold for the fleet 
 FM_BOOTSTRAP_DETECT_ONLY=0   # internal/read-only session-start mode: skip bootstrap's mutating sweeps and print advisory TANGLE wording
 FM_GUARD_READ_ONLY=0    # internal/read-only guard mode: keep alarms but suppress drain, supervision repair, and checkout repair commands
 FM_GUARD_CONTINUE_LINE='This is a supervision warning only; the guarded operation WILL still run.'   # banner continuation line; fm-send.sh overrides it to name the requested message specifically
+FM_GUARD_WAKE_PATH_GRACE=60   # seconds an "alive watcher but no wake-path owner" state must persist before fm-guard.sh warns once per episode; a sub-second wake handoff never trips it; malformed falls back to the default
 FM_POLL=300             # seconds between watcher poll cycles; keep below the beacon grace (FM_WATCHER_STALE_GRACE, which defaults to FM_GUARD_GRACE and to 900) - see the POLL < grace invariant below
 FM_HEARTBEAT=600        # base seconds between heartbeat scans; no-change heartbeats are absorbed while idle
 FM_HEARTBEAT_MAX=7200   # heartbeat backoff cap
