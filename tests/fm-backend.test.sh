@@ -151,6 +151,63 @@ old_bin_sourced_siblings() {  # <bin-dir>
     "$1"/*.sh | sort -u
 }
 
+# Same sed derivation as old_bin_sourced_siblings, applied to ONE file rather
+# than a whole bin/ glob. The closure guard below needs per-file dependency
+# edges to walk the source graph; a whole-dir glob cannot tell which file
+# pulls in which sibling. Keeping the extraction regex identical to
+# old_bin_sourced_siblings is deliberate: both the post-merge shim check and
+# the pre-merge closure guard must agree on what counts as a sourced sibling,
+# or one would drift from the other.
+sourced_fm_siblings_of() {  # <file> -> basenames of fm-*.sh siblings this file sources
+  sed -n 's/^[[:space:]]*\.[[:space:]]*"\$[A-Za-z_][A-Za-z0-9_]*\(\/bin\)\{0,1\}\/\(fm-[A-Za-z0-9-]*\.sh\)".*/\2/p' \
+    "$1" | sort -u
+}
+
+# The set of sibling scripts the shim contract governs, derived the SAME way
+# the shim itself is assembled: start from the refactored entrypoints and walk
+# the transitive `. "$SCRIPT_DIR/fm-*.sh"` source graph. Unlike the shim in
+# build_old_bin, this walks the CURRENT worktree's bin/, so a new source edge
+# added on a branch is visible here BEFORE merge advances the merge-base. That
+# is the whole point: test_old_bin_shim_is_complete only sees a new sibling
+# once BASE_REF contains the source line, i.e. after merge, when main is
+# already red; this closure walk sees it on the PR.
+manifest_governed_closure() {  # <bin-dir> -> every fm-*.sh basename reachable from OLD_BIN_REFACTORED
+  local bin=$1 queue=${2:-} seen=" " out=" " f dep
+  [ -n "$queue" ] || queue=$OLD_BIN_REFACTORED
+  while [ -n "$queue" ]; do
+    f=${queue%% *}
+    if [ "$f" = "$queue" ]; then queue=""; else queue=${queue#* }; fi
+    [ -n "$f" ] || continue
+    case "$seen" in *" $f "*) continue ;; esac
+    seen="$seen$f "
+    out="$out$f "
+    [ -f "$bin/$f" ] || continue
+    for dep in $(sourced_fm_siblings_of "$bin/$f"); do
+      queue="$queue $dep"
+    done
+  done
+  printf '%s\n' "$out" | tr ' ' '\n' | sed '/^$/d' | sort -u
+}
+
+# Given a bin/ and the manifest's known basenames, return every governed
+# sibling NOT in the manifest. Empty output means the manifest is complete.
+# Shared by test_shim_manifest_covers_current_sources (the real guard against
+# this worktree) and test_shim_manifest_guard_catches_missing_sibling (the
+# synthetic proof that an omission is caught). Factoring it keeps both tests
+# checking the SAME rule.
+manifest_uncovered_siblings() {  # <bin-dir> <known-basenames...>
+  local bin=$1; shift
+  local known=" $* " sib out=""
+  while IFS= read -r sib; do
+    [ -n "$sib" ] || continue
+    case "$known" in *" $sib "*) continue ;; esac
+    out="$out $sib"
+  done <<EOF
+$(manifest_governed_closure "$bin")
+EOF
+  printf '%s' "${out# }"
+}
+
 test_old_bin_shim_is_complete() {
   local root bin dep missing=""
   root=$(build_old_bin shim-completeness)
@@ -163,6 +220,68 @@ $(old_bin_sourced_siblings "$bin")
 EOF
   [ -z "$missing" ] || fail "the pre-refactor bin/ shim is missing sibling scripts its own files source:$missing"$'\n'"add each to OLD_BIN_UNCHANGED_SIBLINGS or OLD_BIN_OPTIONAL_SIBLINGS in this file"
   pass "the pre-refactor bin/ shim carries every sibling its scripts source"
+}
+
+# PRE-MERGE guard against the recurring red-main regression: a PR adds a new
+# `. "$SCRIPT_DIR/fm-newlib.sh"` to a shim entrypoint (or a lib it transitively
+# sources) but forgets to add fm-newlib.sh to the manifest. test_old_bin_shim_is_complete
+# only catches this AFTER merge, because it builds the shim from BASE_REF (the
+# merge-base), so the new source line is invisible until the merge advances the
+# merge-base - at which point main is already red on Behavior portable serial
+# and that red cascades to every open PR (seen with fm-jcode-profile-lib.sh #209,
+# fm-pane-crash-lib.sh, fm-watch-scope-lib.sh). This guard walks the CURRENT
+# worktree's source graph instead, so it fires on the PR that introduces the
+# omission. It reuses the SAME sed derivation and the SAME manifest vars, so it
+# cannot drift from the shim it protects.
+test_shim_manifest_covers_current_sources() {
+  local known missing
+  known="$OLD_BIN_UNCHANGED_SIBLINGS $OLD_BIN_OPTIONAL_SIBLINGS $OLD_BIN_REFACTORED"
+  # shellcheck disable=SC2086  # $known is a space-separated basename list; word-splitting is intended.
+  missing=$(manifest_uncovered_siblings "$ROOT/bin" $known)
+  [ -z "$missing" ] || fail \
+"a bin/ script the shim contract governs is sourced but missing from the shim manifest: $missing
+
+Each name above is a fm-*.sh sibling reachable from the shim entrypoints
+($OLD_BIN_REFACTORED) that build_old_bin does NOT copy, so once this merges the
+Behavior portable serial job (test_old_bin_shim_is_complete) goes red on main.
+Fix now, in THIS PR: for each name, add it to OLD_BIN_UNCHANGED_SIBLINGS in
+tests/fm-backend.test.sh (the space-separated list near line 115), or to
+OLD_BIN_OPTIONAL_SIBLINGS if a pre-merge baseline may legitimately lack it."
+  pass "the shim manifest covers every sibling the current worktree's shim entrypoints source"
+}
+
+# Proves the guard above actually catches an omission: a synthetic bin/ whose
+# entrypoint sources a lib absent from the supplied manifest must be reported by
+# manifest_uncovered_siblings, and a manifest that includes it must report
+# nothing. This is the regression proof for the #209 class of failure.
+test_shim_manifest_guard_catches_missing_sibling() {
+  local dir bin uncovered saved_refactored=$OLD_BIN_REFACTORED
+  dir="$TMP_ROOT/manifest-guard"; bin="$dir/bin"; mkdir -p "$bin"
+  # A synthetic refactored entrypoint that sources a brand-new lib.
+  cat > "$bin/fm-send.sh" <<'SH'
+#!/usr/bin/env bash
+. "$SCRIPT_DIR/fm-synthetic-newlib.sh"
+SH
+  : > "$bin/fm-synthetic-newlib.sh"
+  # Restrict the closure to a single entrypoint for a deterministic synthetic
+  # case; restored below so later conformance tests see the real manifest.
+  OLD_BIN_REFACTORED="fm-send.sh"
+
+  # Manifest omits fm-synthetic-newlib.sh -> guard must name it.
+  uncovered=$(manifest_uncovered_siblings "$bin" fm-send.sh)
+  OLD_BIN_REFACTORED=$saved_refactored
+  case " $uncovered " in
+    *" fm-synthetic-newlib.sh "*) : ;;
+    *) fail "manifest guard failed to flag a sourced lib absent from the manifest, got '$uncovered'" ;;
+  esac
+
+  # Manifest includes it -> guard must report nothing.
+  OLD_BIN_REFACTORED="fm-send.sh"
+  uncovered=$(manifest_uncovered_siblings "$bin" fm-send.sh fm-synthetic-newlib.sh)
+  OLD_BIN_REFACTORED=$saved_refactored
+  [ -z "$uncovered" ] || fail "manifest guard flagged a sibling that IS in the manifest: '$uncovered'"
+
+  pass "manifest guard names a sourced sibling missing from the manifest and passes once it is added"
 }
 
 # --- fm-backend.sh unit tests ------------------------------------------------
@@ -1107,6 +1226,8 @@ test_spawn_autodetect_nesting_resolves_tmux_silently() {
 }
 
 test_old_bin_shim_is_complete
+test_shim_manifest_covers_current_sources
+test_shim_manifest_guard_catches_missing_sibling
 test_backend_name_precedence
 test_backend_detect_precedence
 test_backend_detect_cmux_fallback_bundle_id
