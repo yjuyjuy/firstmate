@@ -376,6 +376,27 @@ UNSAFE_LIFECYCLE_IDS=(
   'task$a'
 )
 
+test_missing_meta_points_at_orphan_mode() {
+  local dir rc
+  dir=$(make_case missing-meta-orphan-hint)
+  # No task meta on disk: fm-pr-check must refuse and point the operator at the
+  # supported records-gone path (orphan mode) with its exact argument shape,
+  # rather than the bare "task metadata is unavailable" with no next step.
+  set +e
+  run_check_entry "$dir" gone-x1 https://github.com/example/repo/pull/9 \
+    > "$dir/stdout" 2> "$dir/stderr"
+  rc=$?
+  set -e
+  [ "$rc" -eq 1 ] || fail "missing-meta hint: fm-pr-check should refuse with exit 1"
+  assert_grep 'error: task metadata is unavailable' "$dir/stderr" \
+    "missing-meta hint: refusal did not explain the missing metadata"
+  assert_grep 'fm-pr-merge.sh --orphan <owner/repo> <pr-url>' "$dir/stderr" \
+    "missing-meta hint: refusal did not point at orphan mode with its exact argument shape"
+  [ ! -e "$dir/home/state/gone-x1.check.sh" ] \
+    || fail "missing-meta hint: refusal armed a poll for an unknown task"
+  pass "fm-pr-check missing-meta refusal points at orphan mode with its exact argument shape"
+}
+
 test_parser_matrix() {
   local id row url owner repo number
   while IFS='|' read -r url owner repo number; do
@@ -2961,6 +2982,7 @@ EOF
 }
 
 test_parser_matrix
+test_missing_meta_points_at_orphan_mode
 test_gitlab_merge_watch
 test_invalid_entrypoints_have_zero_side_effects
 test_valid_recording_and_merge_derivation

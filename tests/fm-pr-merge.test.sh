@@ -22,6 +22,9 @@
 #       record survives, records evidence with the task id, and runs the
 #       fork-target guard against the queue record's clone
 #   (m) auto-detect fails closed without a merge-queue record
+#   (n) orphan mode accepts a local clone PATH as the repo argument by mapping
+#       its origin to the PR URL's own owner/repository, and still refuses a
+#       clone whose origin resolves to a different repository
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -761,9 +764,72 @@ test_orphan_gitlab_parsed_but_not_supported() {
   pass "fm-pr-merge --orphan parses a GitLab MR URL and refuses it with a provider-specific message"
 }
 
-# --- records-gone auto-detect ------------------------------------------------
+# --- orphan clone-path repo argument -----------------------------------------
 #
-# The task-id invocation with no state/<id>.meta falls back to the records-gone
+# The --orphan repo argument accepts a local clone PATH in addition to the URL's
+# own owner/repository, mapping the clone's origin to its owner/repository so the
+# operator does not have to hand-translate. A git repo with a github.com origin
+# makes the mapping resolvable; a clone whose origin resolves elsewhere is still
+# refused.
+set_repo_origin_github() {
+  local dir=$1 slug=$2
+  mkdir -p "$dir"
+  git -C "$dir" init -q
+  git -C "$dir" remote add origin "https://github.com/$slug.git"
+}
+
+test_orphan_clone_path_repo_arg_mapped() {
+  local case_dir rc
+  case_dir="$TMP_ROOT/orphan-clone-path"
+  mkdir -p "$case_dir/fakebin"
+  add_gh_mocks "$case_dir" aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  set_repo_origin_github "$case_dir/projects/firstmate" example/repo
+  : > "$case_dir/gh-axi.log"
+
+  set +e
+  run_pr_merge "$case_dir" --orphan "$case_dir/projects/firstmate" \
+    https://github.com/example/repo/pull/47 \
+    > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "orphan-clone-path: fm-pr-merge --orphan should accept a clone PATH mapped to the URL's owner/repository"
+  grep -qxF 'pr merge 47 --repo example/repo --squash' "$case_dir/gh-axi.log" \
+    || fail "orphan-clone-path: gh-axi pr merge was not invoked with number, --repo, and default --squash"
+  assert_grep 'orphan-merge	example/repo	https://github.com/example/repo/pull/47' \
+    "$case_dir/data/orphan-merges.log" \
+    "orphan-clone-path: merge evidence was not recorded to data/orphan-merges.log"
+  pass "fm-pr-merge --orphan maps a local clone PATH to the PR URL's own owner/repository"
+}
+
+test_orphan_clone_path_wrong_repo_refuses() {
+  local case_dir rc
+  case_dir="$TMP_ROOT/orphan-clone-path-wrong"
+  mkdir -p "$case_dir/fakebin"
+  add_gh_mocks "$case_dir" bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  # The clone's origin resolves to a different repository than the PR URL, so
+  # the mapping must not smuggle it past the existing safety check.
+  set_repo_origin_github "$case_dir/projects/other" other-org/other-repo
+  : > "$case_dir/gh-axi.log"
+
+  set +e
+  run_pr_merge "$case_dir" --orphan "$case_dir/projects/other" \
+    https://github.com/example/repo/pull/48 \
+    > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "orphan-clone-path-wrong: fm-pr-merge --orphan should refuse a clone whose origin is a different repository"
+  assert_grep 'repository argument does not match the PR URL' "$case_dir/stderr" \
+    "orphan-clone-path-wrong: refusal did not explain the repo mismatch"
+  assert_no_grep 'pr merge' "$case_dir/gh-axi.log" \
+    "orphan-clone-path-wrong: gh-axi pr merge was invoked despite the mismatch"
+  [ ! -f "$case_dir/data/orphan-merges.log" ] \
+    || fail "orphan-clone-path-wrong: evidence was recorded for a refused merge"
+  pass "fm-pr-merge --orphan still refuses a clone PATH whose origin is a different repository"
+}
+
+# --- records-gone auto-detect ------------------------------------------------
 # (recordless) merge only when the id has a durable data/merge-queue.tsv entry;
 # the entry's clone path feeds the fork-target ownership guard. A real git repo
 # with an origin remote makes the guard resolvable both ways.
@@ -936,6 +1002,8 @@ test_orphan_bitbucket_browser_variant_url_merges
 test_orphan_bitbucket_repo_mismatch_refuses
 test_orphan_bitbucket_not_open_refuses
 test_orphan_gitlab_parsed_but_not_supported
+test_orphan_clone_path_repo_arg_mapped
+test_orphan_clone_path_wrong_repo_refuses
 test_auto_detect_merges_with_queue_record
 test_auto_detect_accepts_queue_clone_own_repo
 test_auto_detect_fork_guard_refuses

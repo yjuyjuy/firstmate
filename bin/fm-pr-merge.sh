@@ -35,7 +35,12 @@
 # The explicit repository argument must equal the project path the URL already
 # carries (owner/repository on GitHub, workspace/repository on Bitbucket, the
 # full namespace on GitLab); it exists so the caller states the repository it
-# believes it is merging and the merge refuses on any mismatch.
+# believes it is merging and the merge refuses on any mismatch. A local clone
+# PATH (for example projects/firstmate) is also accepted for GitHub and
+# Bitbucket: it is mapped to its origin's own owner/repository before the match,
+# so the operator does not have to hand-translate a clone path into the URL
+# owner/repository. A clone whose origin resolves to a different repository is
+# still refused.
 #
 # Orphan mode accepts every provider the task-based path merges: a GitHub PR
 # merges through gh-axi, and a Bitbucket Cloud PR merges through the REST 2.0 API
@@ -284,11 +289,22 @@ if [ "${1:-}" = "--orphan" ]; then
     exit 2
   fi
   # The explicit repository argument must equal the URL's own project path
-  # (owner/repository, workspace/repository, or the full GitLab namespace). This
-  # check and the orphan-log recording apply to every provider.
+  # (owner/repository, workspace/repository, or the full GitLab namespace). A
+  # local clone PATH (e.g. projects/firstmate) is also accepted: it is mapped to
+  # its origin's own owner/repository so the operator need not hand-translate a
+  # clone path into the URL-owner slug. The safety check is unchanged - the
+  # mapped project path must still equal the URL's - so a clone whose origin
+  # resolves to a different repository is still refused.
   if [ "$REPO_ARG" != "$FM_PR_PATH" ]; then
-    echo "error: repository argument does not match the PR URL" >&2
-    exit 1
+    MAPPED_PATH=
+    case "$FM_PR_PROVIDER" in
+      github) MAPPED_PATH=$(fm_pr_github_origin_slug "$REPO_ARG" 2>/dev/null || true) ;;
+      bitbucket) MAPPED_PATH=$(fm_pr_bitbucket_origin_slug "$REPO_ARG" 2>/dev/null || true) ;;
+    esac
+    if [ -z "$MAPPED_PATH" ] || [ "${MAPPED_PATH,,}" != "${FM_PR_PATH,,}" ]; then
+      echo "error: repository argument does not match the PR URL" >&2
+      exit 1
+    fi
   fi
   URL=$FM_PR_URL
   PROVIDER=$FM_PR_PROVIDER

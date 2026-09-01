@@ -59,6 +59,7 @@ NUMBER=$FM_PR_NUMBER
 META="$STATE/$ID.meta"
 if [ ! -f "$META" ] || [ -L "$META" ] || [ "$(fm_pr_file_link_count "$META")" != 1 ]; then
   echo "error: task metadata is unavailable" >&2
+  echo "hint: task $ID has no metadata (torn down while its PR was still open, or its branch drained to the merge queue); records-gone lands through orphan mode: fm-pr-merge.sh --orphan <owner/repo> <pr-url>" >&2
   exit 1
 fi
 
