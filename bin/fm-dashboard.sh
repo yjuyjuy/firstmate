@@ -24,6 +24,10 @@
 #   ctrl-t          cycle a filter: backlog state all/queued/in-flight;
 #                   decisions source all/hold/desk/question
 #   ctrl-r          refresh: re-read the fleet for the ACTIVE panel, no restart
+#   ctrl-y          message: compose a one-line note about the selected row and
+#                   drop it on the LOCAL clipboard via OSC 52 (phase 1, ADR-0032).
+#                   The captain pastes it into the PRIMARY firstmate session. The
+#                   dashboard never writes into any home's state.
 #   preview pane    the selected row's full body (collapsed by default)
 #   enter / esc     quit, leaving NOTHING running
 #
@@ -51,6 +55,7 @@
 #   fm-dashboard.sh --cycle-panel <statedir>       switch the active panel
 #   fm-dashboard.sh --cycle-sort <statedir>        rotate the backlog sort mode
 #   fm-dashboard.sh --cycle-filter <statedir>      rotate the active panel's filter
+#   fm-dashboard.sh --compose <statedir> <a> <b> <c>  compose one message about the selected row and copy it via OSC 52
 #   fm-dashboard.sh --preview <a> <b> <c>          render one selected row's full body
 #
 # Environment overrides (mainly for tests):
@@ -175,12 +180,15 @@ dash_snapshot() {
 # A CAPTAIN DECISION (CONTEXT.md glossary) is any item blocked solely on captain
 # judgment, from three sources. Each source has ONE owner and is read only
 # through it (the single-parser rule); this panel NEVER hand-parses backlog.md,
-# the ledger table, or the transcript jsonl. The decisions cache is a 5-column
+# the ledger table, or the transcript jsonl. The decisions cache is a 6-column
 # TSV, one row per decision:
-#   1 home  2 source  3 rowid  4 display-title  5 body(base64)
+#   1 home  2 source  3 rowid  4 display-title  5 body(base64)  6 key
 # The body is base64 so a multi-line body (a `tasks-axi show` dump) survives as
 # a single cache line; the preview decodes it. rowid is unique per snapshot
-# ("<home>:<source>:<n>") and is the token the preview looks up.
+# ("<home>:<source>:<n>") and is the token the preview looks up. The key column
+# is the row's message-compose identity (issue #200): the task id for a hold, the
+# subject for a desk request, the question head for a question. It feeds the
+# clipboard payload builder and is never read by the preview.
 
 # b64enc / b64dec: encode a body to a single line and back. base64 wraps output
 # by default, so strip the newlines on the way in; the reader tolerates either.
@@ -207,7 +215,7 @@ dash_home_holds() {
     [ -n "$body" ] || body="$title"
     rowid="$home:hold:$n"
     line=$(dash_clean_title "$id: ${reason:-$title}")
-    printf '%s\thold\t%s\t%s\t%s\n' "$home" "$rowid" "$line" "$(printf '%s' "$body" | b64enc)" >> "$tmp"
+    printf '%s\thold\t%s\t%s\t%s\t%s\n' "$home" "$rowid" "$line" "$(printf '%s' "$body" | b64enc)" "$(dash_clean_title "$id")" >> "$tmp"
   done < <(printf '%s\n' "$out" | awk '
     function decode(s,   i,c,cur,inq,esc,nf) {
       nf=0; cur=""; inq=0; esc=0
@@ -251,9 +259,10 @@ dash_home_desk() {
     n=$((n + 1))
     rowid="$home:desk:$n"
     line=$(dash_clean_title "$subject: $question")
-    printf '%s\tdesk\t%s\t%s\t%s\n' "$home" "$rowid" "$line" \
+    printf '%s\tdesk\t%s\t%s\t%s\t%s\n' "$home" "$rowid" "$line" \
       "$(printf 'decision-desk request (%s)\nsubject: %s\nasked: %s\n\n%s\n' \
-         "$status" "$subject" "$when" "$question" | b64enc)" >> "$tmp"
+         "$status" "$subject" "$when" "$question" | b64enc)" \
+      "$(dash_clean_title "$subject")" >> "$tmp"
   done < <(FM_DATA_OVERRIDE="$datadir" "$LEDGER_TOOL" list 2>/dev/null || true)
 }
 
@@ -273,8 +282,9 @@ dash_home_questions() {
     n=$((n + 1))
     rowid="$home:question:$n"
     line=$(dash_clean_title "$q")
-    printf '%s\tquestion\t%s\t%s\t%s\n' "$home" "$rowid" "$line" \
-      "$(printf 'unanswered captain question\n\n%s\n' "$q" | b64enc)" >> "$tmp"
+    printf '%s\tquestion\t%s\t%s\t%s\t%s\n' "$home" "$rowid" "$line" \
+      "$(printf 'unanswered captain question\n\n%s\n' "$q" | b64enc)" \
+      "$(dash_clean_title "$q")" >> "$tmp"
   done < <(FM_DESK_TRANSCRIPT="$feed" "$TRANSCRIPT_TOOL" list 2>/dev/null \
     | jq -rs '[ .[] | select(.kind == "question") ]
               | reverse | unique_by(.q)
@@ -325,9 +335,10 @@ dash_next_decisions_filter() {
 # --- render -----------------------------------------------------------------
 #
 # dash_rows <cache-file> <sort> <filter>: filter the cache by state and sort it,
-# then print fzf input lines. Each fzf line is "<display>\t<backlog>\t<id>":
+# then print fzf input lines. Each fzf line is "<display>\t<backlog>\t<id>\t<home>":
 # fzf shows only the display column (--with-nth=1) and the hidden columns feed
-# the preview subcommand for the selected row.
+# the preview subcommand (file, id) and the compose subcommand (file, id, home)
+# for the selected row.
 dash_rows() {
   local cache=$1 sort=$2 filter=$3
   [ -f "$cache" ] || return 0
@@ -354,7 +365,7 @@ dash_rows() {
       repodisp = ($6 == "-" || $6 == "") ? "-" : $6
       display = sprintf("[%s] %-10s %-3s %-6s %-14s %s", \
         $1, state, pridisp, $5, repodisp, $9)
-      printf "%s\t%s\t%s\t%s\n", key, display, $2, $3
+      printf "%s\t%s\t%s\t%s\t%s\n", key, display, $2, $3, $1
     }
   ' "$cache" | LC_ALL=C sort -t$'\t' -k1,1 | cut -f2-
 }
@@ -456,9 +467,9 @@ dash_active_header() {
   local sd=$1 panel
   panel=$(dash_read_state "$sd" panel backlog)
   if [ "$panel" = decisions ]; then
-    printf 'Captain decisions  |  ctrl-p panel  ctrl-t source  ctrl-r refresh  enter/esc quit'
+    printf 'Captain decisions  |  ctrl-p panel  ctrl-t source  ctrl-r refresh  ctrl-y message  enter/esc quit'
   else
-    printf 'Fleet backlog  |  ctrl-p panel  ctrl-s sort  ctrl-t state  ctrl-r refresh  enter/esc quit'
+    printf 'Fleet backlog  |  ctrl-p panel  ctrl-s sort  ctrl-t state  ctrl-r refresh  ctrl-y message  enter/esc quit'
   fi
 }
 
@@ -495,6 +506,97 @@ dash_decision_preview() {
   printf '%s' "$b64" | b64dec
 }
 
+# --- message compose: clipboard send (issue #200) ---------------------------
+#
+# Phase 1 messaging (ADR-0032): the captain composes a one-line note about the
+# selected row; it lands on the captain's LOCAL clipboard via OSC 52, and the
+# captain pastes it into the PRIMARY firstmate session by hand. Every payload
+# addresses the PRIMARY firstmate regardless of the row's owning home; the home
+# tag names that owner so primary can find the item. The dashboard NEVER writes
+# into any home's state - it only puts text on the captain's own clipboard.
+#
+# Payload shapes by row source:
+#   backlog / hold   re <key> [<home>]: <text>
+#   desk             re desk/<key> [<home>]: <text>
+#   question         re question "<head>" [<home>]: <text>
+
+# dash_question_head <question>: the short head of a question for the payload.
+# Keys are already single-line; trim to a bounded prefix so the payload carries a
+# terse handle, not the whole question body.
+DASH_QUESTION_HEAD_MAX=${DASH_QUESTION_HEAD_MAX:-60}
+dash_question_head() {
+  local q=$1
+  if [ "${#q}" -gt "$DASH_QUESTION_HEAD_MAX" ]; then
+    printf '%s' "${q:0:$DASH_QUESTION_HEAD_MAX}"
+  else
+    printf '%s' "$q"
+  fi
+}
+
+# dash_compose_payload <source> <key> <home> <text>: build the clipboard payload
+# for one row. Pure function (no I/O), unit-tested. A hold is a captain-kind
+# backlog item, so it shares the plain backlog shape keyed on the task id.
+dash_compose_payload() {
+  local source=$1 key=$2 home=$3 text=$4
+  case "$source" in
+    desk)     printf 're desk/%s [%s]: %s' "$key" "$home" "$text" ;;
+    question) printf 're question "%s" [%s]: %s' "$(dash_question_head "$key")" "$home" "$text" ;;
+    *)        printf 're %s [%s]: %s' "$key" "$home" "$text" ;;
+  esac
+}
+
+# dash_osc52 <payload>: emit the OSC 52 escape that sets the captain's LOCAL
+# clipboard to <payload>. Wire format: ESC ] 52 ; c ; <base64(payload)> BEL, where
+# the 'c' selection targets the clipboard and the base64 must be a single
+# unwrapped line inside the escape. Pure function (writes only the escape to
+# stdout), unit-tested. OSC 52 passthrough is verified working through herdr and
+# the captain's terminal (ADR-0032, 2026-08-31).
+dash_osc52() {
+  local payload=$1 b64
+  b64=$(printf '%s' "$payload" | base64 | tr -d '\n')
+  printf '\033]52;c;%s\007' "$b64"
+}
+
+# dash_compose <a> <b> <c>: the ctrl-y seam. Resolve the selected row's
+# source/key/home, prompt the captain for a one-line note, and, unless the
+# compose is cancelled, copy the built payload to the LOCAL clipboard via OSC 52.
+# Under fzf's execute() the terminal is attached to this process's stdin and
+# stdout, so the readline prompt reads stdin and the OSC 52 escape is written to
+# stdout; that same convention makes the seam drivable in tests. Row-arg shapes
+# mirror the preview seam:
+#   backlog row   <a>=backlog-file <b>=id    <c>=home
+#   decision row  <a>=decision     <b>=cache <c>=rowid (home/source/key from cache)
+# A cancel - a whitespace-only line or EOF - composes nothing and copies nothing.
+dash_compose() {
+  local a=${1:-} b=${2:-} c=${3:-}
+  local source key home
+  if [ "$a" = decision ]; then
+    local cache=$b rowid=$c meta
+    [ -n "$rowid" ] || return 0
+    [ -f "$cache" ] || return 0
+    # Resolve home(col1), source(col2), key(col6) for this rowid from the cache.
+    meta=$(awk -F'\t' -v want="$rowid" '$3 == want { printf "%s\t%s\t%s", $1, $2, $6; exit }' "$cache")
+    [ -n "$meta" ] || return 0
+    IFS=$'\t' read -r home source key <<<"$meta"
+  else
+    key=$b
+    home=$c
+    source=backlog
+    [ -n "$key" ] || return 0
+  fi
+  [ -n "$home" ] || home=primary
+  local text
+  # Single-line readline prompt; the prompt text goes to stderr so it never
+  # pollutes the OSC 52 stdout the terminal (or a test) captures.
+  IFS= read -r -e -p "message re [$home] $key > " text || return 0
+  # A whitespace-only line is a cancel: compose nothing, copy nothing.
+  case "$text" in
+    *[![:space:]]*) : ;;
+    *) return 0 ;;
+  esac
+  dash_osc52 "$(dash_compose_payload "$source" "$key" "$home" "$text")"
+}
+
 # --- interactive entry ------------------------------------------------------
 
 dash_run() {
@@ -524,6 +626,7 @@ dash_run() {
     --bind "ctrl-s:execute-silent($SCRIPT_PATH --cycle-sort $statedir)+reload($SCRIPT_PATH --rows $statedir)" \
     --bind "ctrl-t:execute-silent($SCRIPT_PATH --cycle-filter $statedir)+reload($SCRIPT_PATH --rows $statedir)" \
     --bind "ctrl-r:reload($SCRIPT_PATH --snapshot-reload $statedir)" \
+    --bind "ctrl-y:execute($SCRIPT_PATH --compose $statedir {2} {3} {4})" \
     < <("$SCRIPT_PATH" --rows "$statedir") || true
 }
 
@@ -569,6 +672,13 @@ case "${1:-}" in
     # ctrl-t: rotate whichever filter the ACTIVE panel owns.
     [ $# -ge 2 ] || { echo "fm-dashboard: --cycle-filter needs a statedir" >&2; exit 2; }
     dash_active_cycle_filter "$2"
+    ;;
+  --compose)
+    # ctrl-y: compose a message about the selected row and copy it via OSC 52.
+    # The statedir arg keeps the calling convention uniform with the other
+    # keybinds even though the compose seam resolves everything from the row args.
+    [ $# -ge 2 ] || { echo "fm-dashboard: --compose needs a statedir" >&2; exit 2; }
+    dash_compose "${3:-}" "${4:-}" "${5:-}"
     ;;
   --preview)
     dash_preview "${2:-}" "${3:-}" "${4:-}"

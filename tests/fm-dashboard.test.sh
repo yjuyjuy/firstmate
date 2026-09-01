@@ -767,6 +767,188 @@ SH
   pass "empty decision sources render cleanly with no rows and no failure"
 }
 
+# ============================================================================
+# Message compose: clipboard send (firstmate issue #200). Phase 1 messaging
+# (ADR-0032): a keybind composes a one-line note about the selected row, builds a
+# per-source payload addressing the PRIMARY firstmate, and copies it to the
+# captain's LOCAL clipboard via OSC 52; the captain pastes it in by hand. The
+# payload-shape builder and the OSC 52 encoder are pure functions, unit-tested
+# directly by sourcing the script (its main entry is guarded so a source runs no
+# interactive code). The compose seam's cache/row resolution and cancel handling
+# are driven through the --compose subcommand feeding the note on stdin.
+# ============================================================================
+
+# Source the dashboard once for the pure-function unit tests. The script guards
+# its main entry (`[ "${BASH_SOURCE[0]}" != "$0" ] && return 0`), so sourcing
+# defines the functions without running the dispatch or fzf.
+# shellcheck source=bin/fm-dashboard.sh
+# shellcheck disable=SC1091
+FM_HOME="$TMP_ROOT" . "$DASH"
+# The dashboard sets `set -eu`; the suite runs under `set -u` only, so restore
+# errexit-off for the remaining tests (several assert helpers rely on it).
+set +e
+
+# --- OSC 52 encoder ---------------------------------------------------------
+test_osc52_encodes_clipboard_escape() {
+  local out expect_b64 esc bel decoded
+  out=$(dash_osc52 'hello world')
+  # Wire format: ESC ] 52 ; c ; <base64> BEL. Assert the exact framing and that
+  # the body is the base64 of the payload, unwrapped.
+  expect_b64=$(printf '%s' 'hello world' | base64 | tr -d '\n')
+  esc=$(printf '\033'); bel=$(printf '\007')
+  [ "$out" = "${esc}]52;c;${expect_b64}${bel}" ] || fail "OSC 52 framing wrong: $(printf '%q' "$out")"
+  # The decoded body round-trips back to the payload.
+  decoded=$(printf '%s' "$out" | sed -e 's/.*52;c;//' -e "s/${bel}\$//" | base64 -d)
+  [ "$decoded" = 'hello world' ] || fail "OSC 52 body did not round-trip: '$decoded'"
+  pass "OSC 52 encoder emits ESC]52;c;<base64(payload)>BEL, round-tripping the payload"
+}
+
+test_osc52_base64_is_single_unwrapped_line() {
+  local out payload
+  # A long payload would make base64 wrap by default; the escape must stay one
+  # line or terminals reject it. Prove no newline survives in the body.
+  payload=$(printf 'x%.0s' {1..200})
+  out=$(dash_osc52 "$payload")
+  [ "$(printf '%s' "$out" | wc -l)" -eq 0 ] || fail "OSC 52 escape must be a single line (base64 wrapped)"
+  pass "OSC 52 base64 body is a single unwrapped line even for a long payload"
+}
+
+# --- payload-shape builder --------------------------------------------------
+test_payload_backlog_shape() {
+  local out
+  out=$(dash_compose_payload backlog alpha-1 primary 'bump priority')
+  [ "$out" = 're alpha-1 [primary]: bump priority' ] || fail "backlog payload wrong: '$out'"
+  # A hold is a captain-kind backlog item and shares the plain backlog shape.
+  out=$(dash_compose_payload hold p-hold designer 'go with OAuth')
+  [ "$out" = 're p-hold [designer]: go with OAuth' ] || fail "hold payload wrong: '$out'"
+  pass "backlog/hold payload is 're <key> [<home>]: <text>'"
+}
+
+test_payload_desk_shape() {
+  local out
+  out=$(dash_compose_payload desk p-migration primary 'drop it')
+  [ "$out" = 're desk/p-migration [primary]: drop it' ] || fail "desk payload wrong: '$out'"
+  pass "desk payload is 're desk/<key> [<home>]: <text>'"
+}
+
+test_payload_question_shape() {
+  local out
+  out=$(dash_compose_payload question 'which region?' primary 'us-east-1')
+  [ "$out" = 're question "which region?" [primary]: us-east-1' ] || fail "question payload wrong: '$out'"
+  pass "question payload is 're question \"<head>\" [<home>]: <text>'"
+}
+
+test_payload_question_head_is_bounded() {
+  local long out head
+  # A long question is trimmed to its head so the payload carries a terse handle.
+  long=$(printf 'q%.0s' {1..120})
+  out=$(dash_compose_payload question "$long" primary 'answer')
+  # The head is the first DASH_QUESTION_HEAD_MAX (60) chars, quoted.
+  head="${long:0:60}"
+  [ "$out" = "re question \"$head\" [primary]: answer" ] || fail "question head not bounded: '$out'"
+  pass "a long question key is trimmed to a bounded head in the payload"
+}
+
+# --- compose seam: backlog row resolves file/id/home ------------------------
+test_compose_backlog_row_copies_payload() {
+  local base="$TMP_ROOT/compose-bl" primary sd out bel decoded
+  primary=$(build_fleet "$base")
+  sd="$base/state"; mkdir -p "$sd"
+  export TA_LOG="$base/talog"; : > "$TA_LOG"
+  bel=$(printf '\007')
+  # Feed a one-line note on stdin; the compose reads it with read -e.
+  out=$(FM_HOME="$primary" FM_DATA_OVERRIDE="$primary/data" \
+    FM_DASHBOARD_TASKS_AXI="$FAKEBIN/tasks-axi" TA_LOG="$TA_LOG" \
+    "$DASH" --compose "$sd" "$primary/data/backlog.md" alpha-1 primary \
+    < <(printf 'fix it now\n') 2>/dev/null)
+  # The OSC 52 escape was emitted; decode its body and check the payload.
+  decoded=$(printf '%s' "$out" | sed -e 's/.*52;c;//' -e "s/${bel}\$//" | base64 -d 2>/dev/null)
+  [ "$decoded" = 're alpha-1 [primary]: fix it now' ] || fail "backlog compose payload wrong: '$decoded'"
+  pass "compose on a backlog row copies 're <id> [<home>]: <text>' via OSC 52"
+}
+
+# --- compose seam: decision row resolves source/key/home from the cache -----
+test_compose_decision_row_copies_per_source_payload() {
+  local base="$TMP_ROOT/compose-dec" primary sd cache rowid out bel decoded
+  primary=$(build_decisions_fleet "$base")
+  sd="$base/state"; mkdir -p "$sd"
+  export TA_LOG="$base/talog" LEDGER_LOG="$base/ledgerlog" TR_LOG="$base/trlog"
+  : > "$TA_LOG"; : > "$LEDGER_LOG"; : > "$TR_LOG"
+  run_dash_decisions "$primary" "$sd" --decisions-snapshot
+  cache="$sd/dcache"; bel=$(printf '\007')
+  # A hold row: payload keyed on the task id, tagged with its home.
+  rowid=$(awk -F'\t' '$1=="primary" && $2=="hold" {print $3; exit}' "$cache")
+  out=$("$DASH" --compose "$sd" decision "$cache" "$rowid" < <(printf 'use sessions\n') 2>/dev/null)
+  decoded=$(printf '%s' "$out" | sed -e 's/.*52;c;//' -e "s/${bel}\$//" | base64 -d 2>/dev/null)
+  [ "$decoded" = 're p-hold [primary]: use sessions' ] || fail "hold compose payload wrong: '$decoded'"
+  # A desk row: desk/<subject> shape.
+  rowid=$(awk -F'\t' '$1=="primary" && $2=="desk" {print $3; exit}' "$cache")
+  out=$("$DASH" --compose "$sd" decision "$cache" "$rowid" < <(printf 'keep it\n') 2>/dev/null)
+  decoded=$(printf '%s' "$out" | sed -e 's/.*52;c;//' -e "s/${bel}\$//" | base64 -d 2>/dev/null)
+  [ "$decoded" = 're desk/p-migration [primary]: keep it' ] || fail "desk compose payload wrong: '$decoded'"
+  # A secondmate hold: tagged with the registry id, not primary.
+  rowid=$(awk -F'\t' '$1=="designer" && $2=="hold" {print $3; exit}' "$cache")
+  out=$("$DASH" --compose "$sd" decision "$cache" "$rowid" < <(printf 'nested\n') 2>/dev/null)
+  decoded=$(printf '%s' "$out" | sed -e 's/.*52;c;//' -e "s/${bel}\$//" | base64 -d 2>/dev/null)
+  [ "$decoded" = 're sm-hold [designer]: nested' ] || fail "secondmate hold home tag wrong: '$decoded'"
+  pass "compose on a decision row builds the per-source payload with the row's home tag"
+}
+
+# --- compose cancel: whitespace-only or EOF copies nothing ------------------
+test_compose_cancel_copies_nothing() {
+  local base="$TMP_ROOT/compose-cancel" primary sd out
+  primary=$(build_fleet "$base")
+  sd="$base/state"; mkdir -p "$sd"
+  export TA_LOG="$base/talog"; : > "$TA_LOG"
+  # A whitespace-only line is a cancel: nothing is emitted.
+  out=$(FM_HOME="$primary" FM_DATA_OVERRIDE="$primary/data" \
+    FM_DASHBOARD_TASKS_AXI="$FAKEBIN/tasks-axi" TA_LOG="$TA_LOG" \
+    "$DASH" --compose "$sd" "$primary/data/backlog.md" alpha-1 primary \
+    < <(printf '   \n') 2>/dev/null)
+  [ -z "$out" ] || fail "a whitespace-only compose must emit nothing, got: $(printf '%q' "$out")"
+  # EOF (no line at all) is also a cancel.
+  out=$(FM_HOME="$primary" FM_DATA_OVERRIDE="$primary/data" \
+    FM_DASHBOARD_TASKS_AXI="$FAKEBIN/tasks-axi" TA_LOG="$TA_LOG" \
+    "$DASH" --compose "$sd" "$primary/data/backlog.md" alpha-1 primary \
+    < <(printf '') 2>/dev/null)
+  [ -z "$out" ] || fail "an EOF compose must emit nothing, got: $(printf '%q' "$out")"
+  pass "cancelling a compose (whitespace-only or EOF) composes nothing and copies nothing"
+}
+
+# --- backlog rows carry the home tag for compose ----------------------------
+test_backlog_rows_carry_home_column() {
+  local base="$TMP_ROOT/rowhome" primary sd rows line home
+  primary=$(build_fleet "$base")
+  sd="$base/state"; mkdir -p "$sd"
+  export TA_LOG="$base/talog"; : > "$TA_LOG"
+  printf priority > "$sd/sort"; printf all > "$sd/filter"
+  run_dash "$primary" "$sd" --snapshot
+  rows=$(run_dash "$primary" "$sd" --rows)
+  # The trailing (4th) TSV column of a backlog row is its home tag, feeding the
+  # compose keybind's {4} placeholder.
+  line=$(printf '%s\n' "$rows" | grep alpha-1)
+  home=$(printf '%s\n' "$line" | cut -f4)
+  [ "$home" = primary ] || fail "backlog row home column wrong for alpha-1: '$home'"
+  line=$(printf '%s\n' "$rows" | grep sm-task-1)
+  home=$(printf '%s\n' "$line" | cut -f4)
+  [ "$home" = designer ] || fail "secondmate backlog row home column wrong: '$home'"
+  pass "backlog rows carry the home tag as their trailing column for compose"
+}
+
+# --- the message keybind and its subcommand are wired -----------------------
+test_compose_keybind_is_wired() {
+  local hdr rc base="$TMP_ROOT/wired" primary sd
+  primary=$(build_fleet "$base")
+  sd="$base/state"; mkdir -p "$sd"
+  export TA_LOG="$base/talog"; : > "$TA_LOG"
+  hdr=$(run_dash "$primary" "$sd" --header)
+  assert_contains "$hdr" "ctrl-y message" "the backlog header must advertise the message keybind"
+  rc=0
+  "$DASH" --compose >/dev/null 2>&1 || rc=$?
+  expect_code 2 "$rc" "--compose without a statedir must fail with exit 2"
+  pass "the message keybind is advertised and --compose validates its statedir"
+}
+
 test_snapshot_merges_and_tags_homes
 test_reads_flow_only_through_tasks_axi
 test_empty_secondmate_queue_is_graceful
@@ -792,3 +974,21 @@ test_decisions_preview_per_source
 test_decisions_refresh_drops_cleared_items
 test_panel_cycle_flips_rows_and_header
 test_decisions_empty_sources_are_graceful
+
+# Message compose (#200): pure-function units plus the compose seam. The pure
+# functions are tested by sourcing the script (main entry is guarded); the seam
+# is driven through the --compose subcommand feeding the note on stdin. The
+# decision-row test needs the #199 decisions stubs (still installed); the
+# backlog-row snapshot test needs the plain backlog stub, reinstalled first.
+test_osc52_encodes_clipboard_escape
+test_osc52_base64_is_single_unwrapped_line
+test_payload_backlog_shape
+test_payload_desk_shape
+test_payload_question_shape
+test_payload_question_head_is_bounded
+test_compose_decision_row_copies_per_source_payload
+make_stub_tasks_axi "$FAKEBIN"
+test_compose_backlog_row_copies_payload
+test_compose_cancel_copies_nothing
+test_backlog_rows_carry_home_column
+test_compose_keybind_is_wired
