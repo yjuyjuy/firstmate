@@ -29,14 +29,13 @@
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
-FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
-DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
+# FM_ROOT/FM_HOME/DATA and die (exit 2 default) come from the shared preamble.
+FM_PROG=error FM_DIE_CODE=2
+# shellcheck source=bin/fm-preamble-lib.sh
+. "$SCRIPT_DIR/fm-preamble-lib.sh"
 GRILL_DIR="$DATA/grilling"
 LEDGER="$GRILL_DIR/adr-reservations.md"
 LOCK="$GRILL_DIR/.reserve.lock"
-
-die() { echo "error: $*" >&2; exit 2; }
 
 SLUG=""; DATE=""; PROJECT=""; SCAN_MAX=""
 while [ "$#" -gt 0 ]; do

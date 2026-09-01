@@ -91,9 +91,10 @@
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
-FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
-STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
+# FM_ROOT/FM_HOME/STATE and die (canonical exit 1 default) come from the shared preamble.
+FM_PROG=fm-release-lsp
+# shellcheck source=bin/fm-preamble-lib.sh
+. "$SCRIPT_DIR/fm-preamble-lib.sh"
 
 MEMREPORT="${FM_RELEASE_LSP_MEMREPORT:-$SCRIPT_DIR/fm-memory-report.sh}"
 CREW_STATE_BIN="${FM_RELEASE_LSP_STATE_BIN:-$SCRIPT_DIR/fm-crew-state.sh}"
@@ -110,8 +111,6 @@ BACKEND_OK=1
 usage() {
   awk 'NR==1 { next } /^[^#]/ { exit } { sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]}"
 }
-
-die() { printf 'fm-release-lsp: %s\n' "$1" >&2; exit "${2:-1}"; }
 
 refuse() {  # <reason> <detail>...
   local reason=$1

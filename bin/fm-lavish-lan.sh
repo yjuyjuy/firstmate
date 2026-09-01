@@ -58,9 +58,10 @@
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
-FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
-STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
+# FM_ROOT/FM_HOME/STATE and die (exit 2 default) come from the shared preamble.
+FM_PROG=fm-lavish-lan FM_DIE_CODE=2
+# shellcheck source=bin/fm-preamble-lib.sh
+. "$SCRIPT_DIR/fm-preamble-lib.sh"
 
 # shellcheck source=bin/fm-pid-lib.sh
 . "$SCRIPT_DIR/fm-pid-lib.sh"
@@ -82,11 +83,6 @@ SESSION=""
 usage() {
   # Print the header comment block (lines beginning with '# ') as help.
   sed -n '2,/^set -u/p' "${BASH_SOURCE[0]}" | sed -e '/^set -u/d' -e 's/^# \{0,1\}//'
-}
-
-die() {
-  echo "fm-lavish-lan: $1" >&2
-  exit "${2:-2}"
 }
 
 require_port() {  # <name> <value>

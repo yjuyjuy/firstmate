@@ -5,6 +5,13 @@ FM_WAKE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=bin/fm-mutex-lib.sh
 . "$FM_WAKE_LIB_DIR/fm-mutex-lib.sh"
 FM_WAKE_DEFAULT_ROOT="$(cd "$FM_WAKE_LIB_DIR/.." && pwd)"
+# Resolution chain, DELIBERATELY DIFFERENT from bin/fm-preamble-lib.sh and so NOT
+# sourced from it. That lib is the canonical preamble for ENTRYPOINTS, which own
+# their own SCRIPT_DIR and want FM_ROOT recomputed from it. fm-wake-lib.sh is a
+# sourced LIBRARY: an entrypoint has usually already resolved FM_ROOT before
+# sourcing this, so the middle `${FM_ROOT:-...}` term honors that existing value
+# rather than overwriting it with a root derived from this lib's own directory.
+# The rest of the chain (FM_HOME/STATE) matches the canonical one.
 FM_ROOT="${FM_ROOT_OVERRIDE:-${FM_ROOT:-$FM_WAKE_DEFAULT_ROOT}}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-${STATE:-$FM_HOME/state}}"

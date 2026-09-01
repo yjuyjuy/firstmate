@@ -82,9 +82,14 @@
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
-FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
-STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
+# FM_ROOT/FM_HOME/STATE and die (canonical exit 1 default) come from the shared
+# preamble. Every die callsite here passes a single message argument, so the
+# canonical die (prints "<FM_PROG>: <msg>", exits 1) is behavior-identical to the
+# old local die. die_operational below stays script-local: it adds the re-arm
+# verdict line and is not the plain die the lib owns.
+FM_PROG=fm-afk-inbox
+# shellcheck source=bin/fm-preamble-lib.sh
+. "$SCRIPT_DIR/fm-preamble-lib.sh"
 
 # shellcheck source=bin/fm-afk-outbox-lib.sh
 . "$SCRIPT_DIR/fm-afk-outbox-lib.sh"
@@ -100,11 +105,6 @@ ONCE=0
 LOCK_TIMEOUT_MAX=${FM_AFK_INBOX_LOCK_TIMEOUT_MAX:-12}
 case "$LOCK_TIMEOUT_MAX" in ''|*[!0-9]*|0) LOCK_TIMEOUT_MAX=12 ;; esac
 LOCK_TIMEOUTS=0
-
-die() {
-  printf 'fm-afk-inbox: %s\n' "$*" >&2
-  exit 1
-}
 
 # An OPERATIONAL failure - the outbox could not be read, a delivery could not be
 # acknowledged, the lock never came free - still ends the run, but it must not end

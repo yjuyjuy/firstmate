@@ -141,9 +141,10 @@
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
-FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
-DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
+# FM_ROOT/FM_HOME/DATA and die (exit 2 default) come from the shared preamble.
+FM_PROG=fm-token-report FM_DIE_CODE=2
+# shellcheck source=bin/fm-preamble-lib.sh
+. "$SCRIPT_DIR/fm-preamble-lib.sh"
 
 # shellcheck source=bin/fm-token-lib.sh disable=SC1091
 . "$SCRIPT_DIR/fm-token-lib.sh"
@@ -156,11 +157,6 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 
 usage() {
   sed -n '2,138p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
-}
-
-die() {
-  echo "fm-token-report: $1" >&2
-  exit "${2:-2}"
 }
 
 # --- argument parse ----------------------------------------------------------
