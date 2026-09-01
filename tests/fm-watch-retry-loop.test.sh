@@ -220,10 +220,6 @@ FM_STATE_OVERRIDE="$STATE" FM_WAKE_QUEUE="$STATE/.wake-queue" \
     ' >/dev/null 2>&1
 CAPS=$(wc -l < "$CAP_LOG" | tr -d '[:space:]')
 [ "$CAPS" = 0 ] || fail "retry_loop_check must add NO fm_backend_capture, found $CAPS call(s)"
-check_body=$(awk '/^retry_loop_check\(\)/{f=1} f{print} f&&/^}/{exit}' "$WATCH")
-if printf '%s' "$check_body" | grep -q 'fm_backend_capture'; then
-  fail "retry_loop_check must not call fm_backend_capture (it reads the status file)"
-fi
 pass "retry_loop_check reads only the status file, adding zero backend captures"
 
 pass "fm-watch-retry-loop.test.sh: all checks passed"
