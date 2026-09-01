@@ -1566,12 +1566,36 @@ fi
 # closed without an answer. The per-scout `verify` above never sees a sibling hold, so
 # run the fail-closed `guard` across the whole backlog and archive before proceeding.
 if [ "$FORCE" != "--force" ] && fm_tasks_axi_backend_available "$CONFIG"; then
+  GUARD_ERR="$(mktemp "${TMPDIR:-/tmp}/fm-teardown-guard.XXXXXX")"
   if ! FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" FM_DATA_OVERRIDE="$DATA" \
-      FM_CONFIG_OVERRIDE="$CONFIG" "$SCRIPT_DIR/fm-decision-hold.sh" guard; then
+      FM_CONFIG_OVERRIDE="$CONFIG" "$SCRIPT_DIR/fm-decision-hold.sh" guard 2>"$GUARD_ERR"; then
+    cat "$GUARD_ERR" >&2
     echo "REFUSED: an unanswered captain decision hold is closed in the backlog or archive." >&2
-    echo "Restore it with bin/fm-decision-hold.sh guard --restore before tearing down and pruning." >&2
+    # Name each offending hold and inline the exact restore->resolve recipe so recovery
+    # is copy-paste, not archaeology. A hold id is <origin>-decision-<key>; guard prints
+    # each offender on its own indented line, so recover origin and key by the canonical
+    # -decision- separator.
+    OFFENDERS="$(sed -n 's/^  \([A-Za-z0-9._-]*-decision-[A-Za-z0-9._-]*\) .*/\1/p' "$GUARD_ERR" | LC_ALL=C sort -u)"
+    if [ -n "$OFFENDERS" ]; then
+      echo "Offending hold(s) and the exact recovery for each:" >&2
+      echo "  1. bin/fm-decision-hold.sh guard --restore   (reopens active-backlog offenders; archived ones must be moved back into the backlog first)" >&2
+      echo "  2. for each hold, record the captain's answer and route it, which closes the hold:" >&2
+      while IFS= read -r hold; do
+        [ -n "$hold" ] || continue
+        origin="${hold%-decision-*}"
+        key="${hold##*-decision-}"
+        echo "     $hold" >&2
+        echo "       bin/fm-decision-hold.sh resolve $origin $key --decision-file <path> --routed-to <task-id>" >&2
+      done <<EOF_OFFENDERS
+$OFFENDERS
+EOF_OFFENDERS
+    else
+      echo "Restore it with bin/fm-decision-hold.sh guard --restore before tearing down and pruning." >&2
+    fi
+    rm -f "$GUARD_ERR"
     exit 1
   fi
+  rm -f "$GUARD_ERR"
 fi
 
 if [ "$GATE_KIND" = scout ] && [ "$FORCE" != "--force" ]; then

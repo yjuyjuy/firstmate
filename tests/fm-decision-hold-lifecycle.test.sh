@@ -593,6 +593,14 @@ test_guard_backstops_retention_loss() {
   fi
   assert_grep "unanswered captain decision hold" "$home/guard-teardown.err" \
     "teardown refusal must cite the decision-hold guard"
+  # Ergonomics: the refusal must name the specific offending hold id and inline the
+  # copy-paste restore->resolve recovery recipe, so recovery is not archaeology.
+  assert_grep "$hold_id" "$home/guard-teardown.err" \
+    "teardown refusal must name the specific offending hold id"
+  assert_grep "guard --restore" "$home/guard-teardown.err" \
+    "teardown refusal must inline the restore step"
+  assert_grep "fm-decision-hold.sh resolve $id route" "$home/guard-teardown.err" \
+    "teardown refusal must inline the per-hold resolve step with origin and key"
 
   # Restore recovers the active-backlog offender to a held state.
   run_decisions "$home" guard --restore > "$home/restore.out" 2>&1 \
@@ -659,6 +667,47 @@ EOF
   pass "guard backstops the retention-loss bug across active and archived captain holds"
 }
 
+# The close-time catch: closing an unresolved captain hold via `fm-decision-hold.sh
+# close` must be caught before the retention-loss can occur, not only detected later by
+# the ledger-wide guard at teardown. `close` refuses a bare done on a captain hold that
+# still bears the awaiting sentinel and names the resolve recipe, and closes a durably
+# resolved hold (or a non-captain item, or an ordinary captain hold with no sentinel)
+# through a plain done.
+test_close_catches_unresolved_captain_hold() {
+  local home id hold_id show
+  home=$(make_home close-catch)
+  id=sample-close-review
+  mkdir -p "$home/data/$id"
+  tasks_in "$home" add "$id" "Investigate sample close" --kind scout --repo sample --start >/dev/null \
+    || fail "could not create close investigation fixture"
+  write_origin_meta "$home" "$id"
+
+  hold_id=$(run_decisions "$home" hold "$id" route \
+    --title "Choose the sample route" --reason "captain route choice pending" --repo sample) \
+    || fail "could not register close route hold"
+
+  # Closing an unresolved captain hold via `close` must refuse, name the offending hold,
+  # and inline the resolve recipe - the catch that prevents the retention-loss at source.
+  if run_decisions "$home" close "$hold_id" > "$home/close.out" 2> "$home/close.err"; then
+    fail "close must refuse a bare done on an unresolved captain hold"
+  fi
+  assert_grep "REFUSED" "$home/close.err" "close refusal must be explicit"
+  assert_grep "$hold_id" "$home/close.err" "close refusal must name the offending hold"
+  assert_grep "resolve $id route" "$home/close.err" \
+    "close refusal must inline the resolve recipe with origin and key"
+  show=$(tasks_in "$home" show "$hold_id" --full)
+  assert_contains "$show" "state: queued" "refused close must leave the hold open"
+  assert_contains "$show" "held: yes" "refused close must leave the hold held"
+
+  # A non-captain item closes through the normal done with no obstruction.
+  run_decisions "$home" close "$id" >/dev/null 2>&1 \
+    || fail "close must pass through a non-captain item done"
+  show=$(tasks_in "$home" show "$id" --full)
+  assert_contains "$show" "state: done" "close of a non-captain item did not complete the done"
+
+  pass "close catches an unresolved captain hold at close time and inlines the resolve recipe"
+}
+
 test_blocking_flag_marks_priority_and_sorts_first() {
   local home conv_hold block_hold conv_show block_show json ids
   home=$(make_home blocking-holds)
@@ -702,6 +751,7 @@ test_uninventoried_report_decision_refuses_completion
 test_blocking_flag_marks_priority_and_sorts_first
 
 test_guard_backstops_retention_loss
+test_close_catches_unresolved_captain_hold
 test_scout_teardown_always_requires_inventory_verification
 test_structured_holds_survive_teardown_and_route_resolution
 test_origin_slug_validation_precedes_path_construction

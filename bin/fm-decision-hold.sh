@@ -24,6 +24,7 @@
 #   fm-decision-hold.sh verify <origin-id>
 #   fm-decision-hold.sh resolve <origin-id> <decision-key> \
 #     --decision-file <path> --routed-to <task-id> [--routed-to <task-id>...]
+#   fm-decision-hold.sh close <hold-id>
 #   fm-decision-hold.sh guard [--restore]
 #
 # `complete` is the shared investigation and visual-review completion gate.
@@ -47,6 +48,14 @@
 # It writes the captain decision and routed identities into the hold body, clears
 # those dependency edges, and only then marks the hold Done. A failure before the
 # final step leaves the captain hold open.
+#
+# `close` is the close-time catch for the retention-loss bug. It is the safe way to
+# mark a captain hold Done: it refuses a bare `done` on a kind captain hold that still
+# bears the "State: awaiting captain decision." sentinel (i.e. one closed without ever
+# routing through `resolve`), naming the offending hold and the exact `resolve` recipe,
+# so the corruption is caught at close time rather than only detected later by `guard`
+# at teardown. A durably resolved hold, an ordinary captain hold with no sentinel, and a
+# non-captain item all pass straight through to a plain `tasks-axi done`.
 #
 # `hold --blocking` marks a decision that blocks live work, as distinct from a
 # review-when-convenient one. It maps onto the tasks-axi priority field (priority 0,
@@ -503,6 +512,41 @@ command_resolve() {
   printf 'resolved: %s -> %s\n' "$id" "$routed"
 }
 
+# --- close: the close-time catch for the retention-loss bug ------------------
+# The safe replacement for a bare `tasks-axi done` on a captain hold. It refuses to
+# close a kind captain hold that still bears the awaiting sentinel and carries no
+# resolution record, so the corruption `guard` later detects at teardown is caught here
+# at close time instead. Everything else passes straight through to `tasks-axi done`.
+command_close() {
+  local id=${1:-} show kind body origin key
+  [ "$#" -eq 1 ] || { usage >&2; exit 2; }
+  validate_slug hold-id "$id"
+  require_tasks_axi
+  if ! show=$(task_show "$id"); then
+    fail "backlog item $id is absent from the active home $FM_HOME"
+  fi
+  kind=$(show_field "$show" kind)
+  body=$(show_field "$show" body)
+  # A kind captain hold still awaiting a decision, with no durable resolution record, is
+  # exactly the state a bare done would bury. Refuse and inline the resolve recipe. A
+  # durably resolved hold, an ordinary captain hold with no sentinel, and any non-captain
+  # item all fall through to the plain done below.
+  if [ "$kind" = captain ] && body_awaiting_captain "$body" && ! body_has_resolution "$body"; then
+    origin=${id%-decision-*}
+    key=${id##*-decision-}
+    echo "close: REFUSED - captain decision hold $id is still awaiting a captain answer." >&2
+    echo "A bare done would bury it unanswered (the retention-loss bug). Record the answer and route it, which closes the hold:" >&2
+    if [ "$origin" != "$id" ] && [ "$key" != "$id" ]; then
+      echo "  bin/fm-decision-hold.sh resolve $origin $key --decision-file <path> --routed-to <task-id>" >&2
+    else
+      echo "  bin/fm-decision-hold.sh resolve <origin-id> <decision-key> --decision-file <path> --routed-to <task-id>" >&2
+    fi
+    fail "refusing to close unanswered captain hold $id; resolve it instead"
+  fi
+  tasks_axi "done" "$id" >/dev/null || fail "could not close backlog item $id"
+  printf 'closed: %s\n' "$id"
+}
+
 # --- guard: the structural retention-loss backstop --------------------------
 # Owns the invariant that no captain decision hold may be Done while its body still
 # reads the "State: awaiting captain decision." sentinel, i.e. while it was closed
@@ -607,6 +651,7 @@ case "${1:-}" in
   complete) shift; command_complete "$@" ;;
   verify) shift; command_verify "$@" ;;
   resolve) shift; command_resolve "$@" ;;
+  close) shift; command_close "$@" ;;
   guard) shift; command_guard "$@" ;;
   -h|--help) usage ;;
   *) usage >&2; exit 2 ;;
