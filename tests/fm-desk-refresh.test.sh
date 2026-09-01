@@ -194,10 +194,13 @@ SH
   yesterday=$(date -d "@$(( ${FAKE_EPOCH:-1785225600} - 86400 ))" '+%Y-%m-%d' 2>/dev/null || date '+%Y-%m-%d')
   if [ "${FAKE_NO_COMPLETIONS:-0}" != 1 ]; then
     mkdir -p "$home/data"
+    # Mixed formats on purpose: done-a is a legacy bare-date row, done-b carries a
+    # full ISO-8601 timestamp (the 2026-09-onward format). Both must window on the
+    # calendar day, so the progress/stats readers must tolerate both.
     {
       printf '# ledger\n'
       printf 'done-a\t%s\tship\thyfin\tabc123\n' "$today"
-      printf 'done-b\t%s\tship\tfirstmate\tdef456\n' "$today"
+      printf 'done-b\t%sT08:15:00Z\tship\tfirstmate\tdef456\n' "$today"
       printf 'done-c\t%s\tscout\thyfin-server\t\n' "$yesterday"
     } > "$home/data/completions.tsv"
   fi

@@ -310,9 +310,39 @@ test_fail_closed() {
   pass "invalid arguments and an absent completion ledger fail closed (non-zero)"
 }
 
+# --- dual-format close field: mixed legacy date-only + new timestamped rows ---
+
+test_dual_format_close_field_windows_by_day() {
+  # A completions ledger holding BOTH a legacy bare-date row and a new
+  # full-timestamp row must window each on its calendar day. Build a temp data
+  # dir with an empty token ledger (no session rows needed: the assertion is on
+  # window inclusion by close DAY, not on cost).
+  local data out
+  data=$(fm_test_tmproot ticket-cost-rollup-dual)
+  mkdir -p "$data"
+  {
+    printf '# firstmate completion ledger\n'
+    printf 'tk-old\t2026-08-13\tship\talpha\tsha-old\n'
+    printf 'tk-new\t2026-08-13T01:35:29Z\tship\talpha\tsha-new\n'
+    printf 'tk-out\t2026-08-20T23:59:59Z\tship\talpha\tsha-out\n'
+  } > "$data/completions.tsv"
+  : > "$data/token-sessions.tsv"
+  out=$(JCODE_SESSIONS_DIR="$STORE" FM_TOKEN_PRICES="$PRICE" FM_DATA_OVERRIDE="$data" \
+    "$CLI" --since 2026-08-13 --until 2026-08-14 2>&1) \
+    || fail "rollup failed on a mixed-format ledger: $out"
+  assert_contains "$out" "ticket tk-old" "legacy bare-date row must be in the day window: $out"
+  assert_contains "$out" "ticket tk-new" "new timestamped row must window on its day: $out"
+  assert_not_contains "$out" "tk-out" "an out-of-window timestamped row must not leak: $out"
+  # The new row displays its full timestamp verbatim; the legacy row stays bare.
+  assert_contains "$out" "closed=2026-08-13T01:35:29Z" "new row must display its full timestamp: $out"
+  assert_contains "$out" "closed=2026-08-13  " "legacy row must display its bare date: $out"
+  pass "the rollup windows a mixed legacy-and-timestamped ledger by calendar day"
+}
+
 test_multi_session_sums_exactly
 test_covered_vs_billed_split
 test_window_bounds_close_date
+test_dual_format_close_field_windows_by_day
 test_reship_last_row_wins
 test_unpriced_model_withholds_dollars
 test_pre_capture_ticket_no_ledger

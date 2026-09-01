@@ -96,9 +96,12 @@ fm_doclint_commit_date() {  # <project-dir> <sha>
 }
 
 # Count landed ship lanes for <repo> in a completions.tsv, counting only entries
-# whose closed-date is strictly AFTER <since-date>. An empty <since-date> means
+# whose closed DAY is strictly AFTER <since-date>. An empty <since-date> means
 # "no last pass", so every ship lane for the repo counts. Reads the append-only
-# ledger format owned by bin/fm-completions-lib.sh: <id>\t<date>\t<kind>\t<repo>\t<sha>.
+# ledger format owned by bin/fm-completions-lib.sh: <id>\t<close>\t<kind>\t<repo>\t<sha>.
+# The close field is either a bare date (legacy rows) or a full ISO-8601 timestamp
+# (rows from 2026-09 on); both begin with the 10-char date, so substr($2,1,10)
+# normalizes either to its day before the whole-date comparison.
 fm_doclint_count_since() {  # <completions-file> <repo> <since-date>
   local file=$1 repo=$2 since=$3
   [ -f "$file" ] || { printf '0'; return 0; }
@@ -107,14 +110,16 @@ fm_doclint_count_since() {  # <completions-file> <repo> <since-date>
     NF < 4 { next }
     $3 != "ship" { next }
     $4 != repo { next }
-    since != "" && $2 <= since { next }
+    { day = substr($2, 1, 10) }
+    since != "" && day <= since { next }
     { n++ }
     END { printf "%d", n + 0 }
   ' "$file"
 }
 
-# The oldest ship-lane date for <repo> in the ledger, or nothing. Used only when
+# The oldest ship-lane DAY for <repo> in the ledger, or nothing. Used only when
 # no marker exists yet, to age the drift clock from the first un-doc/lint-ed lane.
+# The close field is normalized to its day (see fm_doclint_count_since).
 fm_doclint_oldest_ship_date() {  # <completions-file> <repo>
   local file=$1 repo=$2
   [ -f "$file" ] || return 0
@@ -123,7 +128,7 @@ fm_doclint_oldest_ship_date() {  # <completions-file> <repo>
     NF < 4 { next }
     $3 != "ship" { next }
     $4 != repo { next }
-    { if (oldest == "" || $2 < oldest) oldest = $2 }
+    { day = substr($2, 1, 10); if (oldest == "" || day < oldest) oldest = day }
     END { if (oldest != "") print oldest }
   ' "$file"
 }

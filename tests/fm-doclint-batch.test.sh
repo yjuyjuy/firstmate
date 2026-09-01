@@ -126,6 +126,31 @@ test_no_marker_counts_all_ship_lanes() {
   pass "no marker yet counts every ship lane for the repo"
 }
 
+test_dual_format_close_field_windows_by_day() {
+  # A mixed ledger: legacy bare-date rows AND new full-timestamp rows. Both must
+  # window on their calendar day against a bare-date marker/since bound.
+  local comp="$TMP_ROOT/mixed/completions.tsv"
+  mkdir -p "$TMP_ROOT/mixed"
+  local since y
+  since=$(days_ago 3)
+  y=$(days_ago 1)
+  write_completions "$comp" \
+    "$(printf 'old-in\t%s\tship\talpha\ts1' "$y")" \
+    "$(printf 'new-in\t%sT01:35:29Z\tship\talpha\ts2' "$y")" \
+    "$(printf 'old-out\t%s\tship\talpha\ts3' "$since")" \
+    "$(printf 'new-out\t%sT23:59:59Z\tship\talpha\ts4' "$since")"
+  # since is exclusive (day <= since is dropped): the two <y> rows count, the two
+  # <since>-day rows (bare and timestamped) are both excluded.
+  local n
+  n=$(fm_doclint_count_since "$comp" alpha "$since")
+  [ "$n" = 2 ] || fail "mixed-format count since marker wrong: expected 2, got $n"
+  # oldest ship day must be the <since> day, taken from EITHER format's day.
+  local oldest
+  oldest=$(fm_doclint_oldest_ship_date "$comp" alpha)
+  [ "$oldest" = "$since" ] || fail "mixed-format oldest ship day wrong: $oldest"
+  pass "doclint counts/ages a mixed legacy-and-timestamped ledger by calendar day"
+}
+
 test_status_line_shape() {
   local repo="$TMP_ROOT/shape/proj" comp="$TMP_ROOT/shape/completions.tsv"
   new_repo "$repo"
@@ -264,6 +289,7 @@ test_threshold_fires_on_lane_count
 test_threshold_fires_on_time_ceiling
 test_threshold_quiet_on_fresh_small_batch
 test_no_marker_counts_all_ship_lanes
+test_dual_format_close_field_windows_by_day
 test_status_line_shape
 test_brief_emits_two_phase_pr_delivery
 test_marker_advance_fast_forward_only

@@ -50,9 +50,12 @@
 #     tokens withheld, never guessed.
 #
 # Window: --since / --until bound the ticket close date, since INCLUSIVE and
-# until EXCLUSIVE, both whole ISO-8601 dates (YYYY-MM-DD). completions.tsv stores
-# a UTC calendar date, so the comparison is a pure ISO date-string compare - no
-# timezone reinterpretation of a date the ledger already fixed. Omit both for all
+# until EXCLUSIVE, both whole ISO-8601 dates (YYYY-MM-DD). completions.tsv's
+# close field is either a bare UTC date (legacy rows) or a full UTC timestamp
+# (rows from 2026-09 on); both begin with the 10-char date, so the comparison
+# normalizes the field to its calendar day first (close_day) - a pure ISO
+# date-string compare, no timezone reinterpretation of a day the ledger already
+# fixed. Omit both for all
 # landed tickets. When a ticket has several completion rows (a re-ship), the LAST
 # row wins for both the window test and the displayed close date, matching the
 # rest of the completion machinery (fm-token-report.sh --retro, the dispatch
@@ -180,12 +183,21 @@ until = os.environ.get("FM_TCR_UNTIL", "").strip()
 repo_filter = os.environ.get("FM_TCR_REPO", "").strip()
 
 
+def close_day(value):
+    # The completions close field is either a bare date (legacy rows) or a full
+    # ISO-8601 timestamp (rows from 2026-09 on); both begin with the 10-char
+    # date, so the leading 10 chars are the calendar day in either format.
+    return value[:10]
+
+
 def in_window(close_date):
     # ISO calendar dates compare correctly as strings; since inclusive, until
-    # exclusive. An empty bound is open on that side.
-    if since and close_date < since:
+    # exclusive. An empty bound is open on that side. Normalize to the day first
+    # so a full-timestamp close field windows on its calendar day.
+    day = close_day(close_date)
+    if since and day < since:
         return False
-    if until and close_date >= until:
+    if until and day >= until:
         return False
     return True
 

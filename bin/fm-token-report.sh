@@ -126,10 +126,12 @@
 #   --by-tier (e.g. --period 7d --by week --by-tier = weekly cost per spend tier).
 #
 # --retro details (D4): the ticket must have NO ledger rows (pre-capture) and a
-#   completion record in data/completions.tsv. The completion's close date ends
-#   a coarse 7-day window (close date and the six days before it, whole days
-#   UTC); every session whose created_at falls in that window is attributed to
-#   the ticket HEURISTICALLY. The number is an estimate: the label ESTIMATE is
+#   completion record in data/completions.tsv. The completion's close field (a
+#   bare date on legacy rows, a full UTC timestamp on rows from 2026-09 on; its
+#   leading 10 chars are the calendar day either way) ends a coarse 7-day window
+#   (close day and the six days before it, whole days UTC); every session whose
+#   created_at falls in that window is attributed to the ticket HEURISTICALLY.
+#   The number is an estimate: the label ESTIMATE is
 #   always printed and --json carries estimate=true. --retro refuses to run on a
 #   ticket that has exact ledger data, because the exact path already covers it.
 #
@@ -1077,6 +1079,10 @@ do_retro() {
     || die "no completion record for '$TASK_ID'; --retro cannot bound a date window" 1
   close_date=$(printf '%s\n' "$comps" | tail -n 1 | cut -f2)
   [ -n "$close_date" ] || die "completion record for '$TASK_ID' has no close date" 1
+  # The close field is a bare date (legacy rows) or a full ISO-8601 timestamp
+  # (rows from 2026-09 on); both begin with the 10-char date, so take the leading
+  # day for the date-window math below.
+  close_date=${close_date:0:10}
   start_date=$(python3 -c "import datetime,sys; d=datetime.date(*[int(x) for x in sys.argv[1].split('-')]) - datetime.timedelta(days=6); print(d.isoformat())" "$close_date")
   period_spec="$start_date..$close_date"
 

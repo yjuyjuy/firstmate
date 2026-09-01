@@ -1913,8 +1913,11 @@ desk_progress_window() {  # <heading> <intro> <start-yyyy-mm-dd>
     desk_section_gap "The completion record could not be read, so this progress window is unknown right now."
     return 0
   fi
-  # Data lines: <id>\t<date>\t<kind>\t<repo>\t<sha>. Filter date >= start.
-  rows=$(awk -F'\t' -v s="$start" '/^#/ {next} NF>=4 && $2 >= s {print}' "$COMPLETIONS" 2>/dev/null)
+  # Data lines: <id>\t<close>\t<kind>\t<repo>\t<sha>. The close field is either a
+  # bare date (legacy rows) or a full ISO-8601 timestamp (rows from 2026-09 on);
+  # both begin with the 10-char date, so substr($2,1,10) is the day either way.
+  # Keep rows whose day >= start.
+  rows=$(awk -F'\t' -v s="$start" '/^#/ {next} NF>=4 && substr($2,1,10) >= s {print}' "$COMPLETIONS" 2>/dev/null)
   total=$(printf '%s\n' "$rows" | awk 'NF{n++} END{print n+0}')
   if [ "$total" -eq 0 ]; then
     echo '    <p class="text-sm opacity-60">Nothing has landed in this window.</p>'
@@ -2076,8 +2079,10 @@ render_stats() {
   if [ -f "$COMPLETIONS" ]; then
     local today total per
     today=$(date -d "@$NOW_EPOCH" '+%Y-%m-%d' 2>/dev/null || date '+%Y-%m-%d')
-    total=$(awk -F'\t' -v s="$today" '/^#/ {next} NF>=4 && $2 >= s {n++} END{print n+0}' "$COMPLETIONS")
-    per=$(awk -F'\t' -v s="$today" '/^#/ {next} NF>=4 && $2 >= s {c[$4]++} END{for(r in c) print r" ("c[r]")"}' "$COMPLETIONS" | sort | tr '\n' ' ')
+    # substr($2,1,10) normalizes the close field (bare date or full timestamp) to
+    # its day, so both ledger formats window on the calendar day.
+    total=$(awk -F'\t' -v s="$today" '/^#/ {next} NF>=4 && substr($2,1,10) >= s {n++} END{print n+0}' "$COMPLETIONS")
+    per=$(awk -F'\t' -v s="$today" '/^#/ {next} NF>=4 && substr($2,1,10) >= s {c[$4]++} END{for(r in c) print r" ("c[r]")"}' "$COMPLETIONS" | sort | tr '\n' ' ')
     printf '      <div class="card bg-base-200/60"><div class="card-body py-4 gap-1"><h3 class="font-medium text-sm">Landed today</h3><p class="text-2xl font-semibold">%s</p><p class="text-xs opacity-60">%s</p></div></div>\n' \
       "$total" "$(desk_esc <<<"${per:-none}")"
   else

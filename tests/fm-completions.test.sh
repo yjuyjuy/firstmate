@@ -197,6 +197,14 @@ EOF
     "task-td	"*"	ship	proj	$head") : ;;
     *) fail "teardown ledger line wrong: $line" ;;
   esac
+  # The close field must be a full ISO-8601 UTC timestamp (2026-09 format), not a
+  # bare date: teardown now stamps the hour, not just the day.
+  local close_field
+  close_field=$(printf '%s' "$line" | cut -f2)
+  case "$close_field" in
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z) : ;;
+    *) fail "teardown close field is not a full UTC timestamp: $close_field" ;;
+  esac
   pass "teardown appends one correct ledger line with the landing sha"
 }
 
@@ -263,6 +271,70 @@ test_lookup_returns_all_matches() {
   pass "lookup returns every matching completion line"
 }
 
+# --- full-timestamp close field (2026-09 onward) + backward compatibility ---
+
+test_day_helper_normalizes_both_formats() {
+  [ "$(fm_completions_day 2026-08-06)" = 2026-08-06 ] \
+    || fail "bare date not normalized to its day"
+  [ "$(fm_completions_day 2026-08-06T01:35:29Z)" = 2026-08-06 ] \
+    || fail "full timestamp not normalized to its day"
+  pass "fm_completions_day returns the calendar day for a bare date and a full timestamp"
+}
+
+test_timestamp_close_field_stored_verbatim() {
+  local data="$TMP_ROOT/ts/data" file line
+  mkdir -p "$data"
+  fm_completions_record "$data" task-ts 2026-09-01T01:35:29Z ship firstmate sha-ts \
+    || fail "record with full timestamp failed"
+  file=$(fm_completions_file "$data")
+  line=$(grep -vE '^[[:space:]]*(#|$)' "$file")
+  [ "$line" = "$(printf 'task-ts\t2026-09-01T01:35:29Z\tship\tfirstmate\tsha-ts')" ] \
+    || fail "full timestamp not stored verbatim: $line"
+  pass "a full-timestamp close field is stored verbatim on the new row"
+}
+
+test_idempotent_same_day_different_timestamp() {
+  # A retried teardown stamps a fresh timestamp seconds later on the same day; the
+  # dedup compares the DAY, so the second call must still no-op.
+  local data="$TMP_ROOT/ts-idem/data" file
+  mkdir -p "$data"
+  fm_completions_record "$data" task-r 2026-09-01T01:35:29Z ship firstmate sha-r \
+    || fail "first record failed"
+  fm_completions_record "$data" task-r 2026-09-01T01:35:47Z ship firstmate sha-r \
+    || fail "same-day retry returned non-zero"
+  file=$(fm_completions_file "$data")
+  [ "$(entry_count "$file")" = 1 ] || fail "same-day retried teardown double-appended"
+  pass "a same-day retried teardown with a fresh timestamp still no-ops"
+}
+
+test_distinct_day_timestamp_appends() {
+  # A genuinely later completion (next day) must still append, even timestamped.
+  local data="$TMP_ROOT/ts-next/data" file
+  mkdir -p "$data"
+  fm_completions_record "$data" task-n 2026-09-01T23:59:00Z ship firstmate sha-1
+  fm_completions_record "$data" task-n 2026-09-02T00:01:00Z ship firstmate sha-2
+  file=$(fm_completions_file "$data")
+  [ "$(entry_count "$file")" = 2 ] || fail "distinct-day later completion was suppressed"
+  pass "a distinct-day later completion still appends with timestamps"
+}
+
+test_mixed_format_ledger_lookup() {
+  # A ledger holding BOTH legacy date-only rows and new timestamped rows for one
+  # id returns every matching line verbatim, unaffected by the field format.
+  local data="$TMP_ROOT/ts-mixed/data" file out count
+  mkdir -p "$data"
+  file=$(fm_completions_file "$data")
+  {
+    printf '# firstmate completion ledger\n'
+    printf 'task-mix\t2026-08-06\tship\tproj\told-sha\n'
+    printf 'task-mix\t2026-09-01T01:35:29Z\tship\tproj\tnew-sha\n'
+  } > "$file"
+  out=$(fm_completions_lookup "$data" task-mix) || fail "lookup failed on mixed-format ledger"
+  count=$(printf '%s\n' "$out" | grep -c '^task-mix	')
+  [ "$count" = 2 ] || fail "mixed-format lookup returned $count matches, expected 2"
+  pass "lookup reads a mixed legacy-and-timestamped ledger without error"
+}
+
 test_ship_appends_one_line
 test_second_completion_appends_without_disturbing_first
 test_idempotent_no_double_append
@@ -275,3 +347,8 @@ test_lookup_miss_is_silent_and_fails
 test_lookup_absent_ledger_fails
 test_lookup_matches_first_field_only
 test_lookup_returns_all_matches
+test_day_helper_normalizes_both_formats
+test_timestamp_close_field_stored_verbatim
+test_idempotent_same_day_different_timestamp
+test_distinct_day_timestamp_appends
+test_mixed_format_ledger_lookup

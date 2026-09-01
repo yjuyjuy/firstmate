@@ -1765,7 +1765,7 @@ echo "teardown $ID complete (window $T, worktree $WT)"
 # this finished task. Captured LANDING_SHA (empty when unknown) and COMPLETION_REPO
 # were resolved above while the worktree still existed. The append is idempotent, so
 # a retried teardown never double-records. A failure here never fails the teardown.
-fm_completions_record "$DATA" "$ID" "$(date -u +%Y-%m-%d)" "$KIND" "$COMPLETION_REPO" "$LANDING_SHA" \
+fm_completions_record "$DATA" "$ID" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$KIND" "$COMPLETION_REPO" "$LANDING_SHA" \
   || echo "teardown: WARNING could not append $ID to the completion ledger" >&2
 backlog_refresh_reminder
 

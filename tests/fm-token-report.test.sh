@@ -457,6 +457,29 @@ print("ok")
   pass "--retro produces a coarse date-window estimate, always labeled ESTIMATE, never claiming exactness"
 }
 
+test_retro_dual_format_close_field() {
+  # BACKWARD COMPATIBILITY: --retro reads the completions close field to bound its
+  # 7-day window. A new-format row carries a full timestamp; --retro must window
+  # on its calendar DAY, producing the same bound a bare date would. Reuse the
+  # retro session store; only the close field format changes vs test above.
+  local data out
+  data=$(fm_test_tmproot fm-token-report-retro-ts)
+  mkdir -p "$data"
+  cp "$FIXDATA/token-sessions.tsv" "$data/token-sessions.tsv"
+  {
+    printf '# ledger\n'
+    printf 'ticket-retro\t2026-08-13T14:22:00Z\tship\tfirstmate\tabc123\n'
+  } > "$data/completions.tsv"
+  out=$(JCODE_SESSIONS_DIR="$FIXRETRO" FM_TOKEN_PRICES="$PRICE" FM_DATA_OVERRIDE="$data" \
+    "$CLI" ticket-retro --retro 2>&1) || fail "retro failed on a timestamped close field: $out"
+  # Window bound must be the DAY, not the full timestamp: 2026-08-07..2026-08-13.
+  assert_contains "$out" "2026-08-07..2026-08-13" "timestamped close must window on its day: $out"
+  assert_contains "$out" "sessions=1" "retro must count the in-window session: $out"
+  assert_contains "$out" "\$2.50" "retro must sum the in-window \$2.50: $out"
+  assert_not_contains "$out" "\$45.00" "out-of-window session leaked: $out"
+  pass "--retro windows a full-timestamp close field on its calendar day (dual-format)"
+}
+
 test_retro_refuses_exact_ledger_ticket() {
   # A ticket that HAS exact ledger data must not be run through the coarse
   # estimate path: --retro fails closed and says to drop it.
@@ -614,6 +637,7 @@ test_ticket_rollup_sums_every_ledger_session
 test_ticket_missing_ledger_prompts_retro
 test_by_ticket_buckets_unattributed
 test_retro_labeled_estimate
+test_retro_dual_format_close_field
 test_retro_refuses_exact_ledger_ticket
 test_ticket_arg_guards
 test_by_tier_groups_spend_and_tickets
