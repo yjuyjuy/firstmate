@@ -633,10 +633,21 @@ def window_ticket(working_dir, created):
     An orphan session that ran in a worktree the ledger knows belongs to the
     task whose spawn window covers its creation instant. This is positional,
     not keyed, so it is never presented as exact.
+
+    An agent may run from a SUBDIRECTORY of its leased worktree (a crate dir,
+    say), so the nearest ledgered ancestor of the session's working_dir owns the
+    lane; the nearest one wins, so a nested lease never loses to its parent.
     """
     if not working_dir or created is None:
         return None
-    for start_ep, end_ep, task in wd_windows.get(working_dir, ()):
+    candidate = None
+    for wd in wd_windows:
+        if working_dir == wd or working_dir.startswith(wd + os.sep):
+            if candidate is None or len(wd) > len(candidate):
+                candidate = wd
+    if candidate is None:
+        return None
+    for start_ep, end_ep, task in wd_windows[candidate]:
         if created < start_ep:
             continue
         if end_ep is not None and created >= end_ep:

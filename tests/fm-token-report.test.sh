@@ -695,6 +695,9 @@ PY
   write_attr_session sw3 "$root/wt/slot3" "2026-08-22T07:00:00.000Z" 1000000
   # Ad-hoc work in a primary checkout no join knows: stays unattributed.
   write_attr_session adhoc "$root/plain-checkout" "2026-08-22T08:00:00.000Z" 1000000
+  # An orphan running from a SUBDIRECTORY of the ledgered worktree (an agent
+  # started in a crate dir): the nearest ledgered ancestor owns the lane.
+  write_attr_session swsub "$root/wt/slot3/crates/app-core" "2026-08-22T03:20:00.000Z" 1000000
 
   # Local ledger: the coordinator's own row (exact) plus the two spawn instants
   # that bound the window fallback in /wt/slot3.
@@ -745,8 +748,9 @@ test_attribution_joins_map_and_label() {
     "secondmate join must read the sibling home's ledger exactly: $out"
   # 3. spawn-window fallback: two orphans inside [03:11:35, 06:47:02) attribute
   #    to window-task and MUST be labeled ESTIMATE, never exact (D4).
-  assert_contains "$out" "ticket=window-task  sessions=2  cost_if_api \$10.00  covered \$0.00 / api \$10.00  [ESTIMATE]" \
-    "window fallback must attribute both orphans and label ESTIMATE: $out"
+  # sw1, sw2, and the subdirectory orphan swsub all land on window-task.
+  assert_contains "$out" "ticket=window-task  sessions=3  cost_if_api \$15.00  covered \$0.00 / api \$15.00  [ESTIMATE]" \
+    "window fallback must attribute every in-window orphan and label ESTIMATE: $out"
   printf '%s\n' "$out" | grep -F 'ticket=window-task' | grep -qF '[exact]' \
     && fail "the coarse window join must NEVER be labeled exact: $out"
   assert_contains "$out" "NOT an exact per-ticket cost (D4)" \
@@ -780,7 +784,7 @@ assert rows["sibling-task"]["attribution_sources"] == ["secondmate"], rows["sibl
 assert rows["window-task"]["attribution"] == "ESTIMATE", rows["window-task"]
 assert rows["window-task"]["attribution_sources"] == ["window"], rows["window-task"]
 assert rows["window-task"]["cost_if_api_estimate"] is True, rows["window-task"]
-assert rows["window-task"]["sessions"] == 2, rows["window-task"]
+assert rows["window-task"]["sessions"] == 3, rows["window-task"]
 # The unattributed bucket is a bucket, not a ticket: no attribution label.
 assert rows["unattributed"]["attribution"] is None, rows["unattributed"]
 print("ok")
@@ -811,7 +815,7 @@ test_attribution_absent_sources_are_silent() {
   rm -f "$ATTR_NM_HOME/state.sqlite" "$ATTR_DATA/secondmates.md" "$ATTR_DATA/token-sessions.tsv"
   local out
   out=$(run_attr --period all --by-ticket) || fail "report must survive absent join sources: $out"
-  assert_contains "$out" "ticket=unattributed  sessions=8" \
+  assert_contains "$out" "ticket=unattributed  sessions=9" \
     "with no join source every session stays unattributed: $out"
   assert_not_contains "$out" "ESTIMATE" "no window data means no ESTIMATE row: $out"
   pass "absent join sources are silent: the report still runs and nothing is force-fit"
