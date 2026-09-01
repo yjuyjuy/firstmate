@@ -645,7 +645,7 @@ A run in flight on a DIFFERENT branch is not a refusal: no-mistakes serializes p
 Drive YOUR run by its id. \`no-mistakes axi run\` reports the run it started; from then on read it with \`no-mistakes axi status --run <id>\` and \`no-mistakes axi logs --run <id> --step <step>\`.
 A bare \`axi status\` resolves repo-wide whenever your branch has no run of its own, so it can hand you a concurrent lane run as if it were yours.
 
-ALWAYS pass \`--intent "{one-line description of what this change does}"\` when you invoke \`no-mistakes axi run\`, on EVERY run. It is required, never optional: without it the pipeline spends an extra model call deriving the intent itself, wasting tokens and latency on every run. Write the intent yourself from the Task above.
+ALWAYS pass \`--intent "{one-line description of what this change does}"\` when you invoke \`no-mistakes axi run\`, on EVERY run. Required, never optional: without it the pipeline spends an extra model call deriving the intent itself, wasting tokens and latency on every run. Write the intent yourself from the Task above.
 
 You drive no-mistakes by responding to its gates, not by implementing fixes.
 Follow the guidance no-mistakes itself provides for the mechanics: it loads when you invoke /no-mistakes, and \`no-mistakes axi run --help\` plus the \`help\` lines in each \`axi\` response are authoritative and version-matched to the installed binary.
@@ -726,8 +726,8 @@ $RULE1
    Use \`$PAUSED_VERB: {why}\` (distinct from \`blocked:\`) ONLY when deliberately idling on a known external wait that self-clears;
    use \`blocked:\` when stuck. An auth session-limit, usage-window/quota exhaustion, or revoked/expired token is
    captain-fixable, so report it \`blocked:\`, NEVER \`$PAUSED_VERB:\`.
-5. If you hit the same obstacle twice, append \`blocked: {why}\` and stop.
-6. If a decision belongs to a human (product choices, destructive actions, ask-user findings), append
+5. Same obstacle twice? append \`blocked: {why}\` and stop.
+6. Decision belongs to a human (product choices, destructive actions, ask-user findings)? append
    \`needs-decision: {options}\` and stop. On reply or a blocker clears, append \`resolved: {how}\`
    (same \`[key=<slug>]\` if you opened with one).
 7. Never stop, restart, or update the shared \`no-mistakes\` daemon. On ANY daemon error, append
@@ -749,10 +749,10 @@ $RTK_SECTION
 $CAPTAIN_RULES
 
 # Project memory
-If \`AGENTS.md\` or \`CLAUDE.md\` already exists, or if this task produced durable project-intrinsic knowledge, run \`$FM_ROOT/bin/fm-ensure-agents-md.sh .\` in the worktree.
+\`AGENTS.md\` or \`CLAUDE.md\` already exists, or this task produced durable project-intrinsic knowledge? Run \`$FM_ROOT/bin/fm-ensure-agents-md.sh .\` in the worktree.
 Record only project knowledge useful to almost every future session.
 For anything the codebase already shows, prefer a pointer to the authoritative file, command, or doc over copying the detail.
-If you touch a project \`AGENTS.md\` that lacks \`## Maintaining this file\`, add that short self-governance section from \`$FM_ROOT/bin/fm-ensure-agents-md.sh\` in the same pass.
+Touch a project \`AGENTS.md\` that lacks \`## Maintaining this file\`, add that short self-governance section from \`$FM_ROOT/bin/fm-ensure-agents-md.sh\` in the same pass.
 Keep it proportionate: skip \`AGENTS.md\` edits for trivial tasks that produced no durable project knowledge.
 
 # Test coverage declaration

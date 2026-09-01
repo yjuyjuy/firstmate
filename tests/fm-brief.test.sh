@@ -958,6 +958,39 @@ test_ship_and_scout_briefs_bind_the_standing_captain_rules() {
   pass "fm-brief.sh: ship and scout briefs bind the standing captain rules structurally"
 }
 
+# Constraint-keyword guard against over-compression: each captain rule carries a
+# concrete constraint that a future prose trim must not silently drop. These pin
+# the exact constraint token per rule (not just its label), so a compression that
+# weakens a rule fails here even if the label survives. Ticket: token-t1-brief-boilerplate-trim.
+test_ship_and_scout_briefs_keep_each_captain_rule_constraint() {
+  local home brief kind
+  home="$TMP_ROOT/captain-rules-constraint-home"
+  mkdir -p "$home/data"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" brief-cc-ship some-proj >/dev/null 2>&1 \
+    || fail "fm-brief.sh ship scaffold exited non-zero"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" brief-cc-scout some-proj --scout >/dev/null 2>&1 \
+    || fail "fm-brief.sh scout scaffold exited non-zero"
+  for kind in ship scout; do
+    brief="$home/data/brief-cc-$kind/brief.md"
+    # C1: deleting a branch is the captain's call alone, and the guarded tooling exception.
+    assert_grep "the captain decision alone" "$brief" \
+      "$kind C1 must keep branch deletion as the captain decision alone"
+    # shellcheck disable=SC2016 # Literal backticks must remain unexpanded.
+    assert_grep '`bin/fm-teardown.sh`' "$brief" \
+      "$kind C1 must keep the guarded fm-teardown.sh tooling exception"
+    # shellcheck disable=SC2016 # Literal backticks must remain unexpanded.
+    assert_grep '`bin/fm-fleet-sync.sh`' "$brief" \
+      "$kind C1 must keep the guarded fm-fleet-sync.sh tooling exception"
+    # C4: the verbatim-evidence carve-out inside a compressed report.
+    assert_grep "stay VERBATIM" "$brief" \
+      "$kind C4 must keep report evidence verbatim inside a compressed report"
+    # C5: the two reserved ports, byte-for-byte.
+    assert_grep "443" "$brief" "$kind C5 must keep reserved port 443"
+    assert_grep "3000" "$brief" "$kind C5 must keep reserved port 3000"
+  done
+  pass "fm-brief.sh: ship and scout briefs keep each captain rule's concrete constraint"
+}
+
 # A secondmate supervises rather than implements, so it carries the subset that
 # genuinely applies to its own conduct; its crewmates get the full set from their
 # own generated briefs.
@@ -1044,6 +1077,7 @@ test_captain_rules_preserve_existing_brief_contracts() {
 test_script_parses
 test_help_includes_entire_header
 test_ship_and_scout_briefs_bind_the_standing_captain_rules
+test_ship_and_scout_briefs_keep_each_captain_rule_constraint
 test_secondmate_charter_binds_the_applicable_captain_rules
 test_captain_rules_preserve_existing_brief_contracts
 test_ship_modes_generate_clean_briefs

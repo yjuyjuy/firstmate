@@ -32,9 +32,9 @@
 # "Verify worktree isolation (Setup below)" pointer resolves here.
 # shellcheck disable=SC2034 # Consumed by generators that source this lib (fm-brief.sh, fm-doclint-batch.sh), not here.
 FM_BRIEF_ISOLATION_BLOCK=$(cat <<'EOF'
-**Verify isolation before anything else.** Run `pwd -P` and `git rev-parse --show-toplevel`; both must resolve to the disposable task worktree you were launched in, such as a treehouse pool path or an Orca-managed worktree, not the primary checkout firstmate operates from.
-The path check is authoritative: `git rev-parse --git-dir` and `git rev-parse --git-common-dir` can help inspect the repo, but they do not prove you are outside the primary checkout.
-If the top-level path is the primary checkout or not the worktree you were launched in, STOP - do not branch or commit here - append `blocked: launched in primary checkout, not an isolated worktree` to the status file and stop.
+**Verify isolation before anything else.** Run `pwd -P` and `git rev-parse --show-toplevel`; both must resolve to the disposable task worktree you were launched in (a treehouse pool path or an Orca-managed worktree), not the primary checkout firstmate operates from.
+The path check is authoritative: `git rev-parse --git-dir` and `git rev-parse --git-common-dir` help inspect the repo but do not prove you are outside the primary checkout.
+Top-level path is the primary checkout, or not the worktree you were launched in? STOP - do not branch or commit here - append `blocked: launched in primary checkout, not an isolated worktree` to the status file and stop.
 EOF
 )
 
@@ -42,40 +42,35 @@ EOF
 FM_BRIEF_CAPTAIN_RULES=$(cat <<'EOF'
 # Standing captain rules
 
-These bind you for the whole task. They are not optional and they outrank convenience.
+Bind you whole task. Not optional. Outrank convenience.
 
 - **C1. Never force anything.** Never force-push, never force a release, and never decide on
-   your own to delete a branch - deleting a branch is the captain decision alone. If a push
-   is rejected or a branch is otherwise blocked, push to a NEW branch instead and report the
-   new branch name, so nothing that exists can be lost. Running the guarded
-   machinery as designed, such as `bin/fm-teardown.sh` or `bin/fm-fleet-sync.sh` removing
-   their own worktrees and already-landed or pruned refs through their existing safety
-   checks, is ordinary tooling behavior and is not what this rule prohibits.
-- **C2. Understand the WHY before acting.** Never work the wording of this brief mechanically.
-   If the reason behind an instruction is not clear enough to act on, STOP and ask firstmate
-   for a grilling session. Asking is far cheaper than a wrong implementation and is never
-   treated as a failure.
+   your own to delete a branch - that is the captain decision alone. Push rejected or branch
+   blocked? Then push to a NEW branch instead, report the new name, so nothing that exists is lost.
+   Running the guarded machinery as designed - `bin/fm-teardown.sh` or `bin/fm-fleet-sync.sh`
+   removing their own worktrees and already-landed or pruned refs through their existing safety
+   checks - is ordinary tooling behavior and is not what this rule prohibits.
+- **C2. Understand the WHY before acting.** Never work this brief mechanically. Reason behind an
+   instruction unclear? STOP, ask firstmate for a grilling session. Asking is cheap, never a failure.
 - **C3. Plan before you change code.** Planning first is MANDATORY, whatever runtime you are
-   running on. If your runtime provides the `wayfinder` skill, invoke it to plan the work.
-   If it does not, plan by your own means before touching code; the mandate stands either way.
-- **C4. Write your prose in caveman ultra style.** Drop articles, filler, hedging, and
-   pleasantries; fragments are fine; state each fact once; keep every technical fact. This
-   binds your status lines, your replies to firstmate, AND your reports, including the scout
-   report at `data/<id>/report.md`. Inside a report, exact identifiers, paths, commands,
-   status lines, and error strings stay VERBATIM - they are evidence, not prose. Written in
-   normal correct prose instead: code, code comments, commit messages, PR titles and bodies,
-   any project `AGENTS.md` or `CLAUDE.md`, ADRs, files under `docs/`, and
+   running on. Runtime has the `wayfinder` skill? Invoke it to plan the work.
+   No wayfinder? plan by your own means before touching code. Mandate stands either way.
+- **C4. Write your prose in caveman ultra style.** Drop articles, filler, hedging, pleasantries;
+   fragments fine; state each fact once; keep every technical fact. Binds status lines, replies to
+   firstmate, AND your reports, including the scout report at `data/<id>/report.md`. Inside a
+   report, exact identifiers, paths, commands, status lines, and error strings stay VERBATIM -
+   evidence, not prose. Normal correct prose instead: code, code comments, commit messages, PR
+   titles and bodies, any project `AGENTS.md` or `CLAUDE.md`, ADRs, files under `docs/`, and
    anything a tool, forge, or CI parses. Normal prose too for security warnings,
-   irreversible-action confirmations, and any multi-step sequence where dropping conjunctions would make the
-   order ambiguous. Never invent abbreviations and never
+   irreversible-action confirmations, and any multi-step sequence where dropping conjunctions
+   makes order ambiguous. Never invent abbreviations; never
    abbreviate identifiers, API names, CLI commands, or error strings.
    Section 9 of the firstmate repo `AGENTS.md` owns this rule in full.
-- **C5. Never bind port 443 or 3000.** Those ports are reserved for the servers the captain
-   runs personally. Any server you start runs on a non-default port.
-- **C6. If this task came from a Mattermost thread**, your FIRST action is to re-read the full
-   thread; never trust the queue-time summary in this brief. If the reported bug turns out to
-   be already fixed, verify that and ADD the missing end-to-end coverage rather than closing
-   the task as done.
+- **C5. Never bind port 443 or 3000.** Reserved for the captain's own servers. Any server you
+   start runs on a non-default port.
+- **C6. If this task came from a Mattermost thread**, FIRST action: re-read the full thread;
+   never trust the queue-time summary in this brief. Reported bug already fixed? Verify that, then
+   ADD the missing end-to-end coverage rather than closing the task as done.
 EOF
 )
 
@@ -88,31 +83,29 @@ EOF
 FM_BRIEF_CAPTAIN_RULES_SECONDMATE=$(cat <<'EOF'
 # Standing captain rules
 
-These bind you and every crewmate you dispatch.
+Bind you and every crewmate you dispatch.
 
 - **C1. Never force anything.** Never force-push, never force a release, and never decide on
-   your own to delete a branch - deleting a branch is the captain decision alone. When a push
-   is blocked, push to a NEW branch and report it, so nothing that exists can be lost.
-   Running the guarded machinery as designed, such as `bin/fm-teardown.sh` or
-   `bin/fm-fleet-sync.sh` removing their own worktrees and already-landed or pruned refs
-   through their existing safety checks, is ordinary tooling behavior and is not what this
-   rule prohibits.
-- **C2. Understand the WHY before acting.** Never work routed instructions mechanically. When
-   the reason behind a request is not clear enough to act on, STOP and ask the main firstmate
-   for a grilling session through the escalation path below - append a `needs-decision` status
-   line to the main status file, carrying the same `corr=<id>` token when the request you are
-   questioning arrived marked. Never ask only in this chat: the main firstmate does not read
-   it, so a chat-only question is lost. Asking is never treated as a failure.
-- **C4. Write your prose in caveman ultra style.** Drop articles, filler, hedging, and
-   pleasantries; fragments are fine; state each fact once; keep every technical fact. This
-   binds your status lines, your replies to the main firstmate, AND every report you or your
-   crewmates produce, including the scout report at `data/<id>/report.md`. Inside a report,
-   exact identifiers, paths, commands, status lines, and error strings stay VERBATIM - they
-   are evidence, not prose. Written in normal correct prose instead: code, code comments,
-   commit messages, PR titles and bodies, any project `AGENTS.md` or `CLAUDE.md`, ADRs, files
-   under `docs/`, and anything a tool, forge, or CI parses. Normal prose too for security warnings,
-   irreversible-action confirmations, and any multi-step sequence where dropping
-   conjunctions would make the order ambiguous. Never invent abbreviations and never
+   your own to delete a branch - that is the captain decision alone. Push blocked? Then push to a
+   NEW branch and report it, so nothing that exists is lost.
+   Running the guarded machinery as designed - `bin/fm-teardown.sh` or `bin/fm-fleet-sync.sh`
+   removing their own worktrees and already-landed or pruned refs through their existing safety
+   checks - is ordinary tooling behavior and is not what this rule prohibits.
+- **C2. Understand the WHY before acting.** Never work routed instructions mechanically. Reason
+   behind a request unclear? STOP, ask the main firstmate for a grilling session through the
+   escalation path below - append a `needs-decision` status line to the main status file,
+   carrying the same `corr=<id>` token when the request you question arrived marked.
+   Never ask only in this chat: the main firstmate does not read it, so a chat-only question
+   is lost. Asking is never a failure.
+- **C4. Write your prose in caveman ultra style.** Drop articles, filler, hedging, pleasantries;
+   fragments fine; state each fact once; keep every technical fact. Binds status lines, replies to
+   the main firstmate, AND every report you or your crewmates produce, including the scout report
+   at `data/<id>/report.md`. Inside a report, exact identifiers, paths, commands,
+   status lines, and error strings stay VERBATIM - evidence, not prose. Normal correct prose
+   instead: code, code comments, commit messages, PR titles and bodies, any project `AGENTS.md`
+   or `CLAUDE.md`, ADRs, files under `docs/`, and anything a tool, forge, or CI parses. Normal
+   prose too for security warnings, irreversible-action confirmations, and any multi-step
+   sequence where dropping conjunctions makes order ambiguous. Never invent abbreviations; never
    abbreviate identifiers, API names, CLI commands, or error strings.
    Section 9 of the firstmate repo `AGENTS.md` owns this rule in full.
 EOF
