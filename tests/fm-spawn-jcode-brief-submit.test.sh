@@ -51,9 +51,13 @@ export FM_SPAWN_JCODE_VERIFY_SETTLE=0
 export FM_SPAWN_JCODE_VERIFY_TRIES=3
 
 # The real session resolver + store reader back the verify-before-brief gate, so
-# the one test that pins an explicit model needs a fake store to verify against.
+# the one test that pins an explicit model needs a fake store to verify against
+# and a fake jcode binary implementing the debug-socket set_model verb (model and
+# effort are pinned through that verb now, not typed slash commands).
 # shellcheck source=bin/fm-token-sessions-lib.sh
 . "$ROOT/bin/fm-token-sessions-lib.sh"
+# shellcheck source=bin/fm-jcode-profile-lib.sh
+. "$ROOT/bin/fm-jcode-profile-lib.sh"
 SESS_DIR="$TMP_ROOT/sessions"
 mkdir -p "$SESS_DIR"
 export JCODE_SESSIONS_DIR="$SESS_DIR"
@@ -68,6 +72,40 @@ write_store() {  # <model|-> <effort|->
 {"id":"session_probe","model":$model,"reasoning_effort":$effort,"working_dir":"$PROBE_WT","created_at":"$SPAWN_TS"}
 EOF
 }
+
+# A fake jcode binary implementing `debug -S <sid> set_model:{...}` against the
+# fake store, so the model/effort pin (fm_jcode_pin_and_verify) can verify. This
+# suite is about the BRIEF submit, so the pin always lands here.
+FAKE_JCODE="$TMP_ROOT/fake-jcode"
+cat > "$FAKE_JCODE" <<'FAKE'
+#!/usr/bin/env bash
+set -u
+sid=""; payload=""
+shift
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -S) sid=$2; shift 2 ;;
+    set_model:*) payload=${1#set_model:}; shift ;;
+    *) shift ;;
+  esac
+done
+sdir="${JCODE_SESSIONS_DIR:?}"
+model=$(printf '%s' "$payload" | sed -n 's/.*"model":"\([^"]*\)".*/\1/p')
+effort=$(printf '%s' "$payload" | sed -n 's/.*"effort":"\([^"]*\)".*/\1/p')
+[ -n "$model" ] || exit 1
+f="$sdir/$sid.json"
+[ -f "$f" ] || exit 1
+if [ -n "$effort" ]; then em="\"$effort\""; else em=null; fi
+wd=$(sed -n 's/.*"working_dir":"\([^"]*\)".*/\1/p' "$f")
+ca=$(sed -n 's/.*"created_at":"\([^"]*\)".*/\1/p' "$f")
+cat > "$f" <<EOF2
+{"id":"$sid","model":"$model","reasoning_effort":$em,"working_dir":"$wd","created_at":"$ca"}
+EOF2
+echo "{\"model\":\"$model\",\"effort\":\"$effort\"}"
+exit 0
+FAKE
+chmod +x "$FAKE_JCODE"
+export FM_JCODE_BIN="$FAKE_JCODE"
 
 # --- scriptable fake backend ------------------------------------------------
 #
@@ -155,24 +193,26 @@ has_call() {  # <substring>
 
 # --- tests ------------------------------------------------------------------
 
-test_brief_delivered_even_when_slash_verifies_pending() {
-  # THE REGRESSION: /model verifies `pending` (the slash-popup race). The brief
-  # must STILL be delivered once the store confirms the pin, and delivery must
-  # succeed. The store is pre-seeded with the requested model, so the pre-brief
-  # verify passes on the first read even though the slash submit itself reported
-  # pending - proving a pending verdict is not treated as fatal.
+test_brief_delivered_after_debug_socket_pin() {
+  # The model/effort pin now runs through the debug socket (fake jcode above),
+  # not a typed slash command, so there is no slash-popup "pending" verdict to
+  # abort on. Once the store confirms the pin, the brief must be delivered and
+  # delivery must succeed. The store is pre-seeded with the requested model so the
+  # pin verifies on the first read.
   reset_fake
   write_store claude-opus-4-8 -
-  # ready poll (composer_state) -> non-unknown so delivery proceeds; then the
-  # slash /model submit -> pending; then brief submit -> empty (clean).
+  # ready poll (composer_state) -> non-unknown so delivery proceeds; brief submit
+  # -> empty (clean). No slash submit for the model at all.
   set_composer_queue empty
-  set_submit_queue pending empty
+  set_submit_queue empty
   jcode_post_launch_delivery fakepane /tmp/brief.md claude-opus-4-8 default "" \
     "$PROBE_WT" "$SPAWN_TS" "$TMP_ROOT/pending.status" "$TMP_ROOT/pending.meta" \
-    || fail "delivery must succeed despite a pending slash-command verdict, got failure"
+    || fail "delivery must succeed after the debug-socket pin verifies, got failure"
   [ "$(count_brief_submits)" -ge 1 ] \
-    || fail "the brief must be submitted even when the slash command verified pending; calls: $(calls_joined)"
-  pass "a pending /model verdict no longer aborts delivery: the store confirms the pin and the brief is still submitted"
+    || fail "the brief must be submitted after the pin verifies; calls: $(calls_joined)"
+  ! has_call "submit:/model" \
+    || fail "the model must be pinned via the debug socket, never a typed /model; calls: $(calls_joined)"
+  pass "the model is pinned via the debug socket and the brief is submitted after the store confirms it"
 }
 
 test_brief_resubmitted_until_composer_clears() {
@@ -242,7 +282,7 @@ test_composer_never_ready_skips_delivery() {
   pass "no message is typed until the composer appears; a never-ready composer fails cleanly"
 }
 
-test_brief_delivered_even_when_slash_verifies_pending
+test_brief_delivered_after_debug_socket_pin
 test_brief_resubmitted_until_composer_clears
 test_brief_submit_failure_reported_when_never_clears
 test_unreadable_pane_is_lenient

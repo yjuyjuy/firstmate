@@ -137,11 +137,37 @@ wait_for_wrapped_text() {  # <text> <seconds>
   return 1
 }
 
-wait_for_text "Switched to model: $MODEL" 60 \
-  || fail "the resolved model was never applied to the session: $(capture | tail -20)"
-wait_for_text "Reasoning effort" 30 \
-  || fail "the resolved effort was never applied to the session: $(capture | tail -20)"
-pass "jcode_post_launch_delivery: the resolved model and effort apply to the live session"
+# The model/effort pin now runs through the debug socket, which persists to the
+# session store rather than echoing into the pane, so verify against the STORE -
+# the ground truth for what the session actually runs, and the exact oracle the
+# spawn-time gate uses. This is a stronger check than a pane string: it proves the
+# live session is really on the requested profile, the whole point of the fix.
+# shellcheck source=bin/fm-token-sessions-lib.sh
+. "$ROOT/bin/fm-token-sessions-lib.sh"
+STORE_WT=$(sed -n 's/^worktree=//p' "$META")
+[ -n "$STORE_WT" ] || fail "meta recorded no worktree to resolve the session id"
+store_profile_matches() {  # polls the store until it shows the requested profile
+  local budget=$1 i=0 sid prof am ae kv
+  while [ "$i" -lt "$budget" ]; do
+    sid=$(fm_resolve_crew_session_id "$STORE_WT" "" 2>/dev/null || true)
+    if [ -n "$sid" ]; then
+      prof=$(fm_session_store_profile "$sid" 2>/dev/null || true)
+      am='' ae=''
+      while IFS= read -r kv; do
+        case "$kv" in model=*) am=${kv#model=} ;; effort=*) ae=${kv#effort=} ;; esac
+      done <<EOF
+$prof
+EOF
+      [ "$am" = "$MODEL" ] && [ "$ae" = "$EFFORT" ] && return 0
+    fi
+    sleep 1
+    i=$((i + 1))
+  done
+  return 1
+}
+store_profile_matches 60 \
+  || fail "the session store never showed the resolved model/effort (wanted $MODEL/$EFFORT)"
+pass "jcode_post_launch_delivery: the resolved model and effort apply to the live session store"
 
 wait_for_wrapped_text "$HOME_DIR/data/$ID/brief.md" 60 \
   || fail "the launch-brief pointer never landed in the session: $(capture | tail -20)"
