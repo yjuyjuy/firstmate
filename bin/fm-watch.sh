@@ -85,6 +85,17 @@
 #                          instead of sitting silent and looking healthy
 #                          (mechanism and evidence:
 #                          docs/design-visibility-improvements.md).
+#   check: retry-loop <task>
+#                          retry-loop tripwire: a supervised worker appended
+#                          the SAME status body FM_RETRY_LOOP_MIN+ times in a
+#                          row (default 3), an objective sign it is stuck
+#                          retrying without progress. It already got exactly
+#                          ONE automatic steer (`stop retrying, append
+#                          blocked: with the exact blocker and wait`) recorded
+#                          in state/.retry-loop-<key>, and is escalated ONCE
+#                          here only when the SAME loop continued past that
+#                          steer. Secondmate and supervise=off panes are never
+#                          steered. See retry_loop_check.
 #   tick: <note>           env-gated proof-of-life close (FM_WATCH_ABSORB_TICK=1,
 #                          default off) for a benign-ABSORBED wake while work is
 #                          under way. Not an actionable wake: nothing is queued,
@@ -1356,6 +1367,121 @@ dead_turn_check() {  # <window> <task> <tail40>
   return 0
 }
 
+# retry_loop_check: the worker retry-loop tripwire. A worker stuck in a retry
+# loop keeps writing the SAME status body over and over (an identical failing
+# command, an identical error line, an identical "working: retrying X" note),
+# burning tokens without making progress and never appending a `blocked:` line
+# that would surface it. The stale loop does NOT catch this: the pane keeps
+# CHANGING (each retry redraws output) and the status file keeps being APPENDED
+# (so its size:mtime signature advances and the signal path treats each append
+# as fresh chatter), so nothing wedges and nothing surfaces.
+#
+# DETECTION - "identical status append 3+ times" - is defined precisely as: the
+# task status file's last FM_RETRY_LOOP_MIN (default 3) non-blank lines are all
+# BYTE-IDENTICAL to each other (exact string match on the whole status line,
+# verb and note together). A worker appending the same failing-command line, or
+# the same error, or the same retry note, three times in a row satisfies this;
+# any variation in the body (a different command, a changed error, an advancing
+# note, a real progress line between retries) breaks the run and never trips.
+# The exact-match-on-the-status-body rule is what makes "identical" objective:
+# a worker whose retries carry the same command signature writes that command
+# into its status line, so the status body IS the command signature we compare.
+#
+# STATE MACHINE (mirrors dead_turn_check's marker lifecycle, one auto-steer per
+# distinct loop episode, then one escalation if it continues):
+#   1. Not looping (fewer than FM_RETRY_LOOP_MIN trailing identical lines): clear
+#      this key's tracking so a later genuine loop starts a fresh episode.
+#   2. First poll that sees a qualifying run whose identical body differs from
+#      the last episode's recorded body: send exactly ONE auto-steer via fm-send
+#      (`stop retrying, append blocked: with the exact blocker and wait`) and
+#      record the body's hash in state/.retry-loop-<key> so the SAME loop never
+#      re-steers. No wake - the steer is the first, quiet intervention.
+#   3. A later poll still showing the SAME looping body (the worker ignored the
+#      steer and kept retrying past the grace window) escalates ONCE as
+#      `check: retry-loop <task>` via state/.retry-loop-escalated-<key>, then
+#      stays silent for that episode. A worker that changes its body (including
+#      finally writing the asked-for `blocked:` line) is a NEW body: the run
+#      breaks, the episode clears, and a different loop later may steer once
+#      again.
+# NEVER steers a secondmate (its own home supervises its lanes, and a marked
+# main-home steer would open a parent pending-reply expectation) or an
+# --unsupervised pane (supervise=off), the same exclusions nudge_stale_worker
+# and dead_turn_check enforce. A send that cannot be confirmed records the
+# episode's single steer anyway and escalates immediately, so a failing sender
+# never swallows a looping worker. FAIL-SOFT throughout: a missing meta,
+# missing status file, or a marker write failure surfaces nothing and never
+# blocks the loop. FM_RETRY_LOOP_SEND_BIN is the send seam (default this repo's
+# fm-send.sh); tests stub it.
+FM_RETRY_LOOP_MIN=${FM_RETRY_LOOP_MIN:-3}
+FM_RETRY_LOOP_SEND_BIN=${FM_RETRY_LOOP_SEND_BIN:-"$SCRIPT_DIR/fm-send.sh"}
+
+# retry_loop_trailing_body: prints the status body repeated by the last
+# FM_RETRY_LOOP_MIN non-blank lines of <status-file> when they are ALL identical,
+# and prints nothing otherwise. Pure read; the objective "identical" predicate.
+retry_loop_trailing_body() {  # <status-file>
+  local f=$1 lines first n
+  [ -e "$f" ] || return 0
+  lines=$(grep -v '^[[:space:]]*$' "$f" 2>/dev/null | tail -n "$FM_RETRY_LOOP_MIN")
+  n=$(printf '%s\n' "$lines" | grep -c .)
+  [ "$n" -ge "$FM_RETRY_LOOP_MIN" ] || return 0
+  first=$(printf '%s\n' "$lines" | head -n 1)
+  [ -n "$first" ] || return 0
+  # Every one of the trailing lines must equal the first: uniq -c collapsing to a
+  # single group proves all identical.
+  [ "$(printf '%s\n' "$lines" | sort -u | grep -c .)" = 1 ] || return 0
+  printf '%s' "$first"
+}
+
+retry_loop_check() {  # <window> <task>
+  local w=$1 task=$2 meta body key steer_marker esc_marker sig prev out reason
+  [ -n "$task" ] || return 0
+  meta=$(fm_backend_meta_for_window "$w" "$STATE" 2>/dev/null || true)
+  [ -n "$meta" ] || return 0
+  [ "$(grep '^kind=' "$meta" | cut -d= -f2- || true)" = secondmate ] && return 0
+  [ "$(grep '^supervise=' "$meta" | cut -d= -f2- || true)" = off ] && return 0
+  key=$(printf '%s' "$w" | tr ':/.' '___')
+  steer_marker="$STATE/.retry-loop-$key"
+  esc_marker="$STATE/.retry-loop-escalated-$key"
+  body=$(retry_loop_trailing_body "$STATE/$task.status")
+  if [ -z "$body" ]; then
+    # Not looping: the run broke (a changed body, a real progress line). Clear
+    # the episode so a genuinely new loop later starts fresh and may steer once.
+    rm -f "$steer_marker" "$esc_marker"
+    return 0
+  fi
+  sig=$(printf '%s' "$body" | hash_pane)
+  prev=$(cat "$steer_marker" 2>/dev/null || true)
+  if [ "$prev" = "$sig" ]; then
+    # Same loop already steered. Escalate ONCE if it is still going past the
+    # grace window, then stay silent for this episode.
+    [ "$(cat "$esc_marker" 2>/dev/null || true)" = "$sig" ] && return 0
+    printf '%s' "$sig" > "$esc_marker" 2>/dev/null || return 0
+    reason="check: retry-loop $task (same status appended ${FM_RETRY_LOOP_MIN}+ times, still looping after the stop-retrying steer)"
+    fm_wake_append check "retry-loop-$key" "$reason" || exit 1
+    wake "$reason"
+  fi
+  # First qualifying poll of a NEW loop body: exactly ONE auto-steer. The text is
+  # short, single-line, and steer-safe (plain text, no slash command) so every
+  # verified harness treats it as an ordinary turn nudge.
+  if ! out=$(FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" \
+      "$FM_RETRY_LOOP_SEND_BIN" "$task" \
+      "stop retrying, append blocked: with the exact blocker and wait" 2>&1); then
+    # A send that cannot be confirmed records the episode's single steer and
+    # escalates NOW rather than retrying into a steer loop or swallowing the
+    # looping worker.
+    printf '%s' "$sig" > "$steer_marker" 2>/dev/null || true
+    printf '%s' "$sig" > "$esc_marker" 2>/dev/null || true
+    triage_log "retry-loop steer send failed for $w: $(printf '%s' "$out" | tail -n 1)"
+    reason="check: retry-loop $task (same status appended ${FM_RETRY_LOOP_MIN}+ times, stop-retrying steer delivery FAILED)"
+    fm_wake_append check "retry-loop-$key" "$reason" || exit 1
+    wake "$reason"
+  fi
+  printf '%s' "$sig" > "$steer_marker" 2>/dev/null || true
+  rm -f "$esc_marker"
+  triage_log "retry-loop steer sent for $w (body hash $sig)"
+  return 0
+}
+
 # Visibility Gap-1: the fleet-wide account/quota PRODUCER - this watcher's
 # slow-poll `check: fleet-quota` pass. Runs exactly ONE quota-axi --json per
 # CHECK_INTERVAL (never per pane), folds the claude provider's relevant general
@@ -2278,6 +2404,12 @@ EOF
     # content. Busy-ness is NEVER a liveness signal here (the dead jcode
     # lanes read busy forever; supervision-miss-rootcause F4).
     dead_turn_check "$w" "$task" "$tail40"
+    # Retry-loop tripwire: a supervised worker appending the SAME status body
+    # FM_RETRY_LOOP_MIN+ times in a row is stuck retrying without progress. Pure
+    # status-file read (zero backend capture); sends ONE stop-retrying steer per
+    # distinct loop episode, then escalates once if the loop continues. Secondmate
+    # and supervise=off panes are excluded inside the function.
+    retry_loop_check "$w" "$task"
     if [ "$h" = "$prev" ]; then
       n=$(( $(cat "$cf" 2>/dev/null || echo 0) + 1 ))
       echo "$n" > "$cf"
