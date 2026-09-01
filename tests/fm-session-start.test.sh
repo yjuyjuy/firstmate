@@ -1132,6 +1132,100 @@ EOF
   pass "a queued id with no live task record is not flagged as drift"
 }
 
+# --- backlog drift: In flight with no live worker ----------------------------
+
+# Drift is the deliberate INVERSE of orphan status: orphan = status-without-meta;
+# drift = backlog In flight id with no live meta OR a dead endpoint. Detection
+# only - one advisory line, never a backlog mutation.
+write_in_flight_backlog() {
+  local path=$1 id=$2
+  cat > "$path" <<EOF
+# Backlog
+
+## In flight
+- [ ] $id - Some in-flight task (repo: firstmate) (kind: ship) (since 2026-08-20)
+  BODY line that should not affect drift parsing.
+
+## Queued
+- [ ] queued-thing - A queued task (repo: firstmate) (kind: ship) (since 2026-08-20)
+
+## Done
+EOF
+}
+
+test_backlog_drift_no_meta() {
+  local rec root home fakebin out
+  rec=$(new_world backlog-drift-no-meta)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_claude "$fakebin"
+  # In-flight id with NO state/<id>.meta at all: the worker vanished.
+  write_in_flight_backlog "$home/data/backlog.md" "ghost-task"
+
+  out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+
+  assert_contains "$out" "Backlog drift (In flight with no live worker)" \
+    "digest did not label the backlog-drift section"
+  assert_contains "$out" "BACKLOG_DRIFT: ghost-task in-flight but no live worker" \
+    "an in-flight id with no meta was not flagged as drift"
+  # A queued id must never trip drift, even with no meta.
+  assert_not_contains "$out" "BACKLOG_DRIFT: queued-thing" \
+    "a queued id must not be flagged as backlog drift"
+
+  pass "an in-flight backlog id with no live worker is flagged BACKLOG_DRIFT"
+}
+
+test_backlog_drift_dead_endpoint() {
+  local rec root home fakebin out
+  rec=$(new_world backlog-drift-dead)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_claude "$fakebin"
+  make_fake_tmux "$fakebin" "fm-sess:live-window"
+  write_in_flight_backlog "$home/data/backlog.md" "dead-task"
+  # Meta EXISTS but its recorded window is not the live one, so the endpoint reads
+  # dead: still drift.
+  printf 'window=fm-sess:gone-window\nkind=ship\n' > "$home/state/dead-task.meta"
+
+  out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+
+  assert_contains "$out" "endpoint: dead (backend=tmux window=fm-sess:gone-window)" \
+    "the dead endpoint precondition did not hold"
+  assert_contains "$out" "BACKLOG_DRIFT: dead-task in-flight but no live worker" \
+    "an in-flight id with a dead endpoint was not flagged as drift"
+
+  pass "an in-flight backlog id whose recorded endpoint is dead is flagged BACKLOG_DRIFT"
+}
+
+test_backlog_drift_none_when_live_worker() {
+  local rec root home fakebin out
+  rec=$(new_world backlog-drift-live)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_claude "$fakebin"
+  make_fake_tmux "$fakebin" "fm-sess:live-window"
+  write_in_flight_backlog "$home/data/backlog.md" "live-task"
+  # Meta with a LIVE endpoint: no drift.
+  printf 'window=fm-sess:live-window\nkind=ship\n' > "$home/state/live-task.meta"
+
+  out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+
+  assert_contains "$out" "endpoint: alive (backend=tmux window=fm-sess:live-window)" \
+    "the live endpoint precondition did not hold"
+  assert_contains "$out" "Backlog drift (In flight with no live worker)" \
+    "digest did not label the backlog-drift section"
+  assert_not_contains "$out" "BACKLOG_DRIFT: live-task" \
+    "an in-flight id with a live worker was wrongly flagged as drift"
+
+  pass "an in-flight backlog id with a live worker produces no drift line"
+}
+
 test_next_step_sources_x_mode_cadence() {
   local rec root home fakebin out
   rec=$(new_world next-step-x)
@@ -1436,6 +1530,9 @@ test_fleet_digest_empty_fleet
 test_fleet_digest_surfaces_merge_queue
 test_fleet_digest_flags_merge_queue_drift
 test_fleet_digest_no_drift_when_meta_absent
+test_backlog_drift_no_meta
+test_backlog_drift_dead_endpoint
+test_backlog_drift_none_when_live_worker
 test_next_step_sources_x_mode_cadence
 test_next_step_afk_delegates_to_daemon
 test_next_step_afk_without_daemon_keeps_own_watcher

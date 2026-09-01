@@ -733,6 +733,12 @@ print_cross_session_stalls
 
 subsection "Work under way (state/*.meta)"
 META_FOUND=0
+# Backlog-drift reconcile (see the drift section after orphan status): record,
+# once per meta, whether this id has a LIVE worker, reusing the endpoint read
+# computed here so the drift check never opens a second endpoint sweep. An id is
+# "live" when its meta exists and its endpoint is alive or unknown; only an
+# explicitly DEAD endpoint marks the worker gone.
+declare -A WORKER_ALIVE=()
 for meta in "$STATE"/*.meta; do
   [ -f "$meta" ] || continue
   META_FOUND=1
@@ -746,11 +752,14 @@ for meta in "$STATE"/*.meta; do
     backend=$(fm_backend_of_meta "$meta")
     if fm_backend_target_exists "$backend" "${target:-$window}" "fm-$id"; then
       printf 'endpoint: alive (backend=%s window=%s)\n' "$backend" "$window"
+      WORKER_ALIVE["$id"]=yes
     else
       printf 'endpoint: dead (backend=%s window=%s)\n' "$backend" "$window"
+      WORKER_ALIVE["$id"]=no
     fi
   else
     printf 'endpoint: unknown (no window recorded)\n'
+    WORKER_ALIVE["$id"]=yes
   fi
 
   status="$STATE/$id.status"
@@ -776,6 +785,44 @@ for status in "$STATE"/*.status; do
   print_status_tail "$status"
 done
 [ "$ORPHAN_STATUS_FOUND" -eq 1 ] || printf '(none)\n'
+
+# Backlog drift = the deliberate INVERSE of orphan status. Orphan status is a
+# state/<id>.status with no matching meta; drift is a backlog id parsed as "In
+# flight" with NO live state/<id>.meta OR a DEAD recorded endpoint. Detection
+# only: never mutate the backlog, never kill or spawn anything - just one
+# advisory line per drifting id, reusing the endpoint liveness the meta loop
+# above already computed (WORKER_ALIVE) so no second endpoint sweep runs.
+subsection "Backlog drift (In flight with no live worker)"
+BACKLOG_DRIFT_FOUND=0
+if [ -f "$DATA/backlog.md" ] && [ -s "$DATA/backlog.md" ]; then
+  # Parse only "In flight" section item title lines to their leading id, mirroring
+  # the heading classifier the compact listing uses (In flight / Queued / Done).
+  while IFS= read -r drift_id; do
+    [ -n "$drift_id" ] || continue
+    # Live when a meta exists AND its endpoint was not read DEAD this run. A dead
+    # endpoint or an absent meta both mean no live worker -> drift.
+    if [ ! -f "$STATE/$drift_id.meta" ] || [ "${WORKER_ALIVE[$drift_id]:-no}" = no ]; then
+      printf 'BACKLOG_DRIFT: %s in-flight but no live worker\n' "$drift_id"
+      BACKLOG_DRIFT_FOUND=1
+    fi
+  done < <(awk '
+    /^##[[:space:]]+/ {
+      heading = $0
+      sub(/^##[[:space:]]+/, "", heading)
+      sub(/[[:space:]]+$/, "", heading)
+      in_flight = (heading == "In flight")
+      next
+    }
+    in_flight && /^[-*][[:space:]]+/ {
+      line = $0
+      sub(/^[-*][[:space:]]+(\[[^]]*\][[:space:]]+)?/, "", line)
+      id = line
+      sub(/[[:space:]].*$/, "", id)
+      if (id != "") print id
+    }
+  ' "$DATA/backlog.md")
+fi
+[ "$BACKLOG_DRIFT_FOUND" -eq 1 ] || printf '(none)\n'
 
 # Released-but-unmerged branches. Structural, not discretionary: the release-on-pushed
 # safety guard cannot depend on remembering to run the merge-queue CLI. One bounded
