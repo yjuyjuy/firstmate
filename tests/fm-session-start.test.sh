@@ -1088,6 +1088,50 @@ EOF
   pass "a non-empty merge queue is surfaced as one bounded fleet-digest line"
 }
 
+# Problem-B drift flag: an id that is BOTH in the merge queue AND still has a
+# live state/<id>.meta is surfaced, so a stale queued head against a newer live
+# pr_head is caught rather than sticking forever.
+test_fleet_digest_flags_merge_queue_drift() {
+  local rec root home fakebin out
+  rec=$(new_world merge-queue-drift)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_claude "$fakebin"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' task-drift /proj fm/drift c1 main url-drift > "$home/data/merge-queue.tsv"
+  # A live meta for the SAME id: this is the drift the digest must flag.
+  fm_write_meta "$home/state/task-drift.meta" "window=fm:0" "worktree=/wt" "pr_head=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+
+  out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+  assert_contains "$out" "task-drift" \
+    "a queued id with a live task record was not flagged as drift"
+  assert_contains "$out" "still have a live task record" \
+    "the drift line's reconcile guidance was missing"
+
+  pass "a queued id that still has a live task record is flagged as merge-queue drift"
+}
+
+# An entry with no live meta must NOT trip the drift flag.
+test_fleet_digest_no_drift_when_meta_absent() {
+  local rec root home fakebin out
+  rec=$(new_world merge-queue-no-drift)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_claude "$fakebin"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' task-clean /proj fm/clean c1 main url-clean > "$home/data/merge-queue.tsv"
+
+  out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+  assert_contains "$out" "Finished work still waiting to merge" \
+    "the merge-queue line itself must still show"
+  assert_not_contains "$out" "still have a live task record" \
+    "a queued id with no live task record must not be flagged as drift"
+
+  pass "a queued id with no live task record is not flagged as drift"
+}
+
 test_next_step_sources_x_mode_cadence() {
   local rec root home fakebin out
   rec=$(new_world next-step-x)
@@ -1390,6 +1434,8 @@ test_backlog_compact_manual_backend_skips_indented_bodies
 test_backlog_compact_tasks_axi_unavailable_uses_manual_fallback
 test_fleet_digest_empty_fleet
 test_fleet_digest_surfaces_merge_queue
+test_fleet_digest_flags_merge_queue_drift
+test_fleet_digest_no_drift_when_meta_absent
 test_next_step_sources_x_mode_cadence
 test_next_step_afk_delegates_to_daemon
 test_next_step_afk_without_daemon_keeps_own_watcher

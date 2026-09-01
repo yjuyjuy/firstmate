@@ -226,6 +226,75 @@ fm_merge_queue_branch_merged() {
   [ "$merged_tree" = "$base_tree" ]
 }
 
+# A forge-confirmed merge check, used ONLY when the content-in-base check above
+# is inconclusive (a squash/rebase merge whose base later touched a file the
+# branch also touched makes merge-tree report a conflict, so the content check
+# keeps the entry forever). This is an ADDITION to fm_merge_queue_branch_merged,
+# never a replacement: it asks the forge directly whether <head> landed in a
+# merged pull request, and it is reached only after the content check declined.
+#
+# GitHub: gh-axi api repos/<slug>/commits/<head>/pulls filtered to MERGED PRs
+# whose base is <base>. A non-empty result is a confirmed merge. Any error, an
+# unresolvable slug, or a missing gh-axi is inconclusive (return 1), so nothing
+# clears on an unverifiable claim. Bitbucket has no head-commit-to-PR lookup as
+# cheap as GitHub's, and the Bitbucket branch poll (bin/fm-merge-queue-poll.sh)
+# already drives the merged/declined wake for those entries, so this helper is
+# GitHub-only by design and returns 1 (inconclusive) for a non-GitHub origin.
+#
+# Returns 0 for a forge-confirmed merge, 1 for "not confirmed" (including every
+# inconclusive or unavailable case), so a caller treats only 0 as a clear.
+fm_merge_queue_forge_confirms_merged() {
+  local project=$1 head=$2 base=$3 slug count
+  [ -n "$project" ] && [ -d "$project" ] || return 1
+  [ -n "$head" ] && [ -n "$base" ] || return 1
+  command -v gh-axi >/dev/null 2>&1 || return 1
+  slug=$(fm_pr_github_origin_slug "$project") || return 1
+  # The commits/<sha>/pulls endpoint lists every PR that contains this commit.
+  # Keep only a PR that is MERGED into the queued base; a non-empty count is a
+  # confirmed merge. gh-axi's --jq does the filtering, so no local jq is needed.
+  count=$(gh-axi api "repos/$slug/commits/$head/pulls" \
+    --header 'Accept: application/vnd.github+json' \
+    --jq "[.[] | select(.merged_at != null) | select(.base.ref == \"$base\")] | length" \
+    2>/dev/null) || return 1
+  case "$count" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "$count" -gt 0 ]
+}
+
+# Reconcile queue entries against live state/<id>.meta before a sweep. An id can
+# sit in the queue with a STALE head while a live meta records a NEWER pr_head
+# (the branch got more commits and a fresh PR head after the entry was recorded,
+# e.g. a promoted scout that re-pushed). The stale head is not an ancestor of
+# base and its content no longer matches, so the entry would never sweep. This
+# refreshes the queued head to the meta's pr_head so the merged check runs
+# against the commit that actually landed. It only ever rewrites the head field;
+# it never removes an entry (removal stays with the merged-confirmation sweep)
+# and never touches an id with no live meta or whose meta pr_head already matches.
+# Args: data_dir state_dir. Prints one line per refreshed id.
+fm_merge_queue_reconcile_drift() {
+  local data_dir=$1 state_dir=$2 entries meta new_head
+  [ -n "$state_dir" ] && [ -d "$state_dir" ] || return 0
+  entries=$(fm_merge_queue_entries "$data_dir") || return 0
+  [ -n "$entries" ] || return 0
+  while IFS='	' read -r id project branch head base url; do
+    [ -n "$id" ] || continue
+    meta="$state_dir/$id.meta"
+    [ -f "$meta" ] || continue
+    new_head=$(grep '^pr_head=' "$meta" 2>/dev/null | tail -1 | cut -d= -f2- || true)
+    [ -n "$new_head" ] || continue
+    [ "$new_head" != "$head" ] || continue
+    fm_pr_head_valid "$new_head" || continue
+    if fm_merge_queue_record "$data_dir" "$id" "$project" "$branch" "$new_head" "$base" "$url"; then
+      printf 'refreshed: %s head %s -> %s (from live meta)\n' "$id" "$head" "$new_head"
+    else
+      printf 'kept: %s (drift refresh could not update the queue)\n' "$id" >&2
+    fi
+  done <<EOF
+$entries
+EOF
+}
+
 # Build a captain-facing compare URL from an origin remote URL, base, and branch.
 # Handles github.com and bitbucket.org (SSH or HTTPS); falls back to a plain
 # descriptive string when the host is unknown, so the value is always non-empty.

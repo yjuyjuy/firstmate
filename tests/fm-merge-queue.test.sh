@@ -504,6 +504,217 @@ test_dispatch_cli_execute_requires_harness_with_dispatch_profile() {
   pass "dispatch --execute refuses without --harness when a crew-dispatch profile is active"
 }
 
+# --- Problem A: squash/rebase merge the content check cannot recognize --------
+
+# Build a clone whose branch was squash-merged into main AND whose base later
+# touched the same file, so merge-tree returns CONFLICT and the content-in-base
+# check is INCONCLUSIVE. This is the case that keeps an entry queued forever.
+# Echoes "<repo-root> <clone> <head>".
+make_squash_then_base_touch() {
+  local dir=$1 branch=$2
+  git init -q --bare "$dir/origin.git"
+  git -C "$dir/origin.git" symbolic-ref HEAD refs/heads/main
+  git clone -q "$dir/origin.git" "$dir/seed"
+  git -C "$dir/seed" -c user.email=t@t -c user.name=t commit -q --allow-empty -m baseline
+  printf 'line1\n' > "$dir/seed/shared.txt"
+  git -C "$dir/seed" add -- shared.txt
+  git -C "$dir/seed" -c user.email=t@t -c user.name=t commit -q -m addshared
+  git -C "$dir/seed" push -q origin main
+  rm -rf "$dir/seed"
+  git clone -q "$dir/origin.git" "$dir/clone"
+  git -C "$dir/clone" checkout -q -b "$branch"
+  printf 'line1\nfeature\n' > "$dir/clone/shared.txt"
+  git -C "$dir/clone" add -- shared.txt
+  git -C "$dir/clone" -c user.email=t@t -c user.name=t commit -q -m "work on $branch"
+  git -C "$dir/clone" push -q origin "$branch"
+  local head
+  head=$(git -C "$dir/clone" rev-parse HEAD)
+  # Land equivalent content on main via a distinct (squash-style) commit.
+  git clone -q "$dir/origin.git" "$dir/land"
+  printf 'line1\nfeature\n' > "$dir/land/shared.txt"
+  git -C "$dir/land" add -- shared.txt
+  git -C "$dir/land" -c user.email=t@t -c user.name=t commit -q -m "squash feature"
+  git -C "$dir/land" push -q origin HEAD:main
+  # Base LATER touches the same file, so merge-tree of the old branch conflicts.
+  printf 'line1\nfeature\nbaselater\n' > "$dir/land/shared.txt"
+  git -C "$dir/land" add -- shared.txt
+  git -C "$dir/land" -c user.email=t@t -c user.name=t commit -q -m "base later touches shared"
+  git -C "$dir/land" push -q origin HEAD:main
+  printf '%s %s %s\n' "$dir" "$dir/clone" "$head"
+}
+
+test_content_check_inconclusive_on_squash_then_base_touch() {
+  # Guard the premise of Problem A: the content-in-base check itself must be
+  # inconclusive (kept) for this fixture, so the forge-confirmed path is what
+  # actually clears it below. If git ever recognizes this as merged directly,
+  # this test tells us the premise changed.
+  local repo="$TMP_ROOT/premise/repo" out clone head
+  mkdir -p "$repo"
+  out=$(make_squash_then_base_touch "$repo" fm/premise)
+  read -r _ clone head <<EOF
+$out
+EOF
+  local rc=0
+  fm_merge_queue_branch_merged "$clone" fm/premise "$head" main || rc=$?
+  [ "$rc" -ne 0 ] || fail "content check unexpectedly recognized the squash+base-touch case as merged"
+  [ "$rc" != "$FM_MERGE_QUEUE_BRANCH_GONE" ] || fail "premise wrong: branch is gone, not merely inconclusive"
+  pass "content-in-base check is inconclusive for a squash merge the base later touched"
+}
+
+# A fake gh-axi that answers `api repos/<slug>/commits/<sha>/pulls` from a table
+# of merged shas. Writes its argv to a log for assertions.
+build_fake_gh_axi() {
+  local bindir=$1 merged_sha=$2 log=$3
+  mkdir -p "$bindir"
+  cat > "$bindir/gh-axi" <<GH
+#!/usr/bin/env bash
+printf 'GHAXI %s\n' "\$*" >> "$log"
+# Only the commits/<sha>/pulls merged-count query is emulated.
+path=
+for a in "\$@"; do
+  case "\$a" in repos/*/commits/*/pulls) path=\$a ;; esac
+done
+if [ -n "\$path" ]; then
+  sha=\${path#*/commits/}
+  sha=\${sha%/pulls}
+  if [ "\$sha" = "$merged_sha" ]; then echo 1; else echo 0; fi
+  exit 0
+fi
+exit 1
+GH
+  chmod +x "$bindir/gh-axi"
+}
+
+test_sweep_forge_confirms_squash_merge_github() {
+  # The content check is inconclusive (squash + base touch), but the forge (gh-axi)
+  # confirms the head's PR is merged, so the entry must clear.
+  local data="$TMP_ROOT/forge-gh/data" repo="$TMP_ROOT/forge-gh/repo"
+  local bindir="$TMP_ROOT/forge-gh/bin" log="$TMP_ROOT/forge-gh/gh.log"
+  mkdir -p "$data"
+  : > "$log"
+  local out clone head
+  out=$(make_squash_then_base_touch "$repo" fm/gh-squash)
+  read -r _ clone head <<EOF
+$out
+EOF
+  # Point the clone origin at an owned GitHub slug so the forge path engages.
+  git -C "$clone" remote set-url origin 'git@github.com:yjuyjuy/tool.git'
+  build_fake_gh_axi "$bindir" "$head" "$log"
+  fm_merge_queue_record "$data" task-gh "$clone" fm/gh-squash "$head" main \
+    "https://github.com/yjuyjuy/tool/compare/main...fm/gh-squash"
+  local sweep_out
+  sweep_out=$(PATH="$bindir:$PATH" run_cli "$data" sweep)
+  printf '%s\n' "$sweep_out" | grep -F 'task-gh' >/dev/null || fail "forge-confirmed sweep said nothing about task-gh: $sweep_out"
+  run_cli "$data" list --raw | grep -F task-gh >/dev/null && fail "forge-confirmed squash merge not swept: $(run_cli "$data" list --raw)"
+  grep -F "commits/$head/pulls" "$log" >/dev/null || fail "sweep did not query the forge for the head's merged PR: $(cat "$log")"
+  pass "sweep clears a squash merge the content check missed once the forge confirms it merged"
+}
+
+test_sweep_keeps_when_forge_says_not_merged() {
+  # Same inconclusive content check, but the forge does NOT confirm a merge (no
+  # merged PR for this head): the entry must be KEPT, never cleared on a guess.
+  local data="$TMP_ROOT/forge-keep/data" repo="$TMP_ROOT/forge-keep/repo"
+  local bindir="$TMP_ROOT/forge-keep/bin" log="$TMP_ROOT/forge-keep/gh.log"
+  mkdir -p "$data"
+  : > "$log"
+  local out clone head
+  out=$(make_squash_then_base_touch "$repo" fm/gh-open)
+  read -r _ clone head <<EOF
+$out
+EOF
+  git -C "$clone" remote set-url origin 'git@github.com:yjuyjuy/tool.git'
+  # The fake reports merged only for a DIFFERENT sha, so this head is not merged.
+  build_fake_gh_axi "$bindir" 0000000000000000000000000000000000000000 "$log"
+  fm_merge_queue_record "$data" task-open "$clone" fm/gh-open "$head" main \
+    "https://github.com/yjuyjuy/tool/compare/main...fm/gh-open"
+  PATH="$bindir:$PATH" run_cli "$data" sweep >/dev/null
+  run_cli "$data" list --raw | grep -F task-open >/dev/null || fail "entry wrongly cleared when the forge did not confirm a merge"
+  pass "sweep keeps an inconclusive entry when the forge does not confirm a merge"
+}
+
+test_sweep_content_fallback_still_works_without_forge() {
+  # With NO forge automation available (gh-axi absent), a genuine content-in-base
+  # squash landing must STILL sweep via the fallback content check. This proves
+  # the forge path is an ADDITION, not a replacement.
+  local data="$TMP_ROOT/fallback/data" repo="$TMP_ROOT/fallback/repo"
+  local emptybin="$TMP_ROOT/fallback/bin"
+  mkdir -p "$data" "$emptybin"
+  make_repo_with_pushed_branch "$repo" fm/fb-squash
+  local head
+  head=$(git -C "$repo/clone" rev-parse HEAD)
+  git clone -q "$repo/origin.git" "$repo/land"
+  printf '%s\n' feature > "$repo/land/feature.txt"
+  git -C "$repo/land" add -- feature.txt
+  git -C "$repo/land" -c user.email=t@t -c user.name=t commit -q -m "squash feature"
+  git -C "$repo/land" push -q origin HEAD:main
+  fm_merge_queue_record "$data" task-fb "$repo/clone" fm/fb-squash "$head" main url-fb
+  # A bare git-only PATH: no gh-axi, no curl, so no forge automation exists.
+  local gitbin
+  gitbin=$(dirname "$(command -v git)")
+  PATH="$emptybin:$gitbin" run_cli "$data" sweep >/dev/null
+  run_cli "$data" list --raw | grep -F task-fb >/dev/null && fail "content-fallback squash landing not swept without forge automation"
+  pass "content-in-base fallback still clears a clean squash landing when no forge automation is available"
+}
+
+# --- Problem B: queue-vs-live-meta drift -------------------------------------
+
+test_reconcile_refreshes_stale_head_from_live_meta() {
+  # A queue entry carries a STALE head while a live state/<id>.meta records a
+  # NEWER pr_head. Reconcile must refresh the queued head to the meta's pr_head so
+  # the merged check runs against the commit that actually landed.
+  local data="$TMP_ROOT/drift/data" state="$TMP_ROOT/drift/state"
+  mkdir -p "$data" "$state"
+  local newhead=1111111111111111111111111111111111111111
+  fm_merge_queue_record "$data" task-d /proj fm/d 0000000000000000000000000000000000000000 main url-d
+  fm_write_meta "$state/task-d.meta" "window=fm:0" "worktree=/wt" "pr=https://x/pull/1" "pr_head=$newhead"
+  fm_merge_queue_reconcile_drift "$data" "$state" >/dev/null
+  run_cli "$data" list --raw | grep -F "$newhead" >/dev/null || fail "reconcile did not refresh the stale head: $(run_cli "$data" list --raw)"
+  run_cli "$data" list --raw | grep -F '0000000000000000000000000000000000000000' >/dev/null \
+    && fail "reconcile left the stale head in the queue"
+  [ "$(run_cli "$data" count)" = 1 ] || fail "reconcile changed the entry count"
+  pass "drift reconcile refreshes a stale queued head from the live meta's newer pr_head"
+}
+
+test_reconcile_no_meta_leaves_entry_untouched() {
+  # No live meta for the id: reconcile must leave the entry exactly as recorded.
+  local data="$TMP_ROOT/drift-none/data" state="$TMP_ROOT/drift-none/state"
+  mkdir -p "$data" "$state"
+  fm_merge_queue_record "$data" task-n /proj fm/n abc123abc123abc123abc123abc123abc123abcd main url-n
+  local before
+  before=$(run_cli "$data" list --raw)
+  fm_merge_queue_reconcile_drift "$data" "$state" >/dev/null
+  [ "$(run_cli "$data" list --raw)" = "$before" ] || fail "reconcile modified an entry with no live meta"
+  pass "drift reconcile leaves an entry with no live meta untouched"
+}
+
+test_reconcile_same_head_is_noop() {
+  # The live meta's pr_head equals the queued head: nothing to refresh.
+  local data="$TMP_ROOT/drift-same/data" state="$TMP_ROOT/drift-same/state"
+  mkdir -p "$data" "$state"
+  local h=abc123abc123abc123abc123abc123abc123abcd
+  fm_merge_queue_record "$data" task-s "$data" fm/s "$h" main url-s
+  fm_write_meta "$state/task-s.meta" "pr_head=$h"
+  local before
+  before=$(run_cli "$data" list --raw)
+  fm_merge_queue_reconcile_drift "$data" "$state" >/dev/null
+  [ "$(run_cli "$data" list --raw)" = "$before" ] || fail "reconcile rewrote an entry whose head already matched"
+  pass "drift reconcile is a no-op when the live meta pr_head equals the queued head"
+}
+
+test_sweep_runs_reconcile_first() {
+  # sweep must reconcile drift before its merged checks, so a stale head that
+  # never sweeps is refreshed to the live pr_head in the same pass.
+  local data="$TMP_ROOT/drift-sweep/data" state="$TMP_ROOT/drift-sweep/state"
+  mkdir -p "$data" "$state"
+  local newhead=2222222222222222222222222222222222222222
+  fm_merge_queue_record "$data" task-ds /proj fm/ds 0000000000000000000000000000000000000000 main url-ds
+  fm_write_meta "$state/task-ds.meta" "pr_head=$newhead"
+  FM_ROOT_OVERRIDE="$ROOT" FM_DATA_OVERRIDE="$data" FM_STATE_OVERRIDE="$state" "$CLI" sweep >/dev/null
+  FM_ROOT_OVERRIDE="$ROOT" FM_DATA_OVERRIDE="$data" FM_STATE_OVERRIDE="$state" "$CLI" list --raw \
+    | grep -F "$newhead" >/dev/null || fail "sweep did not reconcile the stale head before its merged checks"
+  pass "sweep reconciles queue-vs-meta drift before running its merged checks"
+}
+
 
 test_record_and_list
 test_record_replaces_same_id
@@ -529,3 +740,11 @@ test_dispatch_plan_below_threshold
 test_dispatch_cli_dry_run_spawns_nothing
 test_dispatch_cli_execute_spawns_only_eligible
 test_dispatch_cli_execute_requires_harness_with_dispatch_profile
+test_content_check_inconclusive_on_squash_then_base_touch
+test_sweep_forge_confirms_squash_merge_github
+test_sweep_keeps_when_forge_says_not_merged
+test_sweep_content_fallback_still_works_without_forge
+test_reconcile_refreshes_stale_head_from_live_meta
+test_reconcile_no_meta_leaves_entry_untouched
+test_reconcile_same_head_is_noop
+test_sweep_runs_reconcile_first

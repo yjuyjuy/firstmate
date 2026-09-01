@@ -13,8 +13,10 @@
 # Usage:
 #   fm-merge-queue.sh list [--raw]     surface entries; grouped by repo with compare
 #                                      links, or --raw for the tab-separated records
-#   fm-merge-queue.sh sweep            drop every entry whose branch is now merged
-#                                      into its base (fresh content-in-base check)
+#   fm-merge-queue.sh sweep            reconcile queue-vs-live-meta drift, then
+#                                      drop every entry whose branch is now merged
+#                                      into its base (content-in-base check, then a
+#                                      forge-confirmed check for the inconclusive case)
 #   fm-merge-queue.sh remove <id>      drop one entry by task id
 #   fm-merge-queue.sh count            print the number of queued branches
 #   fm-merge-queue.sh dispatch [--execute] [--min-batch N] [--harness H] [--model M] [--effort E]
@@ -47,6 +49,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
+STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 # shellcheck source=bin/fm-merge-queue-lib.sh
 . "$SCRIPT_DIR/fm-merge-queue-lib.sh"
@@ -184,6 +187,11 @@ case "$cmd" in
     done
     ;;
   sweep)
+    # Reconcile queue-vs-live-meta drift BEFORE the merged checks: an entry with
+    # a stale head but a live meta carrying a newer pr_head is refreshed to that
+    # head first, so the merged check below runs against the commit that landed
+    # rather than a stale head that could never sweep.
+    fm_merge_queue_reconcile_drift "$DATA" "$STATE" || true
     entries=$(fm_merge_queue_entries "$DATA")
     [ -n "$entries" ] || { echo "Merge queue: empty."; exit 0; }
     removed=0
@@ -194,7 +202,18 @@ case "$cmd" in
       case "$rc" in
         0) reason="$branch merged into $base" ;;
         "$FM_MERGE_QUEUE_BRANCH_GONE") reason="$branch gone from origin, merge unverified" ;;
-        *) continue ;;
+        *)
+          # Content-in-base was inconclusive (a squash/rebase merge the base
+          # later touched conflicts under merge-tree). Ask the forge directly
+          # whether the head landed in a merged PR; the content check stays the
+          # no-PR-automation fallback, this only ADDS a clear when the forge
+          # confirms it. Anything the forge cannot confirm keeps the entry.
+          if fm_merge_queue_forge_confirms_merged "$project" "$head" "$base"; then
+            reason="$branch merged into $base (forge-confirmed)"
+          else
+            continue
+          fi
+          ;;
       esac
       if fm_merge_queue_remove "$DATA" "$id"; then
         echo "cleared: $id ($reason)"

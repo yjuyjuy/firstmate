@@ -788,6 +788,19 @@ if [ "$MERGE_QUEUE_COUNT" -gt 0 ]; then
   subsection "Finished work still waiting to merge"
   printf '%s finished branch(es) are pushed but not merged yet; run bin/fm-merge-queue.sh list for the batched compare links.\n' \
     "$MERGE_QUEUE_COUNT"
+  # Drift flag: an id that is BOTH in the merge queue AND has a live state/<id>.meta
+  # is a released ship branch whose task is somehow still tracked as live, so the
+  # queued head can be stale against a newer pr_head the meta records. Name each so
+  # the sweep's drift reconcile (bin/fm-merge-queue.sh sweep) is run against it.
+  MERGE_QUEUE_DRIFT=$("$SCRIPT_DIR/fm-merge-queue.sh" list --raw 2>/dev/null \
+    | while IFS='	' read -r mq_id _; do
+        [ -n "$mq_id" ] || continue
+        [ -f "$STATE/$mq_id.meta" ] && printf '%s\n' "$mq_id"
+      done)
+  if [ -n "$MERGE_QUEUE_DRIFT" ]; then
+    printf 'These queued branches also still have a live task record, so the queued head may be stale; run bin/fm-merge-queue.sh sweep to reconcile: %s\n' \
+      "$(printf '%s' "$MERGE_QUEUE_DRIFT" | tr '\n' ' ' | sed 's/ $//')"
+  fi
 fi
 
 subsection "Host resources"
