@@ -230,6 +230,7 @@ run_spawn_jcode() {  # <home> <proj> <wt> <fakebin> <id> <sessions_dir>
     FM_SPAWN_NO_GUARD=1 TMUX="fake,1,0" \
     FM_FAKE_PANE_PATH="$wt" \
     FM_SPAWN_JCODE_READY_POLLS=0 \
+    FM_TOKEN_CAPTURE_RETRIES=0 FM_TOKEN_CAPTURE_SLEEP=0 \
     JCODE_SESSIONS_DIR="$sdir" \
     PATH="$fakebin:$PATH" \
     "$SPAWN" "$id" "$proj" 2>&1
@@ -325,6 +326,89 @@ EOF
   assert_no_grep "session_id=" "$home/state/$id.meta" \
     "an unresolvable session stamped session_id into meta"
   pass "an unresolvable session records no row and does not fail the spawn"
+}
+
+# --- capture: retry + verify + diagnostic -----------------------------------
+
+test_capture_happy_path_records_and_prints_id() {
+  command -v python3 >/dev/null 2>&1 || { echo "skip: python3 not found"; return 0; }
+  local base="$TMP_ROOT/cap1" data="$TMP_ROOT/cap1/data" sdir="$TMP_ROOT/cap1/sessions" wt="$TMP_ROOT/cap1/wt"
+  mkdir -p "$data" "$sdir" "$wt"
+  local wt_real; wt_real=$(cd "$wt" && pwd -P)
+  write_session "$sdir" crew "$wt_real" "2099-01-01T00:00:00Z"
+  local out
+  out=$(FM_TOKEN_CAPTURE_RETRIES=1 FM_TOKEN_CAPTURE_SLEEP=0 \
+    fm_token_sessions_capture "$data" cap-a "$wt_real" 2026-08-17T12:00:00Z jcode "$sdir") \
+    || fail "capture returned non-zero on a resolvable session"
+  [ "$out" = session_crew ] || fail "capture did not print the resolved id: '$out'"
+  local file; file=$(fm_token_sessions_file "$data")
+  [ "$(entry_count "$file")" = 1 ] || fail "capture wrote other than 1 row"
+  grep -q "^cap-a	session_crew	" "$file" || fail "capture row missing/wrong"
+  pass "capture records one row and prints the resolved session id"
+}
+
+test_capture_retries_a_transient_miss() {
+  command -v python3 >/dev/null 2>&1 || { echo "skip: python3 not found"; return 0; }
+  # The session json is written ASYNCHRONOUSLY, appearing only AFTER capture has
+  # already begun polling. A single-shot resolve would miss it and drop the row
+  # silently (the live leak). Capture must retry until the store settles.
+  local base="$TMP_ROOT/cap2" data="$TMP_ROOT/cap2/data" sdir="$TMP_ROOT/cap2/sessions" wt="$TMP_ROOT/cap2/wt"
+  mkdir -p "$data" "$sdir" "$wt"
+  local wt_real; wt_real=$(cd "$wt" && pwd -P)
+  # Background writer: create the session file shortly after capture starts.
+  ( sleep 0.2; write_session "$sdir" crew "$wt_real" "2099-01-01T00:00:00Z" ) &
+  local writer=$!
+  local out status
+  out=$(FM_TOKEN_CAPTURE_RETRIES=60 FM_TOKEN_CAPTURE_SLEEP=0.05 \
+    fm_token_sessions_capture "$data" cap-b "$wt_real" 2026-08-17T12:00:00Z jcode "$sdir")
+  status=$?
+  wait "$writer" 2>/dev/null || true
+  [ "$status" -eq 0 ] || fail "capture failed to retry a transient miss (status=$status)"
+  [ "$out" = session_crew ] || fail "capture did not resolve after retry: '$out'"
+  local file; file=$(fm_token_sessions_file "$data")
+  grep -q "^cap-b	session_crew	" "$file" || fail "retry did not land a ledger row"
+  pass "capture retries a transient store miss and still lands the row"
+}
+
+test_capture_gives_up_with_diagnostic_no_row() {
+  command -v python3 >/dev/null 2>&1 || { echo "skip: python3 not found"; return 0; }
+  # A readable store that never yields a matching session: capture exhausts its
+  # bounded retries, writes NO row, and logs ONE clear diagnostic (not silent).
+  local base="$TMP_ROOT/cap3" data="$TMP_ROOT/cap3/data" sdir="$TMP_ROOT/cap3/sessions" wt="$TMP_ROOT/cap3/wt"
+  mkdir -p "$data" "$sdir" "$wt"
+  local wt_real; wt_real=$(cd "$wt" && pwd -P)
+  write_session "$sdir" elsewhere "$base/other" "2099-01-01T00:00:00Z"
+  local out status err
+  err=$(FM_TOKEN_CAPTURE_RETRIES=2 FM_TOKEN_CAPTURE_SLEEP=0 \
+    fm_token_sessions_capture "$data" cap-c "$wt_real" 2026-08-17T12:00:00Z jcode "$sdir" 2>&1 >/dev/null)
+  status=$?
+  [ "$status" -ne 0 ] || fail "capture returned 0 on a permanent miss"
+  case "$err" in
+    *"capture MISS"*"cap-c"*) : ;;
+    *) fail "capture did not log a clear MISS diagnostic: '$err'" ;;
+  esac
+  local file; file=$(fm_token_sessions_file "$data")
+  [ ! -f "$file" ] || [ "$(entry_count "$file")" = 0 ] || fail "give-up wrote a ledger row"
+  pass "capture gives up after bounded retries with a diagnostic and no row"
+}
+
+test_capture_skips_unreadable_harness_without_noise() {
+  # A harness whose store this fleet cannot read is skipped WITHOUT retrying or
+  # logging a false alarm - retry cannot make an unreadable store resolve.
+  local data="$TMP_ROOT/cap4/data"
+  mkdir -p "$data"
+  fm_harness_session_store_readable jcode || fail "jcode store must be readable"
+  fm_harness_session_store_readable opencode && fail "opencode store must be unreadable today"
+  fm_harness_session_store_readable deepseek && fail "deepseek store must be unreadable today"
+  local out status err
+  err=$(FM_TOKEN_CAPTURE_RETRIES=99 FM_TOKEN_CAPTURE_SLEEP=9 \
+    fm_token_sessions_capture "$data" cap-d /wt/x 2026-08-17T12:00:00Z opencode "$TMP_ROOT/cap4/none" 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "capture returned 0 for an unreadable harness"
+  [ -z "$err" ] || fail "capture logged noise for an unreadable harness: '$err'"
+  local file; file=$(fm_token_sessions_file "$data")
+  [ ! -f "$file" ] || [ "$(entry_count "$file")" = 0 ] || fail "unreadable harness wrote a row"
+  pass "capture skips an unreadable harness immediately, no retry, no diagnostic"
 }
 
 # --- session-start sentinel -------------------------------------------------
@@ -444,5 +528,9 @@ test_rows_for_reads_exact_id_in_order
 test_spawn_captures_jcode_session
 test_spawn_relaunch_appends_second_row
 test_spawn_unresolvable_writes_nothing
+test_capture_happy_path_records_and_prints_id
+test_capture_retries_a_transient_miss
+test_capture_gives_up_with_diagnostic_no_row
+test_capture_skips_unreadable_harness_without_noise
 test_session_start_records_sentinel
 test_teardown_preserves_ledger

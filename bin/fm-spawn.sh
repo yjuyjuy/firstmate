@@ -1988,38 +1988,41 @@ fi
 # the agent is launched and its session exists, resolve the crew's harness
 # session id (working_dir == the leased worktree, created_at >= SPAWN_TS, newest
 # wins) and (a) append one durable ledger row and (b) stamp session_id= into the
-# meta. This runs on EVERY spawn, so a relaunch/recovery spawn for the same
-# ticket id lands as an ADDITIONAL ledger row (many-rows-per-id). A resolve that
-# returns empty (no matching session, or a harness whose session store we cannot
-# read) writes NOTHING - no bogus ledger row, no session_id in meta - and never
-# fails the spawn. Only jcode's store is readable today; every other harness
-# resolves empty and is skipped, not guessed.
-if [ "$HARNESS" = jcode ]; then
-  CREW_SESSION_ID=$(fm_resolve_crew_session_id "$WT" "$SPAWN_TS" 2>/dev/null || true)
-  if [ -n "$CREW_SESSION_ID" ]; then
-    if fm_token_sessions_record "$DATA" "$ID" "$CREW_SESSION_ID" "$WT" "$SPAWN_TS" "$HARNESS" 2>/dev/null; then
-      echo "session_id=$CREW_SESSION_ID" >> "$STATE/$ID.meta"
-    fi
-    # Resume-token capture (best-effort, NEVER a spawn blocker). The dead-session
-    # recovery counterpart to the attribution ledger above: stuck-crewmate
-    # recovery can RESUME this harness session in place - restoring its full turn
-    # history, the brief and every step of progress - instead of restarting from
-    # scratch. For jcode the resolved session id IS the `jcode --resume <id>`
-    # token (fm_resume_token_for_harness), so no second lookup is needed; a future
-    # harness whose resume token differs would diverge inside that helper. The
-    # token is stamped resume= into meta (bin/fm-resume-cmd.sh reads it during
-    # recovery) and, for a backlog-tracked ship/scout task, mirrored into the
-    # durable task record via `tasks-axi update --resume` so it survives even a
-    # meta teardown. A secondmate is persistent and never a backlog item, so it
-    # gets the meta stamp only. Empty token, a manual backlog backend, an
-    # incompatible tasks-axi, or a task the backlog does not know all resolve to
-    # "no mirror", silently - none fails the spawn.
-    RESUME_TOKEN=$(fm_resume_token_for_harness "$HARNESS" "$CREW_SESSION_ID")
-    if [ -n "$RESUME_TOKEN" ]; then
-      echo "resume=$RESUME_TOKEN" >> "$STATE/$ID.meta"
-      if [ "$KIND" != secondmate ] && fm_tasks_axi_backend_available "$CONFIG"; then
-        ( cd "$FM_HOME" && tasks-axi update "$ID" --resume "$RESUME_TOKEN" ) >/dev/null 2>&1 || true
-      fi
+# meta. This runs on EVERY spawn REGARDLESS of harness, so no backend is exempt
+# by construction: fm_token_sessions_capture itself asks whether THIS harness's
+# session store is readable (fm_harness_session_store_readable) and skips a
+# harness it cannot read, so the exemption decision lives in ONE place (the lib),
+# never as a bare `= jcode` literal here. A relaunch/recovery spawn for the same
+# ticket id lands as an ADDITIONAL ledger row (many-rows-per-id).
+#
+# Capture RETRIES while the harness writes its session json asynchronously (the
+# store file often does not exist yet at this instant), then VERIFIES the write,
+# so a transient miss no longer silently drops the row - the live attribution
+# leak this fixes. A give-up (unreadable store, or no session after the retry
+# bound) writes NOTHING - no bogus ledger row, no session_id in meta - logs a
+# clear diagnostic (for a readable store only), and never fails the spawn.
+CREW_SESSION_ID=$(fm_token_sessions_capture "$DATA" "$ID" "$WT" "$SPAWN_TS" "$HARNESS" 2>>"$STATE/$ID.spawn.log" || true)
+if [ -n "$CREW_SESSION_ID" ]; then
+  echo "session_id=$CREW_SESSION_ID" >> "$STATE/$ID.meta"
+  # Resume-token capture (best-effort, NEVER a spawn blocker). The dead-session
+  # recovery counterpart to the attribution ledger above: stuck-crewmate
+  # recovery can RESUME this harness session in place - restoring its full turn
+  # history, the brief and every step of progress - instead of restarting from
+  # scratch. For jcode the resolved session id IS the `jcode --resume <id>`
+  # token (fm_resume_token_for_harness), so no second lookup is needed; a future
+  # harness whose resume token differs would diverge inside that helper. The
+  # token is stamped resume= into meta (bin/fm-resume-cmd.sh reads it during
+  # recovery) and, for a backlog-tracked ship/scout task, mirrored into the
+  # durable task record via `tasks-axi update --resume` so it survives even a
+  # meta teardown. A secondmate is persistent and never a backlog item, so it
+  # gets the meta stamp only. Empty token, a manual backlog backend, an
+  # incompatible tasks-axi, or a task the backlog does not know all resolve to
+  # "no mirror", silently - none fails the spawn.
+  RESUME_TOKEN=$(fm_resume_token_for_harness "$HARNESS" "$CREW_SESSION_ID")
+  if [ -n "$RESUME_TOKEN" ]; then
+    echo "resume=$RESUME_TOKEN" >> "$STATE/$ID.meta"
+    if [ "$KIND" != secondmate ] && fm_tasks_axi_backend_available "$CONFIG"; then
+      ( cd "$FM_HOME" && tasks-axi update "$ID" --resume "$RESUME_TOKEN" ) >/dev/null 2>&1 || true
     fi
   fi
 fi

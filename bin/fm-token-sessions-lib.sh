@@ -203,6 +203,100 @@ PY
   return 0
 }
 
+# True when a harness's session store is readable by fm_resolve_crew_session_id,
+# so per-ticket attribution can be captured for it. Args: harness.
+#
+# WHY this predicate exists as its own function: the attribution leak this file
+# guards against had TWO causes, and this is the fix for the second. The capture
+# in bin/fm-spawn.sh was gated on a bare `[ "$HARNESS" = jcode ]` literal at the
+# CALL SITE, so every non-jcode backend was silently exempt from attribution -
+# its sessions landed "unattributed" by construction, not by a failed lookup.
+# Naming the readable-store set ONCE, here, means the capture path asks a single
+# question ("can I read this harness's store?") instead of hard-coding jcode, and
+# a future harness whose store becomes readable is added in exactly one place.
+#
+# Only jcode's store is readable today: fm_resolve_crew_session_id reads the
+# jcode session store (session_*.json), and no other harness exposes an
+# equivalent store this fleet can parse. A harness NOT in this set resolves no
+# session and is skipped (not guessed) - the same fail-closed limitation the
+# resolver already has - but now that skip is a deliberate, named decision rather
+# than a silent literal, and the capture path can log a clear reason for it.
+fm_harness_session_store_readable() {
+  case "$1" in
+    jcode) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Capture and DURABLY RECORD one token-session ledger row for a just-launched
+# crew session, retrying while the harness store settles and verifying the write,
+# so a spawn ALWAYS lands a row (or logs exactly why it could not) instead of
+# silently dropping attribution. Args:
+#   data_dir id working_dir spawn_ts harness [sessions_dir]
+# On success prints the resolved session_id to stdout and returns 0 (the caller
+# stamps session_id= into meta from it). On a give-up prints NOTHING to stdout,
+# writes ONE clear diagnostic to stderr, and returns non-zero. NEVER a spawn
+# blocker: the caller ignores the return for spawn success and only uses the
+# stdout id.
+#
+# WHY retry: capture is post-launch and best-effort, but the harness writes its
+# session_*.json ASYNCHRONOUSLY - at the instant fm-spawn fires the launch and
+# immediately resolves, the store file often does not exist yet, so a single-shot
+# resolve returns empty and the row is dropped SILENTLY. That silent drop is the
+# live attribution leak this task fixes (13 sessions / 275M tokens unattributed
+# in-window). Retrying a bounded number of times with a short sleep lets the
+# store settle so the newest-at/after-spawn session resolves, and a give-up after
+# the bound logs a diagnostic naming the id and worktree rather than vanishing.
+#
+# FAIL-CLOSED still holds: a harness whose store is not readable
+# (fm_harness_session_store_readable false) is skipped WITHOUT retrying or logging
+# a false alarm, because no amount of retry makes an unreadable store resolve.
+# A resolvable-but-unwritable ledger (record fails) is logged and returns
+# non-zero. The write is verified by re-reading the exact (id, session_id) pair
+# back from the ledger, so a partial or lost append is caught, not assumed.
+#
+# The retry bound and per-try sleep are overridable via FM_TOKEN_CAPTURE_RETRIES
+# (default 8) and FM_TOKEN_CAPTURE_SLEEP (default 0.25s) so a test can drive the
+# retry path fast and deterministically; production uses the defaults.
+fm_token_sessions_capture() {
+  local data_dir=$1 id=$2 working_dir=$3 spawn_ts=$4 harness=$5
+  local sessions_dir=${6:-${JCODE_SESSIONS_DIR:-$HOME/.jcode/sessions}}
+  local retries=${FM_TOKEN_CAPTURE_RETRIES:-8}
+  local sleep_s=${FM_TOKEN_CAPTURE_SLEEP:-0.25}
+  # Skip a harness with no readable store: it can never resolve, so retrying and
+  # logging would be pure noise. This is a deliberate, named skip, not a silent
+  # exemption at the call site.
+  if ! fm_harness_session_store_readable "$harness"; then
+    return 1
+  fi
+  local sid attempt=0 file
+  while :; do
+    sid=$(fm_resolve_crew_session_id "$working_dir" "$spawn_ts" "$sessions_dir" 2>/dev/null || true)
+    if [ -n "$sid" ]; then
+      break
+    fi
+    attempt=$((attempt + 1))
+    if [ "$attempt" -gt "$retries" ]; then
+      echo "token-sessions: capture MISS for id='$id' harness='$harness' worktree='$working_dir': no session resolved after $retries retries; row DROPPED (attribution leak)" >&2
+      return 1
+    fi
+    sleep "$sleep_s" 2>/dev/null || true
+  done
+  if ! fm_token_sessions_record "$data_dir" "$id" "$sid" "$working_dir" "$spawn_ts" "$harness" 2>/dev/null; then
+    echo "token-sessions: capture RECORD FAILED for id='$id' session='$sid' worktree='$working_dir': ledger append refused; row DROPPED" >&2
+    return 1
+  fi
+  # Verify the write actually landed by reading the exact (id, session_id) pair
+  # back, so a lost or partial append is caught rather than assumed successful.
+  file=$(fm_token_sessions_file "$data_dir")
+  if ! fm_token_sessions_rows_for "$data_dir" "$id" 2>/dev/null | grep -q "^$id"$'\t'"$sid"$'\t'; then
+    echo "token-sessions: capture VERIFY FAILED for id='$id' session='$sid' (ledger '$file' has no matching row after append); row DROPPED" >&2
+    return 1
+  fi
+  printf '%s' "$sid"
+  return 0
+}
+
 # Read a session's ACTUAL model and reasoning effort from the jcode session
 # store - the ground truth for whether /model and /effort actually applied to a
 # session (pane echo is not proof; incident 2026-08-23, data/learnings.md
