@@ -851,7 +851,11 @@ test_nonterminal_stale_not_working_nudged_once_then_escalated() {
   i=0
   while [ "$i" -lt 200 ]; do
     kill -0 "$pid" 2>/dev/null || { reap "$pid"; fail "watcher exited for a first-sight stopped crew (should nudge and absorb): $(cat "$out")"; }
-    [ -e "$state/.stale-nudged-$key" ] && break
+    # Wait on the LAST-written marker: nudge_stale_worker records
+    # .stale-nudged-$key first, then surface_nonterminal_stale arms the
+    # .stale-since-$key timer. Break on .stale-nudged alone races the timer
+    # write, so poll until the timer is armed (which implies the nudge marker).
+    [ -s "$state/.stale-since-$key" ] && break
     sleep 0.1
     i=$((i + 1))
   done
