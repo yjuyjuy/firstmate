@@ -44,6 +44,8 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 PROJECTS="${FM_PROJECTS_OVERRIDE:-$FM_HOME/projects}"
 # shellcheck source=bin/fm-doclint-batch-lib.sh
 . "$SCRIPT_DIR/fm-doclint-batch-lib.sh"
+# shellcheck source=bin/fm-brief-scaffold-lib.sh
+. "$SCRIPT_DIR/fm-brief-scaffold-lib.sh"
 
 usage() {
   sed -n '2,36p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
@@ -149,6 +151,23 @@ Steps:
 Report the outcome: \`done: doclint pass PR <url>\`, \`done: doclint pass branch $branch pushed <head> - firstmate opens PR\`, or \`done: doclint pass clean, no fixes\`.
 
 NOTE: this touches PROJECT code via the normal delivery path, not firstmate shared material - do not edit firstmate's own bin/ or docs here.
+
+# Setup
+You are in a disposable git worktree of $repo, at a detached HEAD on a clean default branch.
+
+$FM_BRIEF_ISOLATION_BLOCK
+
+The branch this pass cuts is the dated \`$branch\` off \`origin/dev\` (step 1), not \`fm/<id>\`.
+
+# Rules
+1. Never push to the default branch. Never merge a PR. The pass commits fixes locally; only the second push-legal no-mistakes run (step 6) may push, and it pushes your \`$branch\` branch for captain merge.
+2. Stay inside this worktree; modify nothing outside it.
+3. Use gh-axi for GitHub and chrome-devtools-axi for browser operations.
+4. Report status by appending one line to the status file firstmate gave you. States: working, needs-decision, blocked, paused, done, failed. A mid-task \`working:\` line is nonterminal; continue until a defined \`done:\` outcome above. An auth session-limit, usage-window/quota exhaustion, or revoked/expired token is captain-fixable, so report it \`blocked:\`, never \`paused:\`.
+5. If you hit the same obstacle twice, append \`blocked: {why}\` and stop.
+6. Never stop, restart, or update the shared \`no-mistakes\` daemon. On ANY daemon error, append \`blocked: {the daemon error}\` and stop.
+
+$FM_BRIEF_CAPTAIN_RULES
 EOF
     ;;
   marker-read)

@@ -191,6 +191,39 @@ test_brief_emits_two_phase_pr_delivery() {
   pass "brief emits the two-phase pass+PR flow off origin/dev without a hand-push bypass"
 }
 
+# The emitted brief must carry the SAME structural safety scaffold every ship
+# brief gets from bin/fm-brief.sh: the Setup/worktree-isolation verification
+# section that step 1 already points at ("Setup below"), the Rule-1
+# never-push-to-the-default-branch guard, and the C1-C6 captain-rules block. The
+# mode-correct "never hand-push / never merge / PR for captain merge" delivery
+# wording (landed in #185) must survive alongside it. History: a 2026-08-20 lane
+# followed a raw self-land instruction and hand-pushed to hyfin origin/dev.
+test_brief_carries_ship_safety_scaffold() {
+  local out
+  out=$(FM_ROOT_OVERRIDE="$ROOT" "$CLI" brief hyfin)
+  # Setup / worktree-isolation section that step 1's "Setup below" points at.
+  assert_contains "$out" "# Setup" \
+    "brief must carry the Setup section its step 1 points at"
+  assert_contains "$out" "Verify isolation before anything else" \
+    "brief must carry the worktree-isolation verification"
+  # Rule-1 default-branch guard.
+  assert_contains "$out" "Never push to the default branch" \
+    "brief must carry the Rule-1 default-branch guard"
+  # The C1-C6 captain-rules block.
+  assert_contains "$out" "# Standing captain rules" \
+    "brief must carry the standing captain-rules block"
+  assert_contains "$out" "C1. Never force anything" \
+    "brief must carry the C1 never-force rule"
+  assert_contains "$out" "C6. If this task came from a Mattermost thread" \
+    "brief must carry the full C1-C6 block through C6"
+  # The mode-correct delivery wording (#185) must survive the scaffold add.
+  assert_contains "$out" "Never hand-push, never merge" \
+    "brief must keep the never-hand-push / never-merge delivery wording"
+  assert_contains "$out" "for captain merge" \
+    "brief must keep the PR-for-captain-merge delivery wording"
+  pass "brief carries the ship safety scaffold (Setup, Rule-1, C1-C6) with delivery wording intact"
+}
+
 # --- (c) marker-ref advance safety ------------------------------------------
 
 test_marker_advance_fast_forward_only() {
@@ -292,6 +325,7 @@ test_no_marker_counts_all_ship_lanes
 test_dual_format_close_field_windows_by_day
 test_status_line_shape
 test_brief_emits_two_phase_pr_delivery
+test_brief_carries_ship_safety_scaffold
 test_marker_advance_fast_forward_only
 test_marker_advance_refuses_non_fast_forward
 test_marker_helpers_reject_unsafe_repo
