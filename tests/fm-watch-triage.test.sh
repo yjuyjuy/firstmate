@@ -1127,14 +1127,19 @@ test_exited_declared_pause_is_bounded_but_live_gate_surfaces() {
   wait_for_exit "$pid" 200 || { reap "$pid"; fail "dead-agent declared pause did not surface its one bounded recheck"; }
   # Rounds 2-6: with the resurface marker now set, every further poll of the same
   # unchanged pane must ABSORB (stay alive, append no new wake) until the long
-  # PAUSE_RESURFACE_SECS cadence elapses. That decision is gated on the marker's
-  # age, not on timing, so a slow host cannot make it falsely re-surface: a watcher
-  # that DIES here surfaced a second wake and is a real flood regression.
+  # PAUSE_RESURFACE_SECS cadence elapses. The re-surface throttle is anchored on
+  # the marker mtime written in round 1, which is WALL-CLOCK: with the round-1
+  # window (240s) these rounds would falsely re-surface on a slow host whose
+  # rounds 2-6 happen to span more than 240s of real time (the CI flood seen as
+  # "flooded 2 stale wakes"). Use a window far larger than any plausible host load
+  # here so the absorb decision is deterministic; round 1 already fired with its
+  # own 240s window against a 500s-old status, so this only governs re-surface.
+  # A watcher that DIES here surfaced a second wake and is a real flood regression.
   round=2
   while [ "$round" -le 6 ]; do
     PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
       FM_FAKE_TMUX_CURRENT_COMMAND=zsh FM_FAKE_CREW_STATE='state: stopped · source: pane · bare shell' \
-      FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_PAUSE_RESURFACE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+      FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_PAUSE_RESURFACE_SECS=86400 FM_POLL=1 FM_SIGNAL_GRACE=1 \
       FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" >> "$out" &
     pid=$!
     wait_live "$pid" 15 || { wait "$pid" 2>/dev/null; fail "dead-agent declared pause re-surfaced on poll $round (should absorb on the bounded cadence, not flood)"; }
