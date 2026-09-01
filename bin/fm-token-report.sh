@@ -469,7 +469,9 @@ def to_epoch(s):
 # anywhere: every lookup is a read, memoized only in this process.
 
 nm_db = os.environ.get("FM_TR_NM_DB", "")
-nm_worktrees = os.path.join(os.path.dirname(nm_db), "worktrees") if nm_db else ""
+nm_worktrees = (
+    os.path.realpath(os.path.join(os.path.dirname(nm_db), "worktrees")) if nm_db else ""
+)
 _nm_conn = None
 _nm_conn_tried = False
 _nm_cache = {}
