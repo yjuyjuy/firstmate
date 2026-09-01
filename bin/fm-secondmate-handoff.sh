@@ -31,7 +31,12 @@ set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
-FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
+# Resolve THIS home and export it so the internal fm-send calls inherit it. A
+# caller's explicit FM_HOME always wins; a bare invocation resolves it from this
+# home-scoped script's own root. Without the export, a bare invocation left
+# FM_HOME unset in the child fm-send, which fails closed (bin/fm-send.sh) and
+# aborted the handoff mid-sequence.
+export FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 

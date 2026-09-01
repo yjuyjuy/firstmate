@@ -133,6 +133,106 @@ test_env_force_bypasses_threshold() {
   pass "FM_SM_HANDOFF_FORCE env bypasses the threshold like --force"
 }
 
+# Regression: the internal fm-send calls must inherit FM_HOME. The script
+# resolves FM_HOME but a prior version never EXPORTED it, so a bare invocation
+# (no FM_HOME in env) left it unset in the child fm-send, which fails closed
+# (bin/fm-send.sh) and aborted the handoff mid-sequence. The dry-run tests above
+# never catch this because dry-run does not exec the child fm-send. This builds a
+# real firstmate home whose bin/ shadows fm-send.sh and fm-spawn.sh with
+# recorders that capture the FM_HOME they were invoked with, then drives the
+# idempotent-resume path (capture already complete) so the child calls run for
+# real without a live backend.
+#
+# fm_setup_shadow_home <name> echoes: <fmhome> <smhome>. The fmhome bin/ is a
+# symlink farm of the real bin (so fm-backend.sh and the adapters resolve) with
+# fm-send.sh / fm-spawn.sh replaced by FM_HOME recorders writing to
+# <fmhome>/data/fm-send.env and fm-spawn.env.
+fm_setup_shadow_home() {  # <name>
+  local name=$1 f fmhome smhome
+  fmhome="$TMP_ROOT/$name"; smhome="$TMP_ROOT/$name-sm"
+  mkdir -p "$fmhome/data" "$fmhome/state" "$fmhome/config" "$fmhome/bin" "$smhome/data"
+  : > "$fmhome/AGENTS.md"
+  for f in "$ROOT/bin"/*; do
+    ln -s "$f" "$fmhome/bin/$(basename "$f")"
+  done
+  # Recorders: capture the FM_HOME the internal call inherited. A missing
+  # FM_HOME (the pre-fix bug) records the literal token UNSET so the assertion
+  # fails loudly instead of on an empty string.
+  for f in fm-send fm-spawn; do
+    rm -f "$fmhome/bin/$f.sh"
+    cat > "$fmhome/bin/$f.sh" <<REC
+#!/usr/bin/env bash
+printf '%s\n' "\${FM_HOME:-UNSET}" >> "$fmhome/data/$f.env"
+exit 0
+REC
+    chmod +x "$fmhome/bin/$f.sh"
+  done
+  # Secondmate meta + a completed prior capture so capture_complete() is true and
+  # the run resumes straight at the child fm-spawn/fm-send calls.
+  {
+    printf 'window=test:fm-sm\n'
+    printf 'worktree=%s\nharness=claude\nkind=secondmate\nhome=%s\n' "$smhome" "$smhome"
+  } > "$fmhome/state/sm.meta"
+  printf 'continuation\n' > "$smhome/data/handoff-latest.md"
+  : > "$smhome/data/.handoff-done"
+  printf '%s\t%s\n' "$fmhome" "$smhome"
+}
+
+test_bare_invocation_exports_fm_home_to_children() {
+  local fmhome smhome status
+  IFS=$'\t' read -r fmhome smhome < <(fm_setup_shadow_home export-bare)
+  # BARE: no FM_HOME in env. The script must resolve and export it from its own
+  # root so the child fm-send/fm-spawn inherit it. FM_SM_HANDOFF_POLL keeps the
+  # post-respawn sleep short.
+  ( unset FM_HOME
+    FM_SM_HANDOFF_POLL=0 FM_SM_HANDOFF_EXIT_TIMEOUT=1 \
+      "$fmhome/bin/fm-secondmate-handoff.sh" sm --force >/dev/null 2>&1 )
+  status=$?
+  expect_code 0 "$status" "bare handoff should complete"
+  [ -f "$fmhome/data/fm-send.env" ] || fail "bare invocation never reached the child fm-send"
+  [ -f "$fmhome/data/fm-spawn.env" ] || fail "bare invocation never reached the child fm-spawn"
+  assert_not_contains "$(cat "$fmhome/data/fm-send.env")" "UNSET" "child fm-send must inherit FM_HOME, never unset"
+  assert_contains "$(cat "$fmhome/data/fm-send.env")" "$fmhome" "child fm-send must inherit THIS home"
+  assert_contains "$(cat "$fmhome/data/fm-spawn.env")" "$fmhome" "child fm-spawn must inherit THIS home"
+  pass "a bare invocation exports FM_HOME so the internal fm-send/fm-spawn never fail closed"
+}
+
+test_caller_fm_home_preserved() {
+  local scripthome caller smhome status f
+  # Split the two homes so a wrong override is observable: the SCRIPT lives in
+  # scripthome (its own root), but the secondmate meta + completed capture live
+  # in a DIFFERENT caller home. If the script respected its own root instead of
+  # the caller's FM_HOME, state resolution would miss the meta and fail
+  # "no metadata"; a clean completion proves the caller's FM_HOME won.
+  scripthome="$TMP_ROOT/caller-script"; caller="$TMP_ROOT/caller-home"; smhome="$TMP_ROOT/caller-sm"
+  mkdir -p "$scripthome/data" "$scripthome/state" "$scripthome/config" "$scripthome/bin" \
+           "$caller/data" "$caller/state" "$caller/config" "$smhome/data"
+  : > "$scripthome/AGENTS.md"; : > "$caller/AGENTS.md"
+  for f in "$ROOT/bin"/*; do ln -s "$f" "$scripthome/bin/$(basename "$f")"; done
+  for f in fm-send fm-spawn; do
+    rm -f "$scripthome/bin/$f.sh"
+    cat > "$scripthome/bin/$f.sh" <<REC
+#!/usr/bin/env bash
+printf '%s\n' "\${FM_HOME:-UNSET}" >> "$caller/data/$f.env"
+exit 0
+REC
+    chmod +x "$scripthome/bin/$f.sh"
+  done
+  # Meta + completed capture in the CALLER home only.
+  {
+    printf 'window=test:fm-sm\n'
+    printf 'worktree=%s\nharness=claude\nkind=secondmate\nhome=%s\n' "$smhome" "$smhome"
+  } > "$caller/state/sm.meta"
+  printf 'continuation\n' > "$smhome/data/handoff-latest.md"; : > "$smhome/data/.handoff-done"
+  ( FM_HOME="$caller" FM_SM_HANDOFF_POLL=0 FM_SM_HANDOFF_EXIT_TIMEOUT=1 \
+      "$scripthome/bin/fm-secondmate-handoff.sh" sm --force >/dev/null 2>&1 )
+  status=$?
+  expect_code 0 "$status" "caller-FM_HOME handoff should complete (meta found in the caller home)"
+  assert_contains "$(cat "$caller/data/fm-send.env")" "$caller" "child fm-send must inherit the caller's FM_HOME"
+  assert_not_contains "$(cat "$caller/data/fm-send.env")" "$scripthome" "must not override the caller's valid FM_HOME with the script root"
+  pass "a caller-provided FM_HOME is preserved and passed to the internal calls"
+}
+
 test_capture_idempotent() {
   local fmhome home config out
   IFS=$'\t' read -r fmhome home config < <(setup_home idem 260000)
@@ -152,6 +252,8 @@ test_dry_run_full_sequence_over_threshold
 test_no_stale_instruction_reference
 test_force_bypasses_threshold
 test_env_force_bypasses_threshold
+test_bare_invocation_exports_fm_home_to_children
+test_caller_fm_home_preserved
 test_capture_idempotent
 
 echo "# all fm-secondmate-handoff tests passed"
