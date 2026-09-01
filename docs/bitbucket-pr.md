@@ -117,8 +117,22 @@ https://bitbucket.org/dashnow/hyfin/pull-requests/3613
 `bin/fm-pr-check.sh` then armed the merge watch with the same credentials.
 So firstmate opening a Bitbucket pull request itself is proven, not theoretical.
 
-In `direct-push` delivery the no-mistakes pipeline itself still opens no PR, and the crew env does not carry the Bitbucket credentials, so a crew `missing NO_MISTAKES_BITBUCKET_EMAIL` report is expected rather than a failure.
+In `direct-push` delivery the no-mistakes pipeline's own PR and CI steps do not apply on this forge, so the pipeline never reaches the Bitbucket PR step regardless of whether the crew now carries the credentials (see the crew-forwarding section below).
 Firstmate opens the pull request itself after the crew's validated branch is pushed, sourcing the `.env` credentials, so this is not a captain-side-only step.
+
+## Crew credential forwarding for Bitbucket-origin lanes
+
+Before this change the crew's pane shell never carried the `NO_MISTAKES_BITBUCKET_*` credentials, so a crew running the no-mistakes pipeline on a Bitbucket product repository passed every local gate and then skipped the PR and CI steps, and every Bitbucket pull request fell to firstmate to open by hand.
+`bin/fm-spawn.sh` now forwards the credentials into the crew pane shell, but only for a lane whose project origin resolves to a `bitbucket.org` repository, so a crew on a Bitbucket repo can complete its own PR path end to end.
+
+The forwarding is deliberately narrow and owned by `bin/fm-crew-bitbucket-env-lib.sh`:
+
+- Only the allowlisted `NO_MISTAKES_BITBUCKET_EMAIL`, `NO_MISTAKES_BITBUCKET_API_TOKEN`, and `NO_MISTAKES_BITBUCKET_API_BASE_URL` are forwarded, never the whole `.env`.
+- Forwarding happens only when `fm_pr_bitbucket_origin_slug` (`bin/fm-pr-lib.sh`) resolves the project origin to a `bitbucket.org` repository. A GitHub-origin lane, a lane with no resolvable `bitbucket.org` origin, and a secondmate home receive nothing, so a token never reaches a crew with no Bitbucket work.
+- No secret value is hardcoded. Values are read at spawn time from the process environment first, then from the home's private `.env` as a fallback (the same precedence `bin/fm-merge-queue-poll.sh`'s `ensure_credentials` uses).
+- A Bitbucket-origin lane with no credentials available forwards nothing and does not fail the spawn, so the crew reports the same expected `missing NO_MISTAKES_BITBUCKET_EMAIL` it did before rather than hard-failing.
+
+Behavior is proven by `tests/fm-crew-bitbucket-env.test.sh`, which asserts a Bitbucket-origin lane forwards the allowlisted credentials (including from `.env`), a GitHub-origin lane forwards nothing, and no non-allowlisted variable is ever forwarded.
 
 ## Registry flip is a separate captain decision
 
