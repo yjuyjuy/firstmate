@@ -393,6 +393,137 @@ test_wake_path_grace_suppresses_first_sighting() {
   pass "fm-guard: a first unowned sighting within grace stays silent (handoff gap never warns)"
 }
 
+# --- benign-only queued-wake nag suppression --------------------------------
+# The drain-first advisory ("queued wakes pending - drain them ...") is context
+# noise when the ONLY pending records are benign ones firstmate has already been
+# shown: a signal whose status file's current size:mtime signature still equals
+# the watcher's .seen-* signature (already surfaced/absorbed) and whose last line
+# is not captain-relevant. It must DROP for a benign-only queue but keep firing
+# whenever any pending record is genuinely actionable (a captain-relevant status,
+# an un-surfaced newer signature, or any non-signal record such as a heartbeat).
+
+# stat_sig <file>: the size:mtime signature exactly as bin/fm-watch.sh records it
+# into .seen-*, so a test-built .seen file matches what the guard reads back.
+guard_test_stat_sig() {
+  if [ "$(uname)" = Darwin ]; then
+    stat -f '%z:%Fm' "$1" 2>/dev/null
+  else
+    stat -c '%s:%Y' "$1" 2>/dev/null
+  fi
+}
+
+# append_wake <state> <kind> <key> <payload>: enqueue a wake record with the
+# production wake library, in a subshell scoped to <state>. Local copy so this
+# suite need not pull the whole wake-helpers harness.
+guard_append_wake() {
+  local state=$1 kind=$2 key=$3 payload=$4 lib="$ROOT/bin/fm-wake-lib.sh"
+  FM_STATE_OVERRIDE="$state" bash -c '
+    # shellcheck disable=SC1090,SC1091
+    . "$1"
+    fm_wake_append "$2" "$3" "$4"
+  ' _ "$lib" "$kind" "$key" "$payload"
+}
+
+# seed a fresh watcher beacon so the guard's stale banner stays silent and the
+# only thing under test is the queued-wake nag block.
+guard_seed_fresh_watcher() {  # <home>
+  touch "$1/state/.last-watcher-beat"
+}
+
+# write a status file plus a MATCHING .seen-* signature (already surfaced) and
+# enqueue a signal wake for it. This is the benign already-absorbed shape.
+guard_seed_surfaced_signal() {  # <home> <id> <last-line>
+  local home=$1 id=$2 last=$3 statusf seenf
+  statusf="$home/state/$id.status"
+  printf 'working: setup\n%s\n' "$last" > "$statusf"
+  seenf="$home/state/.seen-$(basename "$statusf" | tr '.' '_')"
+  guard_test_stat_sig "$statusf" > "$seenf"
+  guard_append_wake "$home/state" signal "$id.status" "signal: $statusf" \
+    || fail "could not enqueue the signal wake for $id"
+}
+
+test_benign_only_queue_drops_the_drain_nag() {
+  local dir home out
+  dir=$(make_guard_case benign-only-nag)
+  home=$(case_home "$dir")
+  guard_seed_fresh_watcher "$home"
+  guard_seed_surfaced_signal "$home" task "working: still building"
+  out=$(run_guard_case "$dir")
+  assert_not_contains "$out" "queued wakes pending" \
+    "a benign-only, already-surfaced queue must not trip the drain-first nag"
+  pass "fm-guard: benign-only already-surfaced queue drops the drain-first nag"
+}
+
+test_captain_relevant_queue_still_nags() {
+  local dir home out
+  dir=$(make_guard_case captain-relevant-nag)
+  home=$(case_home "$dir")
+  guard_seed_fresh_watcher "$home"
+  # Surfaced signature, but a captain-relevant last line is actionable regardless.
+  guard_seed_surfaced_signal "$home" task "done: shipped"
+  out=$(run_guard_case "$dir")
+  assert_contains "$out" "queued wakes pending - drain them" \
+    "a captain-relevant queued signal must still trip the drain-first nag"
+  pass "fm-guard: a captain-relevant queued signal still nags"
+}
+
+test_unsurfaced_newer_signature_still_nags() {
+  local dir home out statusf seenf
+  dir=$(make_guard_case unsurfaced-nag)
+  home=$(case_home "$dir")
+  guard_seed_fresh_watcher "$home"
+  statusf="$home/state/task.status"
+  seenf="$home/state/.seen-task_status"
+  # A stale .seen signature (records an OLD size) means the worker wrote a newer,
+  # not-yet-surfaced line: genuinely actionable, so the nag must fire.
+  printf 'working: building\n' > "$statusf"
+  printf '1:1\n' > "$seenf"
+  guard_append_wake "$home/state" signal task.status "signal: $statusf" \
+    || fail "could not enqueue the signal wake"
+  out=$(run_guard_case "$dir")
+  assert_contains "$out" "queued wakes pending - drain them" \
+    "a queued signal whose file changed since it was surfaced must still nag"
+  pass "fm-guard: an un-surfaced newer signature still nags"
+}
+
+test_non_signal_record_still_nags() {
+  local dir home out
+  dir=$(make_guard_case heartbeat-nag)
+  home=$(case_home "$dir")
+  guard_seed_fresh_watcher "$home"
+  guard_append_wake "$home/state" heartbeat heartbeat heartbeat \
+    || fail "could not enqueue the heartbeat wake"
+  out=$(run_guard_case "$dir")
+  assert_contains "$out" "queued wakes pending - drain them" \
+    "a queued heartbeat (non-signal) record must still trip the drain-first nag"
+  pass "fm-guard: a non-signal queued record still nags"
+}
+
+test_mixed_queue_with_one_actionable_still_nags() {
+  local dir home out
+  dir=$(make_guard_case mixed-nag)
+  home=$(case_home "$dir")
+  guard_seed_fresh_watcher "$home"
+  guard_seed_surfaced_signal "$home" task "working: still building"
+  guard_seed_surfaced_signal "$home" other "done: shipped"
+  out=$(run_guard_case "$dir")
+  assert_contains "$out" "queued wakes pending - drain them" \
+    "a queue mixing a benign and an actionable record must still nag"
+  pass "fm-guard: a mixed queue with any actionable record still nags"
+}
+
+test_read_only_benign_queue_keeps_its_notice() {
+  local dir home out
+  dir=$(make_guard_case read-only-benign-nag)
+  home=$(case_home "$dir")
+  guard_seed_fresh_watcher "$home"
+  guard_seed_surfaced_signal "$home" task "working: still building"
+  out=$(run_guard_case_read_only "$dir")
+  assert_contains "$out" "queued wakes pending - left untouched for the session holding the fleet lock" \
+    "a read-only session must still report a benign queue to the lock holder"
+  pass "fm-guard: a read-only session keeps its queued-wake notice even for a benign queue"
+}
+
 test_first_stale_call_prints_full_banner
 test_repeated_same_episode_prints_reminder_only
 test_healthy_recovery_rearms_next_stale_episode
@@ -408,3 +539,9 @@ test_banner_without_daemon_names_the_watcher
 test_wake_path_warns_when_watcher_alive_but_unowned
 test_wake_path_silent_when_arm_alive
 test_wake_path_grace_suppresses_first_sighting
+test_benign_only_queue_drops_the_drain_nag
+test_captain_relevant_queue_still_nags
+test_unsurfaced_newer_signature_still_nags
+test_non_signal_record_still_nags
+test_mixed_queue_with_one_actionable_still_nags
+test_read_only_benign_queue_keeps_its_notice

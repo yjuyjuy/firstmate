@@ -73,12 +73,62 @@ fm_guard_wake_path_should_warn() {
 
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
+# shellcheck source=bin/fm-classify-lib.sh
+. "$SCRIPT_DIR/fm-classify-lib.sh"
 # shellcheck source=bin/fm-tangle-lib.sh
 . "$SCRIPT_DIR/fm-tangle-lib.sh"
 # shellcheck source=bin/fm-supervision-lib.sh
 . "$SCRIPT_DIR/fm-supervision-lib.sh"
 # shellcheck source=bin/fm-afk-daemon-lib.sh
 . "$SCRIPT_DIR/fm-afk-daemon-lib.sh"
+
+# Portable size:mtime signature, byte-identical to the one bin/fm-watch.sh
+# records into its .seen-* markers (Darwin lacks `stat -c`, Linux lacks `-f`).
+# The benign-only nag suppressor below compares a queued signal's current status
+# signature against that marker to tell an already-surfaced record from a fresh one.
+if [ "$(uname)" = Darwin ]; then
+  fm_guard_stat_sig() { stat -f '%z:%Fm' "$1" 2>/dev/null; }
+else
+  fm_guard_stat_sig() { stat -c '%s:%Y' "$1" 2>/dev/null; }
+fi
+
+# fm_guard_queue_all_benign <queue> <state>
+# Exit 0 only when EVERY pending wake record is a benign, already-surfaced signal:
+# a signal wake on a .status key whose status file's current size:mtime signature
+# still equals the watcher's recorded .seen-* signature (so it was already
+# surfaced or absorbed) AND whose last line is not captain-relevant. Exit 1 (the
+# nag fires) for anything else: any non-signal record (heartbeat, stale, check),
+# a .turn-ended marker, a status file whose signature has advanced past .seen (a
+# newer, not-yet-surfaced line), a captain-relevant status, a missing status or
+# .seen file, or an empty/unreadable queue. This never weakens the drain mandate:
+# it only decides whether to print the ADVISORY warning, and errs toward printing
+# it (return 1) on any uncertainty, so a genuinely actionable wake is never hidden.
+fm_guard_queue_all_benign() {  # <queue> <state>
+  local queue=$1 state=$2 epoch seq kind key payload saw=0
+  local statusf seenf cur seen last
+  [ -s "$queue" ] || return 1
+  while IFS="$(printf '\t')" read -r epoch seq kind key payload; do
+    [ -n "$kind" ] || continue
+    saw=1
+    # Only signal records can ever be benign; every other kind is actionable.
+    [ "$kind" = signal ] || return 1
+    # A .turn-ended marker (mapped historical) is treated as actionable, so scope
+    # to a direct .status key whose current signature we can compare to .seen.
+    case "$key" in *.status) ;; *) return 1 ;; esac
+    fm_wake_status_key_map "$key" || return 1
+    [ "$FM_WAKE_STATUS_HISTORICAL" = false ] || return 1
+    statusf="$state/$FM_WAKE_STATUS_KEY"
+    seenf="$state/.seen-$(printf '%s' "$FM_WAKE_STATUS_KEY" | tr '.' '_')"
+    [ -f "$statusf" ] || return 1
+    [ -f "$seenf" ] || return 1
+    cur=$(fm_guard_stat_sig "$statusf") || return 1
+    seen=$(cat "$seenf" 2>/dev/null) || return 1
+    [ -n "$cur" ] && [ "$cur" = "$seen" ] || return 1
+    last=$(last_status_line "$statusf")
+    status_is_captain_relevant "$last" && return 1
+  done < "$queue"
+  [ "$saw" = 1 ]
+}
 
 # Deterministic episode key from beacon state: same continuous stale beacon
 # (or continuous absence) shares a key; a recovered-then-restale beacon gets a
@@ -265,11 +315,18 @@ fi
 
 # Queued wakes are an independent hazard; warn whenever they are pending, even if
 # a watcher is alive. Kept after the banner so the no-watcher alarm reads first.
-# Dedup of the watcher-down banner never suppresses this warning.
+# Dedup of the watcher-down banner never suppresses this warning. The one
+# exception is the benign-only case: when EVERY pending record is an
+# already-surfaced signal (its status signature still equals the watcher's
+# recorded .seen-* and its last line is not captain-relevant), draining changes
+# nothing firstmate has not already seen, so the advisory is pure noise and is
+# dropped. The at-least-once no-loss drain semantics are untouched: this only
+# gates the ADVISORY print, and a read-only session still reports the queue to the
+# lock holder regardless, because it is not the one that will drain it.
 if "$queue_pending"; then
   if [ "$READ_ONLY" -eq 1 ]; then
     echo "WARNING: queued wakes pending - left untouched for the session holding the fleet lock." >&2
-  else
+  elif ! fm_guard_queue_all_benign "$FM_WAKE_QUEUE" "$STATE"; then
     echo "WARNING: queued wakes pending - drain them with bin/fm-wake-drain.sh before anything else." >&2
   fi
 fi
