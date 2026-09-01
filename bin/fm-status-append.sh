@@ -9,7 +9,19 @@
 # complete original text is preserved in an overflow file the truncated line
 # points at.
 #
-# Behavior:
+# Two independent caps live here, and this helper is the single owner of both:
+#   1. Per-LINE cap (default 300, FM_STATUS_APPEND_CAP overrides) - see below.
+#   2. Per-FILE line-count cap (default 200, FM_STATUS_FILE_MAX_LINES overrides).
+#      Even capped lines accrete without bound over a long-lived task, so after
+#      each append the live file is trimmed to its most-recent MAX lines and the
+#      trimmed-off older lines are archived to <status-file>.1. Readers only ever
+#      tail the recent lines, so keeping the most-recent MAX in the live file
+#      preserves the verb-keyed tail that bin/fm-classify-lib.sh and the tail
+#      readers depend on, while nothing is discarded - the older lines stay
+#      recoverable in the archive. Archive-before-trim, same crash-safe ordering
+#      as the per-line overflow.
+#
+# Per-line behavior:
 #   - A line at or under the cap (default 300, FM_STATUS_APPEND_CAP overrides) is
 #     appended UNCHANGED.
 #   - A line over the cap: the FULL original text is written FIRST to
@@ -22,7 +34,7 @@
 #     is unaffected.
 #
 # Usage:
-#   fm-status-append.sh [--overflow-dir DIR] [--cap N] <status-file> <line...>
+#   fm-status-append.sh [--overflow-dir DIR] [--cap N] [--max-lines N] <status-file> <line...>
 #
 # The overflow dir defaults to <home>/data/<id>/status-overflow, derived from the
 # status file path (<home>/state/<id>.status). Callers that use a non-default
@@ -32,17 +44,19 @@ set -eu
 
 usage() {
   cat <<'EOF' >&2
-Usage: fm-status-append.sh [--overflow-dir DIR] [--cap N] <status-file> <line...>
+Usage: fm-status-append.sh [--overflow-dir DIR] [--cap N] [--max-lines N] <status-file> <line...>
 EOF
   exit 2
 }
 
 OVERFLOW_DIR=""
 CAP="${FM_STATUS_APPEND_CAP:-300}"
+MAX_LINES="${FM_STATUS_FILE_MAX_LINES:-200}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --overflow-dir) [ $# -ge 2 ] || usage; OVERFLOW_DIR=$2; shift 2 ;;
     --cap) [ $# -ge 2 ] || usage; CAP=$2; shift 2 ;;
+    --max-lines) [ $# -ge 2 ] || usage; MAX_LINES=$2; shift 2 ;;
     --) shift; break ;;
     -*) usage ;;
     *) break ;;
@@ -57,6 +71,31 @@ LINE=$*
 case "$CAP" in
   ''|*[!0-9]*) echo "error: --cap must be a non-negative integer (got '$CAP')" >&2; exit 1 ;;
 esac
+case "$MAX_LINES" in
+  ''|*[!0-9]*) echo "error: --max-lines must be a non-negative integer (got '$MAX_LINES')" >&2; exit 1 ;;
+esac
+
+# Bound the live status file to its most-recent MAX_LINES lines, archiving the
+# older lines to <status-file>.1 so nothing is discarded. Archive-before-trim:
+# the older lines are durable in the archive before the live file is rewritten,
+# so a crash mid-rotation cannot lose evidence. A MAX_LINES of 0 disables the
+# file cap entirely. Called after every append.
+rotate_status_file() {
+  [ "$MAX_LINES" -gt 0 ] || return 0
+  [ -f "$STATUS_FILE" ] || return 0
+  local total
+  total=$(wc -l < "$STATUS_FILE" 2>/dev/null || echo 0)
+  [ "$total" -gt "$MAX_LINES" ] || return 0
+  local trim=$((total - MAX_LINES))
+  local archive="$STATUS_FILE.1"
+  # Append the older lines to the archive FIRST (durable before any trim).
+  head -n "$trim" "$STATUS_FILE" >> "$archive"
+  # Rewrite the live file with only the most-recent MAX_LINES lines, via a temp
+  # file + atomic rename so a reader never sees a half-written status file.
+  local tmp="$STATUS_FILE.tmp.$$"
+  tail -n "$MAX_LINES" "$STATUS_FILE" > "$tmp"
+  mv -f "$tmp" "$STATUS_FILE"
+}
 
 mkdir -p "$(dirname "$STATUS_FILE")" 2>/dev/null || true
 if [ ! -d "$(dirname "$STATUS_FILE")" ]; then
@@ -68,6 +107,7 @@ fi
 # backslash in the body is written literally.
 if [ "${#LINE}" -le "$CAP" ]; then
   printf '%s\n' "$LINE" >> "$STATUS_FILE"
+  rotate_status_file
   exit 0
 fi
 
@@ -109,3 +149,4 @@ if [ "$head_len" -lt "$min_head" ]; then
 fi
 head=${LINE:0:$head_len}
 printf '%s%s\n' "$head" "$suffix" >> "$STATUS_FILE"
+rotate_status_file

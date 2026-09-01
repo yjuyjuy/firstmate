@@ -155,6 +155,110 @@ test_cap_is_configurable() {
   pass "fm-status-append.sh: FM_STATUS_APPEND_CAP overrides the cap"
 }
 
+# --- per-FILE line-count cap / rotation -------------------------------------
+# The file itself must stay bounded: after an append pushes the live status file
+# over FM_STATUS_FILE_MAX_LINES, the oldest lines are archived to
+# <status-file>.1 and the live file is trimmed to the most-recent max lines.
+# Readers only ever tail the recent lines, so trimming clearly-old lines is safe;
+# nothing is discarded, the trimmed lines are recoverable in the archive.
+ARCHIVE_FILE="$STATUS_FILE.1"
+
+reset_state_with_archive() {
+  reset_state
+  rm -f "$ARCHIVE_FILE"
+}
+
+# Below the file cap: file grows normally, no archive is created.
+test_file_under_cap_no_rotation() {
+  reset_state_with_archive
+  local i
+  for i in $(seq 1 5); do
+    FM_STATUS_FILE_MAX_LINES=10 "$SA" "$STATUS_FILE" "working: line $i" \
+      || fail "append $i exited non-zero"
+  done
+  local n
+  n=$(wc -l < "$STATUS_FILE")
+  [ "$n" -eq 5 ] || fail "expected 5 live lines, got $n"
+  assert_absent "$ARCHIVE_FILE" "no archive until the file cap is exceeded"
+  pass "fm-status-append.sh: file below the cap is not rotated"
+}
+
+# Appending past the cap trims the live file to <= max lines and keeps the
+# MOST-RECENT lines (a reader tails those).
+test_file_over_cap_trims_to_recent() {
+  reset_state_with_archive
+  local i
+  for i in $(seq 1 15); do
+    FM_STATUS_FILE_MAX_LINES=10 "$SA" "$STATUS_FILE" "working: line $i" \
+      || fail "append $i exited non-zero"
+  done
+  local n
+  n=$(wc -l < "$STATUS_FILE")
+  [ "$n" -le 10 ] || fail "live file is $n lines, expected <= 10"
+  # Most-recent line survives in the live file.
+  assert_grep "working: line 15" "$STATUS_FILE" "newest line must stay in the live file"
+  # An old line is gone from the live file (lines 1-5 were trimmed).
+  assert_no_grep "working: line 5" "$STATUS_FILE" "oldest line must be trimmed from the live file"
+  pass "fm-status-append.sh: over-cap file trimmed to the recent lines"
+}
+
+# The trimmed-off older lines are recoverable in the archive, never discarded.
+test_file_trim_preserves_history_in_archive() {
+  reset_state_with_archive
+  local i
+  for i in $(seq 1 15); do
+    FM_STATUS_FILE_MAX_LINES=10 "$SA" "$STATUS_FILE" "working: line $i" \
+      || fail "append $i exited non-zero"
+  done
+  assert_present "$ARCHIVE_FILE" "archive must exist once lines are trimmed"
+  # Every original line is recoverable from live + archive combined.
+  local combined
+  combined=$(cat "$ARCHIVE_FILE" "$STATUS_FILE")
+  for i in $(seq 1 15); do
+    case "$combined" in
+      *"working: line $i"*) : ;;
+      *) fail "line $i lost from both live file and archive" ;;
+    esac
+  done
+  # The oldest line lives in the archive specifically.
+  assert_grep "working: line 1" "$ARCHIVE_FILE" "oldest line must be recoverable in the archive"
+  pass "fm-status-append.sh: trimmed lines are recoverable in the archive"
+}
+
+# A recent keyed event (an unresolved needs-decision) must survive in the live
+# file the tail readers see, not be rotated out.
+test_file_trim_keeps_recent_keyed_line() {
+  reset_state_with_archive
+  local i
+  for i in $(seq 1 12); do
+    FM_STATUS_FILE_MAX_LINES=10 "$SA" "$STATUS_FILE" "working: filler $i"
+  done
+  FM_STATUS_FILE_MAX_LINES=10 "$SA" "$STATUS_FILE" "needs-decision: pick option A or B"
+  assert_grep "needs-decision: pick option A or B" "$STATUS_FILE" \
+    "a fresh keyed event must remain in the live file"
+  pass "fm-status-append.sh: recent keyed line survives rotation"
+}
+
+# The file cap and the per-line cap coexist: an over-cap line still overflows,
+# and the file still rotates.
+test_file_cap_and_line_cap_coexist() {
+  reset_state_with_archive
+  local i giant
+  for i in $(seq 1 9); do
+    FM_STATUS_FILE_MAX_LINES=10 "$SA" "$STATUS_FILE" "working: line $i"
+  done
+  giant="needs-decision: $(printf 'x%.0s' $(seq 1 600)) END"
+  FM_STATUS_FILE_MAX_LINES=10 "$SA" "$STATUS_FILE" "$giant"
+  FM_STATUS_FILE_MAX_LINES=10 "$SA" "$STATUS_FILE" "working: after giant"
+  # Per-line overflow still fired.
+  assert_present "$OVERFLOW_DIR" "over-cap line must still spill to overflow"
+  # Live file still bounded.
+  local n
+  n=$(wc -l < "$STATUS_FILE")
+  [ "$n" -le 10 ] || fail "live file is $n lines, expected <= 10"
+  pass "fm-status-append.sh: per-file cap and per-line cap coexist"
+}
+
 test_script_parses
 test_under_cap_passthrough
 test_exact_cap_passthrough
@@ -163,3 +267,8 @@ test_overflow_file_content_integrity
 test_full_body_written_before_pointer_resolves
 test_concurrent_overflow_files_are_distinct
 test_cap_is_configurable
+test_file_under_cap_no_rotation
+test_file_over_cap_trims_to_recent
+test_file_trim_preserves_history_in_archive
+test_file_trim_keeps_recent_keyed_line
+test_file_cap_and_line_cap_coexist
