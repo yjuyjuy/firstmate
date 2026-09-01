@@ -198,6 +198,15 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 . "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
 # shellcheck source=bin/fm-pr-lib.sh
 . "$SCRIPT_DIR/fm-pr-lib.sh"
+# Bitbucket credential forwarding for a bitbucket.org-origin crew lane
+# (fm_crew_bitbucket_env_lines): reads only the allowlisted NO_MISTAKES_BITBUCKET_*
+# vars from the process env or the home's private .env and emits them for the
+# pane-shell export loop below, so a crew on a Bitbucket product repo completes its
+# own PR path instead of the PR falling to firstmate. Depends on
+# fm_pr_bitbucket_origin_slug from fm-pr-lib.sh sourced just above; no side effects
+# on source.
+# shellcheck source=bin/fm-crew-bitbucket-env-lib.sh
+. "$SCRIPT_DIR/fm-crew-bitbucket-env-lib.sh"
 # shellcheck source=bin/fm-completions-lib.sh
 . "$SCRIPT_DIR/fm-completions-lib.sh"
 # shellcheck source=bin/fm-token-sessions-lib.sh
@@ -1934,6 +1943,25 @@ else
   HEAVY_SLOTS_FILE="$CONFIG_ABS/heavy-run-slots"
 fi
 spawn_send_text_line "$T" "export FM_HEAVY_SLOTS_FILE=$(shell_quote "$HEAVY_SLOTS_FILE")"
+# Forward the Bitbucket PR credentials into the pane shell for a lane whose
+# project origin is a bitbucket.org repository, so the crew's no-mistakes run can
+# complete its own PR + CI steps instead of skipping them (the pipeline reads
+# NO_MISTAKES_BITBUCKET_EMAIL / NO_MISTAKES_BITBUCKET_API_TOKEN, and without them
+# every Bitbucket PR falls to firstmate to open by hand). fm_crew_bitbucket_env_lines
+# emits nothing for a GitHub-origin lane (or a secondmate home, whose PROJ_ABS is
+# not a repo clone), so a credential never reaches a crew with no Bitbucket work.
+# The value is read from the process env or the home's private .env at spawn time
+# and shell-quoted like every other export, so a token with shell metacharacters
+# cannot escape. Emitted BEFORE the --env override loop below so an explicit
+# per-spawn --env for the same KEY still wins.
+if [ "$KIND" != secondmate ]; then
+  while IFS= read -r bb_kv; do
+    [ -n "$bb_kv" ] || continue
+    bb_k=${bb_kv%%=*}; bb_v=${bb_kv#*=}
+    spawn_send_text_line "$T" "export $bb_k=$(shell_quote "$bb_v")"
+    sleep 0.1
+  done < <(fm_crew_bitbucket_env_lines "$PROJ_ABS" "$FM_HOME/.env" 2>/dev/null || true)
+fi
 # Apply any per-spawn --env KEY=VAL overrides into the pane shell env through
 # the same channel the GOTMPDIR export uses, so the agent and its children
 # inherit the swapped token. Last --env for the same KEY wins (shell `export`
