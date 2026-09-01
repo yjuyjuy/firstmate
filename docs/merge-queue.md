@@ -57,12 +57,30 @@ or hand-edits the file.
   does not depend on remembering to run the CLI.
 - **Surface.** `bin/fm-merge-queue.sh list` prints the batched set as one list of
   compare links, grouped for the captain, rather than a trickle of individual asks.
+- **Reconcile drift first.** The sweep begins by reconciling each queue entry
+  against its live `state/<id>.meta`: an id can sit queued with a stale head while
+  its meta records a newer `pr_head` (the branch got more commits and a fresh PR
+  head after the entry was recorded), so the stale head would never sweep. The
+  reconcile (`fm_merge_queue_reconcile_drift`) only rewrites the queued head field
+  to the meta's newer `pr_head`; it never removes an entry, and never touches an id
+  with no live meta or whose meta head already matches. Session-start flags any id
+  that is both queued and has a live meta so this reconcile is run.
 - **Clear.** `bin/fm-merge-queue.sh sweep` drops every entry whose branch is now
-  merged into its base. The merged check is a fresh **content-in-base** test against
-  the real base branch on origin - never a PR-state lookup - so it is correct for
-  Bitbucket repos (hyfin, hyfin-server) that have no PR automation. Any inconclusive
-  result (no origin, fetch failure, merge conflict) keeps the entry rather than
-  clearing it on an unverifiable claim.
+  merged into its base. The primary merged check is a fresh **content-in-base** test
+  against the real base branch on origin - never a PR-state lookup - so it is correct
+  for Bitbucket repos (hyfin, hyfin-server) that have no PR automation. Any
+  inconclusive result (no origin, fetch failure, merge conflict) does not clear on
+  that check alone.
+  When the content check is inconclusive, the sweep next asks the forge directly
+  (`fm_merge_queue_forge_confirms_merged`): a squash or rebase merge is not an
+  ancestor of base and merge-tree reports a conflict once base later touches a file
+  the squashed branch also touched, which would otherwise keep the entry queued
+  forever. This GitHub-only check (`gh-axi api repos/<slug>/commits/<head>/pulls`
+  filtered to merged PRs whose base is the queued base) clears the entry only on a
+  forge-confirmed merge; it is an addition, not a replacement, so the content check
+  stays the no-PR-automation fallback. Bitbucket confirmation stays with the branch
+  poll (`bin/fm-merge-queue-poll.sh`), so the forge helper is GitHub-only by design.
+  Anything the forge cannot confirm keeps the entry.
   One further clearing case exists for the same reason: when the recorded head commit
   is no longer present in the clone at all - the local branch is gone after teardown,
   and a pruning fetch plus garbage collection can drop the last remote-tracking copy
