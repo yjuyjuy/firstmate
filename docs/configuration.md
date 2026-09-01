@@ -101,6 +101,7 @@ state/               volatile runtime signals; gitignored
   .afk-delivery .afk-outbox* .afk-inbox.beat  away-mode delivery mode, the durable pull-delivery records used when no supervisor pane exists, and the reader's liveness beacon; acknowledged only by bin/fm-afk-inbox.sh (docs/configuration.md)
   .watch.lock .wake-queue.lock watcher singleton and queue serialization locks
   .wake-brief-spool-*  bin/fm-wake-brief.sh's drained-record spool; removed after a successful brief, kept and named in the output when the drain failed because it is then the only copy of those records
+  .wake-brief-seen-*  bin/fm-wake-brief.sh's reader-owned per-task last-seen status signature (size:mtime), used to skip reprinting an unchanged status tail on a re-read; distinct from the watcher's .seen-*/.hash-* internals and reclaimed by fm-cleanup-sweep.sh when the task is gone
   .hash-* .count-* .stale-* .stale-since-* .paused-* .wedge-escalations-* .seen-* .hb-surfaced-* .last-* .resource-* .heartbeat-streak   watcher internals; never touch
   .hourly-armed .hourly-*-surfaced .hourly-*.latest .hourly-decision-* .hourly-cleanup.log  hourly session-review and cleanup pass state: armed for the session by bin/fm-session-start.sh, run by the one watcher on its slow poll (docs/configuration.md); watcher internals, never touch
   .watch-triage.log  watcher's absorbed-wake debug log (size-capped); never relied on, safe to delete
