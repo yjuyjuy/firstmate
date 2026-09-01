@@ -1109,12 +1109,17 @@ test_watcher_absorbs_already_reported_pressure() {
 }
 
 test_watcher_stays_quiet_on_a_healthy_host_and_rearms() {
-  local home out status
+  local home out status now
   home=$(make_home watcher-healthy)
   printf 'critical\n' > "$home/state/.resource-surfaced"
+  # Seed a FRESH healthy reading and use a long cadence, so the re-arm comes
+  # deterministically from the surface read of the cached reading rather than
+  # racing a backgrounded probe that may not publish before the checkpoint ends.
+  now=$(date +%s)
+  seed_reading "$home" "$now" healthy "healthy | load 5 (0.5x over 10 cores)"
   out="$home/out.txt"
   status=0
-  env "${HEALTHY_ENV[@]}" FM_RESOURCE_INTERVAL=1 \
+  env "${HEALTHY_ENV[@]}" FM_RESOURCE_INTERVAL=999999 \
     FM_HOME="$home" FM_RESOURCE_PROBE_LOCK="$home/state/.resource-probe.lock" \
     FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
     "$CHECKPOINT" --seconds 4 >"$out" 2>/dev/null || status=$?
@@ -1146,9 +1151,15 @@ annotated_heartbeat_reason() {
   home=$(make_home "$1")
   enter_daemon_owned_away_mode "$home"
   printf 'critical\n' > "$home/state/.resource-surfaced"
+  # Seed a FRESH cached reading and use a cadence far longer than the checkpoint
+  # window, so the annotation comes deterministically from the cached file rather
+  # than racing a backgrounded probe that may not publish .resource-status before
+  # the heartbeat fires. touch .last-resource so no probe launches to overwrite it.
+  printf 'critical\n' > "$home/state/.resource-status"
+  touch "$home/state/.last-resource"
   out="$home/out.txt"
   status=0
-  env "${HEALTHY_ENV[@]}" FM_RESOURCE_INTERVAL=1 FM_RESOURCE_LOAD1=40 \
+  env "${HEALTHY_ENV[@]}" FM_RESOURCE_INTERVAL=999999 \
     FM_HOME="$home" FM_RESOURCE_PROBE_LOCK="$home/state/.resource-probe.lock" \
     FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
     FM_HEARTBEAT=1 "$CHECKPOINT" --seconds 8 >"$out" 2>/dev/null || status=$?
@@ -1179,14 +1190,19 @@ test_heartbeat_carries_the_cached_pressure() {
   home=$(make_home heartbeat-annotation)
   # The daemon owns triage while away mode is on, so every heartbeat is queued -
   # the cheapest way to observe the annotation a fleet review reads. The monitor
-  # is ENABLED and reads critical, so the annotation comes from a live sweep; the
-  # already-surfaced level absorbs the resource wake so the heartbeat is what the
-  # checkpoint observes.
+  # is ENABLED and the reading is seeded critical, so the annotation comes from
+  # the cached file; the already-surfaced level absorbs the resource wake so the
+  # heartbeat is what the checkpoint observes.
   enter_daemon_owned_away_mode "$home"
   printf 'critical\n' > "$home/state/.resource-surfaced"
+  # Seed a FRESH cached reading and use a long cadence so the annotation comes
+  # deterministically from the cached file, not from racing a backgrounded probe
+  # that may not publish .resource-status before the heartbeat fires.
+  printf 'critical\n' > "$home/state/.resource-status"
+  touch "$home/state/.last-resource"
   out="$home/out.txt"
   status=0
-  env "${HEALTHY_ENV[@]}" FM_RESOURCE_INTERVAL=1 FM_RESOURCE_LOAD1=40 \
+  env "${HEALTHY_ENV[@]}" FM_RESOURCE_INTERVAL=999999 \
     FM_HOME="$home" FM_RESOURCE_PROBE_LOCK="$home/state/.resource-probe.lock" \
     FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
     FM_HEARTBEAT=1 "$CHECKPOINT" --seconds 8 >"$out" 2>/dev/null || status=$?
