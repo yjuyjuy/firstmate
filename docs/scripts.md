@@ -47,6 +47,8 @@ The shared no-mistakes gate refusal for fleet lifecycle entrypoints is summarize
 | `fm-secondmate-handoff.sh` | Hand a context-full secondmate to a fresh agent (stow + continuation doc + respawn) instead of `/compact`; idempotent, fail-closed |
 | `fm-spawn.sh`            | Spawn crewmates, scouts, `id=repo` batches, and secondmates on the resolved harness and runtime backend; refuses crewmate/scout spawns onto already-completed or already-merged work unless `FM_SPAWN_ALLOW_DUPLICATE=1` |
 | `fm-dispatch-select.sh`  | Resolve a dispatch rule/default to one profile, owning quota-aware arrays and random fallback |
+| `fm-jcode-repin.sh`      | Re-pin a live jcode lane's recorded model/effort through jcode's race-free debug socket and verify against the session store; the drift-response counterpart to `fm-spawn.sh`'s spawn-time pin, run on a `model-drift` wake, fail-closed with an escalation diagnostic |
+| `fm-jcode-profile-lib.sh` | Side-effect-free owner of the jcode model/effort pin seam (`fm_jcode_apply_profile` applies model+effort atomically via `jcode debug -S <sid> set_model`, `fm_jcode_pin_and_verify` applies-and-confirms against the session store with bounded retries); sourced by `fm-spawn.sh` and `fm-jcode-repin.sh`, never executed |
 | `fm-account-orchestrator.sh` | Firstmate's thin caller of the quota-axi account-switch orchestrator (`decide` at spawn, `decide`+`switch` on a tripwire); owns the jcode/Claude limit-error recognizer (see `docs/account-orchestrator.md`) |
 | `fm-backend.sh`          | Runtime-backend selection, meta helpers, selector resolution, and operation dispatch |
 | `fm-backend-hometag-lib.sh` | Shared per-installation home-tag derivation for zellij tab and cmux workspace titles |
