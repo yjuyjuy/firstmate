@@ -756,6 +756,37 @@ test_briefs_bind_the_shared_machine_rules() {
   pass "fm-brief.sh: ship and scout briefs bind the shared-machine and coverage rules"
 }
 
+# Every worker must report through the capped status-append helper, not a raw
+# echo, so a giant status line is truncated (with the full body spilled to a
+# file) BEFORE it reaches the status file every wake and digest reads. The
+# scaffold must both point crews at the helper and teach the long-evidence-to-a-
+# file convention.
+test_briefs_route_status_through_the_capped_helper() {
+  local home brief kind
+  home="$TMP_ROOT/status-cap-home"
+  mkdir -p "$home/data"
+  for kind in ship scout interactive; do
+    case "$kind" in
+      ship) FM_HOME="$home" "$ROOT/bin/fm-brief.sh" cap-ship some-proj >/dev/null 2>&1 \
+              || fail "fm-brief.sh ship scaffold exited non-zero"
+            brief="$home/data/cap-ship/brief.md" ;;
+      scout) FM_HOME="$home" "$ROOT/bin/fm-brief.sh" cap-scout some-proj --scout >/dev/null 2>&1 \
+              || fail "fm-brief.sh scout scaffold exited non-zero"
+            brief="$home/data/cap-scout/brief.md" ;;
+      interactive) FM_HOME="$home" "$ROOT/bin/fm-brief.sh" cap-int some-proj --interactive >/dev/null 2>&1 \
+              || fail "fm-brief.sh interactive scaffold exited non-zero"
+            brief="$home/data/cap-int/brief.md" ;;
+    esac
+    assert_grep 'bin/fm-status-append.sh' "$brief" \
+      "$kind brief must route status appends through the capped helper"
+    assert_no_grep 'echo "{state}: {one short line}" >>' "$brief" \
+      "$kind brief must not tell crews to raw-echo status lines"
+    assert_grep 'spills the full body to a file' "$brief" \
+      "$kind brief must teach the long-evidence-to-a-file convention"
+  done
+  pass "fm-brief.sh: ship, scout, and interactive briefs report status through the capped helper"
+}
+
 # The standing captain rules used to reach workers only when firstmate remembered to
 # paste them onto a brief, so a lane whose brief predated a rule never saw it (one such
 # lane force-pushed within an hour of the never-force rule being set). They must be
@@ -951,3 +982,4 @@ test_interactive_rejects_herdr_lab
 test_briefs_route_heavy_runs_through_the_runner
 test_briefs_carry_rtk_token_efficiency_section
 test_briefs_bind_the_shared_machine_rules
+test_briefs_route_status_through_the_capped_helper

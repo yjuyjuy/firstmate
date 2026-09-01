@@ -181,6 +181,13 @@ shell_quote() {
 }
 
 STATUS_FILE=$(shell_quote "$STATE/$ID.status")
+# The capped status-append entry point every worker reports through. It writes the
+# line unchanged when short and, when a line exceeds the cap, spills the full body
+# to data/<id>/status-overflow/<ts>.txt first and appends a truncated line
+# pointing at it, so a giant needs-decision line never bloats every wake and digest
+# (bin/fm-status-append.sh owns the mechanics). The state verb stays at the front,
+# so bin/fm-classify-lib.sh's triage is unaffected.
+APPEND_CMD="$FM_ROOT/bin/fm-status-append.sh $STATUS_FILE"
 
 # Standing captain rules. These bind every worker, so they are generated here
 # rather than pasted onto each brief by hand: a rule that lives only in
@@ -333,8 +340,9 @@ $CAPTAIN_RULES_SECONDMATE
 
 # Escalation to main firstmate
 Handle routine work yourself.
-Report only true captain-relevant outcomes or a declared external wait by appending one line:
-   \`echo "{state}: {one short line}" >> $STATUS_FILE\`
+Report only true captain-relevant outcomes or a declared external wait by appending one line through the capped helper:
+   \`$APPEND_CMD "{state}: {one short line}"\`
+Keep each line short - a state verb plus one plain sentence. It writes short lines unchanged and, if a line is long, spills the full body to a file and leaves a truncated line pointing at it, so put a detailed answer in a doc under your home's \`data/\` and make the status line a short pointer to it (the scout-report pattern below).
 States: working, needs-decision, blocked, $PAUSED_VERB, done, failed.
 Use \`$PAUSED_VERB: {why}\` (distinct from \`blocked:\`) only when your domain is deliberately idling on a known external wait you expect to clear on its own; use \`blocked:\` when you are stuck and need firstmate to act. A Claude/auth session-limit, a usage-window or quota exhaustion, or a revoked/expired token is captain-fixable (switch account or relog in), so report it \`blocked:\`, never \`$PAUSED_VERB:\`.
 Use this only for material phase changes, a captain decision, a real blocker, a failure, or work ready for review.
@@ -471,7 +479,8 @@ The report is the only thing that survives, so anything worth keeping must be in
 1. Never push to any remote and never open a PR.
 2. Stay inside this worktree; the only files you may write outside it are the report and the status file below.
 3. Use gh-axi for GitHub and chrome-devtools-axi for browser operations.
-4. Report status by appending one line: \`echo "{state}: {one short line}" >> $STATUS_FILE\`
+4. Report status by appending one line through the capped helper: \`$APPEND_CMD "{state}: {one short line}"\`
+   Keep each line short - a state verb plus one plain sentence. It writes short lines unchanged and, if a line is long, spills the full body to a file and leaves a truncated line pointing at it, so put long evidence (logs, diffs, a decision's full options) in a report doc under \`$DATA/$ID/\` and make the status line a short pointer to it.
    States: working, needs-decision, blocked, $PAUSED_VERB, done, failed. Each append wakes firstmate, so report only
    supervisor-actionable phase changes plus the needs-decision/blocked/$PAUSED_VERB/done/failed states; no FYI lines.
    Use \`$PAUSED_VERB: {why}\` (distinct from \`blocked:\`) ONLY when deliberately idling on a known external wait that self-clears;
@@ -548,8 +557,9 @@ Interactive tasks are usually the money-path / prod-write ones (repair scripts, 
 1. Never push to any remote and never open a PR. Never edit product code.
 2. Stay inside this worktree; the only files you may write outside it are the session log and the status file below.
 3. Use gh-axi for GitHub operations and chrome-devtools-axi for browser operations.
-4. Report status by appending one line:
-   \`echo "{state}: {one short line}" >> $STATUS_FILE\`
+4. Report status by appending one line through the capped helper:
+   \`$APPEND_CMD "{state}: {one short line}"\`
+   Keep each line short - a state verb plus one plain sentence. It writes short lines unchanged and, if a line is long, spills the full body to a file and leaves a truncated line pointing at it, so put long evidence in a doc under \`$DATA/$ID/\` and make the status line a short pointer to it.
    States: working, needs-decision, blocked, $PAUSED_VERB, done, failed.
    Each append wakes firstmate, so report sparingly: only phase changes a supervisor
    would act on and the needs-decision/blocked/paused/done/failed states. No step-by-step
@@ -749,7 +759,8 @@ If the top-level path is the primary checkout or not the worktree you were launc
 $RULE1
 2. Stay inside this worktree; modify nothing outside it.
 3. Use gh-axi for GitHub and chrome-devtools-axi for browser operations.
-4. Report status by appending one line: \`echo "{state}: {one short line}" >> $STATUS_FILE\`
+4. Report status by appending one line through the capped helper: \`$APPEND_CMD "{state}: {one short line}"\`
+   Keep each line short - a state verb plus one plain sentence. It writes short lines unchanged and, if a line is long, spills the full body to a file and leaves a truncated line pointing at it, so put long evidence (logs, diffs, a decision's full options) in a report doc under \`$DATA/$ID/\` and make the status line a short pointer to it.
    States: working, needs-decision, blocked, $PAUSED_VERB, done, failed. Each append wakes firstmate, so report only
    supervisor-actionable phase changes plus the needs-decision/blocked/$PAUSED_VERB/done/failed states; no FYI lines.
    A mid-task \`working:\` line (including setup complete) is nonterminal: continue until a defined \`done:\` gate.

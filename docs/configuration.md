@@ -69,6 +69,7 @@ data/                personal fleet records; LOCAL, gitignored as a whole
   <id>/brief.md      per-task crewmate brief, or per-secondmate charter brief when kind=secondmate
   <id>/report.md     scout task deliverable, written by the crewmate; survives teardown
   <id>/pr-description.md  PR-description skeleton for a ship task, generated from data/<id>/brief.md by bin/fm-pr-description.sh and completed substantively by the crewmate; used as the PR body on direct-PR and direct-push lanes; survives teardown
+  <id>/status-overflow/<ts>.txt  full body of an over-cap crew status append, spilled here by bin/fm-status-append.sh so the truncated status line stays short; the status line points at this file with a "... [full: <path>]" suffix
 projects/            cloned repos; gitignored; READ-ONLY for you
 .treehouse/          this home's own worktree pools for those clones; gitignored; created by treehouse, pinned per clone by bin/fm-treehouse-pin.sh so a spawn cannot draw a worktree of another copy of the repo (docs/treehouse-pools.md)
 state/               volatile runtime signals; gitignored
