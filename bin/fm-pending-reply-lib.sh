@@ -1151,6 +1151,8 @@ EOF
 #   STEER_KEY_RECORD  = the steer-key record path (whether or not it exists)
 # A resolved worker status wins over a pending send record so the louder,
 # more actionable "already answered" message is shown.
+# STEER_KEY_STATE/POINTER/RECORD are output globals consumed in bin/fm-send.sh.
+# shellcheck disable=SC2034
 fm_steer_key_check() {  # <state-dir> <target> <key> [status-file]
   local state=$1 target=$2 key=$3 status_file=${4-} rec status_state
   STEER_KEY_STATE=none

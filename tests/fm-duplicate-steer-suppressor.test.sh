@@ -68,7 +68,8 @@ SH
 
 # A valid firstmate home with one recorded ship lane.
 setup_home() {  # <dir> -> echoes home dir
-  local dir=$1 home="$dir/home"
+  local dir=$1
+  local home="$dir/home"
   mkdir -p "$home/data" "$home/state" "$home/config"
   printf '# firstmate\n' > "$home/AGENTS.md"
   fm_write_meta "$home/state/lane-ok.meta" "window=sess:fm-lane-ok" "kind=ship" "harness=codex"
