@@ -72,6 +72,16 @@ fm_install_prepush_guard() {
   fi
 
   local hooks_dir="$wt/.fm-hooks"
+  local own_hook=""
+  if [ -e "$hooks_dir/pre-push" ]; then
+    own_hook=$(cd "$hooks_dir" 2>/dev/null && pwd -P)/pre-push || own_hook=""
+  else
+    own_hook=$(cd "$wt" 2>/dev/null && pwd -P)/.fm-hooks/pre-push || own_hook=""
+  fi
+  if [ -n "$prior_hook" ] && [ -n "$own_hook" ] && [ "$prior_hook" = "$own_hook" ]; then
+    prior_hook=""
+  fi
+
   if ! mkdir -p "$hooks_dir" 2>/dev/null; then
     echo "warning: fm_install_prepush_guard: cannot create '$hooks_dir'; skipping push guard" >&2
     return 0

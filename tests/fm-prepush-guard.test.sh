@@ -180,6 +180,26 @@ test_fallback_blocks_common_default_names() {
   pass "fm-prepush-guard: origin/HEAD-unset fallback still refuses main/master/dev"
 }
 
+test_reinstall_does_not_self_chain() {
+  local wt rc
+  wt=$(build_fixture main)
+  # Reinstalling on the same worktree (reused/pooled crew worktree) must be
+  # re-entrant: the guard must never chain to its own hook, or a push recurses.
+  fm_install_prepush_guard "$wt"
+  local hp
+  hp=$(git -C "$wt" config --worktree --get core.hooksPath 2>/dev/null || true)
+  [ -n "$hp" ] || fail "reinstall dropped the per-worktree core.hooksPath"
+  local own
+  own=$(cd "$hp" && pwd -P)/pre-push
+  if grep -qF "prior_hook='$own'" "$hp/pre-push"; then
+    fail "reinstalled hook chains to its OWN pre-push ($own)"
+  fi
+  printf 'g\n' >> "$wt/a"; git -C "$wt" commit -qam g
+  git -C "$wt" push origin HEAD:fm/testtask >/dev/null 2>&1; rc=$?
+  expect_code 0 "$rc" "after a second install, an fm/<id> push must still succeed (no recursion/hang)"
+  pass "fm-prepush-guard: reinstall is re-entrant and never self-chains"
+}
+
 test_lib_parses
 test_emitted_hook_parses
 test_install_pins_worktree_hookspath
@@ -189,3 +209,4 @@ test_allows_gate_mirror_push
 test_allows_authorized_default_push
 test_primary_checkout_unaffected
 test_fallback_blocks_common_default_names
+test_reinstall_does_not_self_chain
