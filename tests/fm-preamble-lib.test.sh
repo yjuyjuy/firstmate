@@ -13,9 +13,10 @@
 #   - die/fail print "<FM_PROG>: <message>" and exit with the fixed documented
 #     code (canonical default 1, an explicit code argument, and the per-script
 #     FM_DIE_CODE legacy default)
-#   - a lint-style guard that every MIGRATED pilot entrypoint no longer declares
-#     its own die/fail and no longer carries its own FM_ROOT/FM_HOME/STATE/DATA
-#     resolution lines (the duplication this lib exists to end)
+#   - each MIGRATED pilot entrypoint, driven on a real argument-error path,
+#     still prints its own "<FM_PROG>: " prefix and exits with the same code its
+#     pre-migration die/fail produced (proving the extraction is behavior-
+#     preserving through the public binary, not just the source shape)
 #
 # shellcheck disable=SC2016 # The single-quoted probe bodies and grep patterns
 # below are LITERAL on purpose: $FM_ROOT/$STATE/etc. must expand inside the child
@@ -28,10 +29,6 @@ set -u
 # shellcheck disable=SC2153 # ROOT is exported by tests/lib.sh, sourced above.
 LIB="$ROOT/bin/fm-preamble-lib.sh"
 TMP_ROOT=$(fm_test_tmproot fm-preamble-lib-tests)
-
-# The pilot set migrated to the lib in phase 1. Kept here as the single list the
-# lint-style guard iterates; a phase-2 migration extends it.
-MIGRATED_PILOT="fm-grill-reserve.sh fm-lavish-lan.sh fm-token-report.sh fm-ticket-cost-rollup.sh fm-release-lsp.sh fm-afk-inbox.sh"
 
 # run_probe <fm-prog> <die-code-or-empty> <script-body> [env-assignments...]
 # Sources the lib exactly as a migrated entrypoint does (FM_PROG/FM_DIE_CODE set
@@ -173,41 +170,59 @@ EOF
   pass "preamble: FM_PROG defaults to the invoked basename without .sh"
 }
 
-# --- migration lint guard ---------------------------------------------------
+# --- migrated-script error paths (behavioral) -------------------------------
+#
+# These drive each real pilot binary on an argument-error path and assert the
+# observable contract the migration must preserve: the exact "<prefix>: " the
+# script's FM_PROG produces AND the exact exit code the lib's die now yields,
+# which must equal the pre-migration code. This proves the behavior (prefix +
+# code) end to end, including that FM_DIE_CODE and the explicit ${2:-...} code
+# path both work, rather than asserting the shape of the source text.
 
-test_migrated_scripts_source_the_lib() {
-  # Every pilot script must actually source the lib; otherwise it is not migrated
-  # and the guards below are vacuous.
-  local f
-  for f in $MIGRATED_PILOT; do
-    grep -Eq '\. +"\$SCRIPT_DIR/fm-preamble-lib\.sh"' "$ROOT/bin/$f" \
-      || fail "migrated pilot $f should source bin/fm-preamble-lib.sh"
-  done
-  pass "preamble: every migrated pilot script sources the lib"
+# run_migrated <script> <expected-code> <prefix> <msg-needle> <arg...>
+# Invokes $ROOT/bin/<script> with the given args on an error path in an isolated
+# FM_HOME so it never touches the real fleet state, capturing stdout+stderr.
+run_migrated() {
+  local script=$1 want_code=$2 prefix=$3 needle=$4; shift 4
+  local out rc
+  out=$(FM_HOME="$TMP_ROOT/migrated-home" "$ROOT/bin/$script" "$@" 2>&1); rc=$?
+  expect_code "$want_code" "$rc" "$script error path should exit $want_code"
+  assert_contains "$out" "$prefix: " "$script should print its '$prefix:' prefix"
+  assert_contains "$out" "$needle" "$script error message should mention '$needle'"
 }
 
-test_migrated_scripts_drop_local_die_fail() {
-  # A migrated script must not re-declare its own die/fail: the lib owns them.
-  local f
-  for f in $MIGRATED_PILOT; do
-    grep -Eq '^[[:space:]]*(die|fail)\(\)' "$ROOT/bin/$f" \
-      && fail "migrated pilot $f still declares its own die()/fail(); the lib owns it"
-  done
-  pass "preamble: no migrated pilot script re-declares its own die()/fail()"
+test_migrated_grill_reserve_bad_option_exits_2() {
+  run_migrated fm-grill-reserve.sh 2 error "unknown argument" --bogus
+  pass "preamble: fm-grill-reserve bad option -> 'error:' prefix, exit 2"
 }
 
-test_migrated_scripts_drop_inline_resolution() {
-  # A migrated script must not carry its own FM_ROOT/FM_HOME/STATE/DATA/CONFIG
-  # resolution lines: the lib owns the chain. SCRIPT_DIR stays inline by design
-  # (it must run before the lib can be sourced), so it is NOT checked here.
-  local f var
-  for f in $MIGRATED_PILOT; do
-    for var in FM_ROOT FM_HOME STATE DATA CONFIG; do
-      grep -Eq "^${var}=\"?\\\$\\{FM_" "$ROOT/bin/$f" \
-        && fail "migrated pilot $f still resolves $var inline; the lib owns the chain"
-    done
-  done
-  pass "preamble: no migrated pilot script resolves FM_ROOT/FM_HOME/STATE/DATA/CONFIG inline"
+test_migrated_lavish_lan_bad_option_exits_2() {
+  run_migrated fm-lavish-lan.sh 2 fm-lavish-lan "unknown subcommand" bogus
+  pass "preamble: fm-lavish-lan bad subcommand -> 'fm-lavish-lan:' prefix, exit 2"
+}
+
+test_migrated_token_report_bad_option_exits_2() {
+  run_migrated fm-token-report.sh 2 fm-token-report "unknown option" --bogus
+  pass "preamble: fm-token-report bad option -> 'fm-token-report:' prefix, exit 2"
+}
+
+test_migrated_ticket_cost_rollup_bad_option_exits_2() {
+  run_migrated fm-ticket-cost-rollup.sh 2 fm-ticket-cost-rollup "unknown option" --bogus
+  pass "preamble: fm-ticket-cost-rollup bad option -> 'fm-ticket-cost-rollup:' prefix, exit 2"
+}
+
+test_migrated_release_lsp_unknown_option_exits_64() {
+  # release-lsp's die passes an explicit code 64 (${2:-...} path), NOT the
+  # canonical default 1 - proves the explicit-code callsite still honors its code.
+  run_migrated fm-release-lsp.sh 64 fm-release-lsp "unknown option" --bogus
+  pass "preamble: fm-release-lsp unknown option -> 'fm-release-lsp:' prefix, explicit exit 64"
+}
+
+test_migrated_afk_inbox_bad_timeout_exits_1() {
+  # afk-inbox's die uses the canonical default (no FM_DIE_CODE), so a bad
+  # --timeout exits 1.
+  run_migrated fm-afk-inbox.sh 1 fm-afk-inbox "--timeout must be a whole number" --timeout abc
+  pass "preamble: fm-afk-inbox bad --timeout -> 'fm-afk-inbox:' prefix, exit 1"
 }
 
 test_resolution_defaults_to_repo_root
@@ -219,8 +234,11 @@ test_fail_default_code_is_one
 test_die_explicit_code_wins
 test_fm_die_code_legacy_default
 test_fm_prog_defaults_to_basename
-test_migrated_scripts_source_the_lib
-test_migrated_scripts_drop_local_die_fail
-test_migrated_scripts_drop_inline_resolution
+test_migrated_grill_reserve_bad_option_exits_2
+test_migrated_lavish_lan_bad_option_exits_2
+test_migrated_token_report_bad_option_exits_2
+test_migrated_ticket_cost_rollup_bad_option_exits_2
+test_migrated_release_lsp_unknown_option_exits_64
+test_migrated_afk_inbox_bad_timeout_exits_1
 
 pass "fm-preamble-lib.sh: all checks passed"
