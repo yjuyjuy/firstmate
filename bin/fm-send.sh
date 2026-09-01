@@ -10,6 +10,14 @@
 # Key support is backend-specific: tmux/herdr support Escape, Enter, and C-c;
 # Orca currently supports Enter and C-c only, and rejects Escape.
 #
+# Duplicate-steer suppressor: a text steer carrying a "[key=<slug>]" correlation
+# token is refused, loudly and non-zero, when that key already has a pending
+# (already-sent) or resolved (worker already answered) reply for this target, so a
+# re-sent already-answered steer no longer burns a supervisor turn and a worker
+# turn. A leading "fm-send.sh <target> --force ..." consumes the flag (never
+# delivered as text) and sends anyway. A fresh key or a no-key steer passes
+# through untouched. The keyed-steer ledger reuses bin/fm-pending-reply-lib.sh.
+#
 # Text submission is verified: the line is typed ONCE, then Enter is sent and
 # retried (Enter only, never retyped) until the target backend confirms a
 # submit or reports an inconclusive send. If a swallowed Enter is positively
@@ -218,6 +226,17 @@ fm_send_resolve_target "$RAW_TARGET" || exit 1
 T=$RESOLVED_TARGET
 shift
 
+# Duplicate-steer suppressor override: a leading "--force" (consumed here, never
+# delivered as text) sends a keyed steer even when its "[key=...]" is already
+# pending or resolved for this target. Only a leading token is a flag; a "--force"
+# that appears later in the message is ordinary text. See the suppressor block
+# below and bin/fm-pending-reply-lib.sh.
+STEER_FORCE=0
+if [ "${1:-}" = "--force" ]; then
+  STEER_FORCE=1
+  shift
+fi
+
 fm_backend_validate "$TARGET_BACKEND" || exit 1
 
 # Classify a from-firstmate -> secondmate request. Only a task selector resolved
@@ -276,6 +295,40 @@ if [ "${1:-}" = "--key" ]; then
   fi
 else
   MESSAGE=$*
+  # Duplicate-steer suppressor: if this steer carries a "[key=<slug>]" token and
+  # that key already has a pending (already-sent) or resolved (worker already
+  # answered) reply for this target, refuse loudly and non-zero with a pointer to
+  # the existing reply, unless --force was passed. A fresh key or a no-key steer
+  # passes through untouched. The check reads the target's own status file for the
+  # resolved case and this home's steer-key ledger for the pending case; both are
+  # owned by bin/fm-pending-reply-lib.sh. Failing here BEFORE any backend send is
+  # deliberate: a refused steer must never reach the composer.
+  STEER_KEY=$(fm_steer_key_extract "$MESSAGE")
+  STEER_KEY_TASK_ID=
+  STEER_KEY_STATUS=
+  # Canonical ledger target: prefer the resolved task id so different selectors
+  # for one lane (fm-<id>, session:window) converge on the same steer-key record;
+  # fall back to the raw target for an explicit endpoint with no recorded meta.
+  STEER_KEY_TARGET=$RAW_TARGET
+  if [ -n "$STEER_KEY" ] && [ -n "$TARGET_META" ]; then
+    STEER_KEY_TASK_ID=$(fm_send_id_from_meta "$TARGET_META")
+    STEER_KEY_TARGET=$STEER_KEY_TASK_ID
+    STEER_KEY_STATUS="$STATE/$STEER_KEY_TASK_ID.status"
+    [ -f "$STEER_KEY_STATUS" ] || STEER_KEY_STATUS=
+  fi
+  if [ -n "$STEER_KEY" ] && [ "$STEER_FORCE" = 0 ]; then
+    fm_steer_key_check "$STATE" "$STEER_KEY_TARGET" "$STEER_KEY" "$STEER_KEY_STATUS"
+    case "$STEER_KEY_STATE" in
+      resolved)
+        echo "error: steer [key=$STEER_KEY] to $RAW_TARGET was already answered; not resending (see $STEER_KEY_POINTER). Pass --force to send anyway." >&2
+        exit 1
+        ;;
+      pending)
+        echo "error: steer [key=$STEER_KEY] to $RAW_TARGET is already pending a reply; not resending (see $STEER_KEY_POINTER). Pass --force to send anyway." >&2
+        exit 1
+        ;;
+    esac
+  fi
   if [ "$MARK_FROM_FIRSTMATE" = 1 ] && [ "$MARK_NO_REPLY_EXPECTED" = 1 ]; then
     # One-way secondmate message (nudge / control pointer): keep the
     # from-firstmate reply-routing marker so a volunteered reply still lands on
@@ -381,6 +434,14 @@ else
   # silent-when-absent contract the watcher reader uses (fail-soft).
   if [ -n "$TARGET_META" ]; then
     fm_telemetry_set "$STATE/$(fm_send_id_from_meta "$TARGET_META").telemetry" last_steer_ts "$(date +%s)" || true
+  fi
+  # Duplicate-steer suppressor: record this delivered keyed steer so a later
+  # duplicate send of the same "[key=...]" to this target is refused. Only a
+  # CONFIRMED submit reaches here (every failure path above exited), so a failed
+  # send never records a phantom steer. A --force resend still records, keeping the
+  # ledger's last_sent/send_count current. See bin/fm-pending-reply-lib.sh.
+  if [ -n "$STEER_KEY" ]; then
+    fm_steer_key_record "$STATE" "$STEER_KEY_TARGET" "$STEER_KEY" "$STEER_KEY_TASK_ID" "$STEER_KEY_STATUS" || true
   fi
   # Submit landed (verdict was not pending/send-failed). Confirmation only proves
   # the text was accepted; the harness still needs a beat to spin up the

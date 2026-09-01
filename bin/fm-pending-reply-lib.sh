@@ -68,6 +68,13 @@ _FM_PENDING_REPLY_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/n
 . "$_FM_PENDING_REPLY_LIB_DIR/fm-backend.sh"
 # shellcheck source=bin/fm-tmux-lib.sh
 . "$_FM_PENDING_REPLY_LIB_DIR/fm-tmux-lib.sh"
+# shellcheck source=bin/fm-classify-lib.sh
+# fm-classify-lib.sh owns the decision-key grammar ("[key=<slug>]") and the
+# status-line verb/key parsers the duplicate-steer suppressor below reuses so the
+# suppressor never re-implements that grammar. Re-sourcing it is idempotent (pure
+# function definitions), so a consumer that already sources it (bin/fm-watch.sh)
+# is unaffected.
+. "$_FM_PENDING_REPLY_LIB_DIR/fm-classify-lib.sh"
 
 FM_PENDING_REPLY_SCHEMA='fm-pending-reply.v1'
 FM_PENDING_REPLY_CORR_RE='corr=[A-Fa-f0-9]{16}'
@@ -1029,3 +1036,181 @@ fm_pending_reply_task_has_open() {  # <state-dir> <task_id>
   done
   return 1
 }
+
+# --- duplicate-steer suppressor --------------------------------------------
+#
+# Problem: a supervisor re-sending the SAME correlation-keyed steer ("[key=...]")
+# to a worker burns a full supervisor turn and a full worker turn every time,
+# because the worker has already opened or already answered that keyed request
+# (the "3rd duplicate of already-resolved" report). This suppressor extends the
+# outbound-request tracking above to the keyed-steer case: fm-send records every
+# keyed steer it delivers, and refuses - loudly, non-zero, with a pointer to the
+# existing reply - a second send of a "[key=<slug>]" that is already pending
+# (already sent, not yet answered) or already resolved (the worker's status shows
+# a resolved/captain-held line for that key). A --force override sends anyway.
+#
+# It deliberately reuses the ONE decision-key grammar and status-fold owned by
+# fm-classify-lib.sh (status_open_decisions, status_line_verb, _fm_decision_key)
+# rather than re-deriving "[key=...]" a second time. It never refuses a steer
+# whose key is merely OPEN in the worker's status: an open needs-decision is the
+# worker asking, and the first decision-delivery steer answering it MUST get
+# through - only a duplicate SEND or an already-RESOLVED key is suppressed.
+#
+# Record location (sender FM_HOME): state/steer-keys/<target-slug>__<key>
+# Flat files (no per-target subdir) owned by this library. Schema:
+#   schema=fm-steer-key.v1
+#   target=       raw fm-send target the steer was addressed to
+#   key=          the "[key=<slug>]" slug
+#   task_id=      resolvable task id for the target, or empty
+#   status_path=  absolute target status file used for resolved reconcile, or empty
+#   created_epoch=
+#   last_sent_epoch=
+#   send_count=
+#   phase=        pending | resolved
+#
+# Tunables (env):
+#   FM_STEER_KEY_DIR_OVERRIDE  override the steer-keys directory (tests)
+
+FM_STEER_KEY_SCHEMA='fm-steer-key.v1'
+FM_STEER_KEY_TOKEN_RE='\[key=[A-Za-z0-9._-]+\]'
+
+# Extract the first "[key=<slug>]" slug from free steer text. Empty (return 0,
+# no output) when the text carries no key token, so a no-key steer is never
+# suppressed. The slug alphabet matches fm-classify-lib.sh's decision-key grammar.
+fm_steer_key_extract() {  # <text>
+  local text=$1 tok
+  tok=$(printf '%s' "$text" | grep -oE "$FM_STEER_KEY_TOKEN_RE" 2>/dev/null | head -1) || true
+  [ -n "$tok" ] || return 0
+  tok=${tok#\[key=}
+  tok=${tok%\]}
+  printf '%s' "$tok"
+}
+
+fm_steer_key_dir() {  # <state-dir>
+  local state=$1
+  if [ -n "${FM_STEER_KEY_DIR_OVERRIDE:-}" ]; then
+    printf '%s' "$FM_STEER_KEY_DIR_OVERRIDE"
+    return 0
+  fi
+  printf '%s/steer-keys' "$state"
+}
+
+# Filename-safe slug for a raw target (session:window, task id, herdr triple).
+fm_steer_key_target_slug() {  # <target>
+  local target=$1 slug
+  slug=$(printf '%s' "$target" | tr -c 'A-Za-z0-9._-' '_')
+  # Bound the length so an unusually long explicit endpoint stays a sane filename.
+  if [ "${#slug}" -gt 100 ]; then
+    slug="${slug:0:100}"
+  fi
+  printf '%s' "$slug"
+}
+
+fm_steer_key_path() {  # <state-dir> <target> <key>
+  printf '%s/%s__%s' "$(fm_steer_key_dir "$1")" "$(fm_steer_key_target_slug "$2")" "$3"
+}
+
+# Prints "open" | "resolved" | "absent" for <key> in a target status file, using
+# only fm-classify-lib.sh's fold. "open" means an unresolved needs-decision/blocked
+# still carries the key (the worker is asking); "resolved" means a resolved or
+# captain-held line closed it; "absent" means the key never appears.
+fm_steer_key_status_state() {  # <status-file> <key>
+  local f=$1 key=$2 open line verb k resolve held
+  [ -f "$f" ] || { printf 'absent'; return 0; }
+  open=$(status_open_decisions "$f")
+  while IFS=$'\t' read -r k _; do
+    [ -n "$k" ] || continue
+    if [ "$k" = "$key" ]; then
+      printf 'open'
+      return 0
+    fi
+  done <<EOF
+$open
+EOF
+  resolve=${FM_CLASSIFY_RESOLVE_VERB:-$FM_CLASSIFY_RESOLVE_VERB_DEFAULT}
+  held=${FM_CLASSIFY_CAPTAIN_HELD_VERB:-$FM_CLASSIFY_CAPTAIN_HELD_VERB_DEFAULT}
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -n "${line//[[:space:]]/}" ] || continue
+    verb=$(status_line_verb "$line")
+    case "$verb" in
+      "$resolve"|"$held") ;;
+      *) continue ;;
+    esac
+    k=$(_fm_decision_key "$line") || continue
+    if [ "$k" = "$key" ]; then
+      printf 'resolved'
+      return 0
+    fi
+  done < "$f"
+  printf 'absent'
+}
+
+# Classify a would-be keyed steer. Sets three globals and returns 0 always:
+#   STEER_KEY_STATE   = none | pending | resolved
+#   STEER_KEY_POINTER = a path/id pointing at the existing reply (empty for none)
+#   STEER_KEY_RECORD  = the steer-key record path (whether or not it exists)
+# A resolved worker status wins over a pending send record so the louder,
+# more actionable "already answered" message is shown.
+fm_steer_key_check() {  # <state-dir> <target> <key> [status-file]
+  local state=$1 target=$2 key=$3 status_file=${4-} rec status_state
+  STEER_KEY_STATE=none
+  STEER_KEY_POINTER=
+  STEER_KEY_RECORD=$(fm_steer_key_path "$state" "$target" "$key")
+  rec=$STEER_KEY_RECORD
+  if [ -n "$status_file" ]; then
+    status_state=$(fm_steer_key_status_state "$status_file" "$key")
+    if [ "$status_state" = resolved ]; then
+      STEER_KEY_STATE=resolved
+      STEER_KEY_POINTER="$status_file (resolved [key=$key])"
+      if [ -f "$rec" ]; then
+        fm_pending_reply_set "$rec" phase resolved 2>/dev/null || true
+      fi
+      return 0
+    fi
+  fi
+  if [ -f "$rec" ]; then
+    STEER_KEY_STATE=pending
+    STEER_KEY_POINTER="$rec"
+    return 0
+  fi
+  return 0
+}
+
+# Record a delivered keyed steer, creating or bumping the durable record. Called
+# only AFTER a confirmed submit so a failed send never records a phantom steer.
+fm_steer_key_record() {  # <state-dir> <target> <key> [task_id] [status_path]
+  local state=$1 target=$2 key=$3 task_id=${4-} status_path=${5-}
+  local dir rec now count tmp
+  [ -n "$key" ] || return 0
+  dir=$(fm_steer_key_dir "$state")
+  mkdir -p "$dir" || return 1
+  chmod 700 "$dir" 2>/dev/null || true
+  rec=$(fm_steer_key_path "$state" "$target" "$key")
+  now=$(fm_pending_reply_now)
+  if [ -f "$rec" ]; then
+    count=$(fm_pending_reply_get "$rec" send_count)
+    case "$count" in ''|*[!0-9]*) count=0 ;; esac
+    count=$((count + 1))
+    fm_pending_reply_set "$rec" last_sent_epoch "$now" || return 1
+    fm_pending_reply_set "$rec" send_count "$count" || return 1
+    fm_pending_reply_set "$rec" phase pending || return 1
+    [ -z "$status_path" ] || fm_pending_reply_set "$rec" status_path "$status_path" || return 1
+    return 0
+  fi
+  tmp="$dir/.$(fm_steer_key_target_slug "$target")__${key}.tmp.$$"
+  cat > "$tmp" <<EOF
+schema=$FM_STEER_KEY_SCHEMA
+target=$target
+key=$key
+task_id=$task_id
+status_path=$status_path
+created_epoch=$now
+last_sent_epoch=$now
+send_count=1
+phase=pending
+EOF
+  chmod 600 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$rec" || return 1
+  return 0
+}
+
