@@ -45,6 +45,7 @@ write_registry() {
 - direct-proj [direct-PR] - fixture for direct-PR mode (added 2026-07-01)
 - push-proj [direct-push] - fixture for direct-push mode (added 2026-07-24)
 - push-autoland-proj [direct-push +autoland] - fixture for direct-push self-land (added 2026-07-26)
+- noci-proj [no-mistakes +no-ci] - fixture for fork-no-CI no-mistakes park (added 2026-09-01)
 - local-proj [local-only] - fixture for local-only mode (added 2026-07-01)
 - hyfin [no-mistakes] - fixture for hyfin live-stack repro block (added 2026-08-02)
 - hyfin-server [direct-push] - fixture for hyfin-server live-stack repro block (added 2026-08-02)
@@ -382,47 +383,47 @@ test_no_mistakes_dod_requires_preflight() {
   pass "fm-brief.sh: no-mistakes DOD requires the pre-run guard and drive-by-id reads"
 }
 
-# jcode/opus ship crews reliably COMMIT the fix then STOP before running the
-# pipeline or pushing, because the no-mistakes DOD embedded the pipeline in prose
-# paragraphs so a crew read it as "commit then done". The DOD must render as an
-# EXPLICIT NUMBERED terminal step list whose last steps are the pipeline
-# invocation and the stop-at-green PR gate, so the brief structurally cannot read
-# as "commit then done": committing locally is a mid-step, never the finish, and
-# the only "done" is a green PR url. (data/learnings.md; this home 2026-08-17
-# "3 crews stalled after /no-mistakes activation without calling no-mistakes axi run").
-test_no_mistakes_dod_numbered_terminal_pipeline() {
-  local home id brief
-  home="$TMP_ROOT/nm-terminal-home"
-  mkdir -p "$home/data"
-  id="brief-nm-terminal-b5"
-  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj >/dev/null 2>&1
-  brief="$home/data/$id/brief.md"
-  assert_present "$brief" "brief was not scaffolded"
-  # The finish must be an explicit numbered sequence, not prose.
-  assert_grep "1. **Implement**" "$brief" \
-    "no-mistakes DOD lost its numbered terminal step list (step 1 implement)"
-  assert_grep "fm-nm-preflight.sh" "$brief" \
-    "no-mistakes DOD numbered list lost the preflight step"
-  # The pipeline invocation is an explicit required numbered step, not prose.
-  # shellcheck disable=SC2016  # single quotes are deliberate: the backticks must stay literal
-  assert_grep '4. **Run /no-mistakes** (`no-mistakes axi run`)' "$brief" \
-    "no-mistakes DOD numbered list lost the explicit run-the-pipeline step"
-  # Committing locally must be marked a mid-step, never the finish.
-  assert_grep "Committing locally is a mid-step, NEVER the finish" "$brief" \
-    "no-mistakes DOD must state committing locally is never the finish"
-  assert_grep "a local commit is NOT done" "$brief" \
-    "no-mistakes DOD must state a local commit is not done"
-  # The only "done" is the green PR url.
-  assert_grep 'done: PR {url} checks green' "$brief" \
-    "no-mistakes DOD numbered list lost the green-PR done gate"
-  # The two-phase handshake is gone: the crew drives the pipeline itself in one
-  # continuous flow, never stopping for a firstmate steer.
-  assert_no_grep "Firstmate will then instruct you to run /no-mistakes" "$brief" \
-    "no-mistakes DOD must not defer pipeline start to a firstmate steer"
-  # shellcheck disable=SC2016  # single quotes are deliberate: the backticks must stay literal
-  assert_no_grep 'append \`done: {summary}\` to the status file and stop' "$brief" \
-    "no-mistakes DOD must not stop at a local-commit done handshake"
-  pass "fm-brief.sh: no-mistakes DOD renders a numbered terminal pipeline step ending at a green PR"
+# A no-mistakes ship on a fork-no-CI / no-merge-authority repo (registry +no-ci flag)
+# can never report "CI green" - the pipeline reaches the pr step clean then polls
+# "no CI checks reported" forever. Its DoD must instruct the crew to park on the open
+# clean+mergeable PR with EXACTLY the declared external-wait terminal line, so the
+# watcher absorbs the idle pane on its long cadence instead of wedge-escalating it as
+# a stopped crew (data/learnings.md 2026-08-21 done+parked churn note). A CI-running
+# repo (the default no-mistakes lane) must keep the normal "report done at green CI"
+# DoD and must NOT carry the park line.
+test_no_mistakes_noci_dod_parks_on_pr() {
+  local home noci_brief ci_brief
+  home="$TMP_ROOT/noci-home"
+  write_registry "$home"
+
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" brief-noci-c1 noci-proj >/dev/null 2>&1
+  noci_brief="$home/data/brief-noci-c1/brief.md"
+  assert_present "$noci_brief" "fork-no-CI brief was not scaffolded"
+  assert_no_grep "EOF" "$noci_brief" "fork-no-CI brief leaked a heredoc EOF marker"
+  # Layer 1: the fork-no-CI DoD carries the EXACT terminal paused-park line.
+  assert_grep "paused: PR <n> clean+mergeable, awaiting captain merge (no CI on fork)" "$noci_brief" \
+    "fork-no-CI no-mistakes DoD missing the exact paused-park terminal line"
+  assert_grep 'ships **no-mistakes on a fork with no CI**' "$noci_brief" \
+    "fork-no-CI DoD did not declare its no-CI posture"
+  # It must NOT tell the crew to wait for / report a green CI it will never get.
+  assert_no_grep "done: PR {url} checks green" "$noci_brief" \
+    "fork-no-CI DoD must not tell the crew to report a green CI that never arrives"
+  # It still runs the full pipeline (shared body): preflight + --intent are present.
+  assert_grep "$ROOT/bin/fm-nm-preflight.sh" "$noci_brief" \
+    "fork-no-CI DoD lost the shared no-mistakes pipeline body (preflight)"
+  assert_grep 'ALWAYS pass `--intent' "$noci_brief" \
+    "fork-no-CI DoD lost the shared --intent requirement"
+
+  # A CI-running repo (default no-mistakes, no +no-ci flag) keeps the green-CI DoD and
+  # must NOT get the park line - the posture gate is precise.
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" brief-ci-c2 hyfin >/dev/null 2>&1
+  ci_brief="$home/data/brief-ci-c2/brief.md"
+  assert_present "$ci_brief" "CI-running no-mistakes brief was not scaffolded"
+  assert_grep "done: PR {url} checks green" "$ci_brief" \
+    "CI-running no-mistakes DoD lost the report-done-at-green-CI terminal step"
+  assert_no_grep "awaiting captain merge (no CI on fork)" "$ci_brief" \
+    "CI-running no-mistakes DoD must not carry the fork-no-CI park line"
+  pass "fm-brief.sh: +no-ci no-mistakes DoD parks on the PR; a CI-running repo keeps the green-CI DoD"
 }
 
 test_ship_project_memory_wording() {
@@ -1054,7 +1055,7 @@ test_faster_paths_use_configured_authority_without_stacked_review
 test_pr_description_skeleton_required_on_body_writing_lanes
 test_no_mistakes_dod_wording
 test_no_mistakes_dod_requires_preflight
-test_no_mistakes_dod_numbered_terminal_pipeline
+test_no_mistakes_noci_dod_parks_on_pr
 test_ship_project_memory_wording
 test_herdr_lab_contract_is_explicit_and_complete
 test_herdr_lab_contract_quotes_foreign_firstmate_path

@@ -615,10 +615,14 @@ fi
 # yolo does not affect the brief (it governs firstmate's approval behaviour), so discard it.
 # autoland DOES affect the brief: a direct-push +autoland lane self-lands its own green
 # branch onto the default branch, so the generated Rule 1 and Definition of done change.
-read -r MODE _YOLO AUTOLAND _ <<EOF
+# no-ci DOES affect the brief: a fork-no-CI / no-merge-authority repo can never report
+# "CI green", so the no-mistakes DoD tells the crew to park on a clean+mergeable PR with an
+# explicit `paused: ... awaiting captain merge (no CI on fork)` terminal line instead.
+read -r MODE _YOLO AUTOLAND NOCI _ <<EOF
 $("$FM_ROOT/bin/fm-project-mode.sh" "$REPO")
 EOF
 : "${AUTOLAND:=off}"
+: "${NOCI:=off}"
 
 case "$MODE" in
   direct-PR)
@@ -713,21 +717,65 @@ EOF
     SETUP2="
 2. Run \`no-mistakes doctor\`; if it reports the repo is not initialized here, run \`no-mistakes init\`."
     RULE1='1. Never push to the default branch. Never merge a PR.'
-    DOD=$(cat <<EOF
-# Definition of done
-YOU own the entire finish. Committing locally is a mid-step, NEVER the finish - the ONLY done is a GREEN PR. Drive this NUMBERED terminal sequence yourself in one continuous flow; do not stop after committing and do not wait for a firstmate steer to start the pipeline:
+    # Shared no-mistakes pipeline body: identical whether or not the forge runs CI.
+    NM_BODY=$(cat <<EOF
+Before you invoke /no-mistakes, run \`$FM_ROOT/bin/fm-nm-preflight.sh\` from this worktree.
+If it refuses, do NOT invoke /no-mistakes: append \`blocked: {the refusal it printed}\` and stop.
+It refuses a detached HEAD and a worktree that belongs to another copy of the repo.
+A run in flight on a DIFFERENT branch is not a refusal: no-mistakes serializes per repo+branch, so your branch validates alongside it. The guard names that run as a warning - never respond to or abort that run, because its findings belong to the lane that started it.
 
-1. **Implement** the change on your \`fm/$ID\` branch.
-2. **Commit** it. This is a mid-step: a local commit is NOT done.
-3. **Run \`$FM_ROOT/bin/fm-nm-preflight.sh\`** from this worktree. If it refuses, do NOT invoke /no-mistakes: append \`blocked: {the refusal it printed}\` and stop. It refuses a detached HEAD and a worktree that belongs to another copy of the repo. A run in flight on a DIFFERENT branch is NOT a refusal: no-mistakes serializes per repo+branch, so your branch validates alongside it; the guard names that run as a warning - never respond to or abort that run, because its findings belong to the lane that started it.
-4. **Run /no-mistakes** (\`no-mistakes axi run\`) and DRIVE every gate to completion. ALWAYS pass \`--intent "{one-line description of what this change does}"\` on EVERY \`axi run\` - it is required, never optional: without it the pipeline spends an extra model call deriving the intent. Write the intent yourself from the Task above.
-   - Drive YOUR run by its id: \`no-mistakes axi run\` reports the run it started; from then on read it with \`no-mistakes axi status --run <id>\` and \`no-mistakes axi logs --run <id> --step <step>\`. A bare \`axi status\` resolves repo-wide when your branch has no run of its own, so it can hand you a concurrent lane's run as if it were yours.
-   - You drive no-mistakes by RESPONDING to its gates, not by implementing fixes. Follow the guidance no-mistakes itself provides for the mechanics: it loads when you invoke /no-mistakes, and \`no-mistakes axi run --help\` plus the \`help\` lines in each \`axi\` response are authoritative and version-matched to the installed binary. Do NOT hand-edit, commit, or fix findings yourself while a run is active - the pipeline applies every fix.
-   - ask-user findings are NOT yours to answer: escalate to firstmate (rule 6) and stop. When the decision comes back, feed it to the gate with \`no-mistakes axi respond\` and let the pipeline apply it - do not route the question to "the user" or implement the fix yourself. Avoid \`--yes\`: the captain, not you, owns the ask-user decisions it would silently auto-resolve.
-5. **Stop ONLY at the PR gate with CI GREEN** (the CI-ready return point - do not keep monitoring in the background until merge).
-6. **Report done ONLY with the green PR url:** append \`done: PR {url} checks green\` and stop. You are finished. A local commit, a pushed branch, or an open PR with pending checks is NOT done.
+Drive YOUR run by its id. \`no-mistakes axi run\` reports the run it started; from then on read it with \`no-mistakes axi status --run <id>\` and \`no-mistakes axi logs --run <id> --step <step>\`.
+A bare \`axi status\` resolves repo-wide whenever your branch has no run of its own, so it can hand you a concurrent lane run as if it were yours.
+
+ALWAYS pass \`--intent "{one-line description of what this change does}"\` when you invoke \`no-mistakes axi run\`, on EVERY run. It is required, never optional: without it the pipeline spends an extra model call deriving the intent itself, wasting tokens and latency on every run. Write the intent yourself from the Task above.
+
+You drive no-mistakes by responding to its gates, not by implementing fixes.
+Follow the guidance no-mistakes itself provides for the mechanics: it loads when you invoke /no-mistakes, and \`no-mistakes axi run --help\` plus the \`help\` lines in each \`axi\` response are authoritative and version-matched to the installed binary.
+Do not hand-edit, commit, or fix findings yourself while a run is active - the pipeline applies every fix.
+
+Two firstmate-specific rules layer on top of that guidance:
+- ask-user findings are not yours to answer: escalate to firstmate (rule 6) and stop.
+  When the decision comes back, feed it to the gate with \`no-mistakes axi respond\` and let the pipeline apply it - do not route the question to "the user" or implement the fix yourself.
+- Avoid \`--yes\`: the captain, not you, owns the ask-user decisions it would silently auto-resolve.
 EOF
 )
+    if [ "$NOCI" = on ]; then
+      # Fork-no-CI / no-merge-authority repo: the pipeline reaches the pr step clean and
+      # then polls "no CI checks reported" forever, so "CI green" is structurally
+      # unreachable. Report the ready-state as a clean+mergeable PR parked on the captain
+      # merge, using the declared external-wait verb so the watcher absorbs the idle pane
+      # on its long cadence instead of wedge-escalating it as a stopped crew.
+      DOD=$(cat <<EOF
+# Definition of done
+This project ships **no-mistakes on a fork with no CI** (\`+no-ci\`): the pipeline runs clean through the \`pr\` step, but the forge reports NO checks ever, so "CI green" is UNREACHABLE here - the \`ci\` step polls \`no CI checks reported\` forever. The true ready-state is a CLEAN + MERGEABLE PR awaiting the captain's merge, NOT a green check.
+
+The task is complete only when committed on your branch.
+When you believe it is complete, append \`done: {summary}\` to the status file and stop.
+Firstmate will then instruct you to run /no-mistakes to validate and ship a PR.
+
+$NM_BODY
+
+TERMINAL step - park on the open PR, do NOT chase a green that never arrives:
+1. Run /no-mistakes and drive every gate until the pipeline opens the PR clean (0 findings through the \`pr\` step).
+2. Do NOT wait for the \`ci\` step to go green - on this fork it never will. Once the PR is open, verify it is mergeable with \`gh-axi pr view <n>\` (checks read \`no CI checks configured\`).
+3. Append EXACTLY this one line and idle - do NOT append \`done:\`, and do NOT keep polling:
+   \`$PAUSED_VERB: PR <n> clean+mergeable, awaiting captain merge (no CI on fork)\`
+   The \`$PAUSED_VERB:\` verb (not \`done:\`) tells firstmate this is a deliberate external-merge wait, so it leaves your idle pane alone and relays the PR to the captain. Firstmate records the PR, then tears your lane down (your pushed branch is durable on the fork and goes to the merge queue), so do not hold the slot yourself.
+EOF
+)
+    else
+      DOD=$(cat <<EOF
+# Definition of done
+The task is complete only when committed on your branch.
+When you believe it is complete, append \`done: {summary}\` to the status file and stop.
+Firstmate will then instruct you to run /no-mistakes to validate and ship a PR.
+
+$NM_BODY
+
+After /no-mistakes reports CI green (the CI-ready return point - do not wait for it to keep monitoring in the background until merge), append \`done: PR {url} checks green\` and stop. You are finished.
+EOF
+)
+    fi
     ;;
 esac
 

@@ -41,6 +41,9 @@ The optional `+yolo` posture changes routine approval authority but does not cha
 Default it off, and enable it only on the captain's explicit instruction.
 Destructive, irreversible, and security-sensitive decisions still require captain approval when it is on.
 
+The optional `+no-ci` posture (owned by the header of `bin/fm-project-mode.sh`) marks a fork or no-merge-authority repo whose forge reports no CI on our branches, so a no-mistakes lane can never reach "CI green".
+Set it on such a repo so the generated no-mistakes brief parks the crew on a clean, mergeable PR with an explicit `paused: ... awaiting captain merge (no CI on fork)` terminal line instead of chasing an unreachable green.
+
 ## Add or clone an existing project
 
 Confirm the source URL, local project name, delivery mode, and autonomy posture.
