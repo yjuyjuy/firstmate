@@ -664,7 +664,7 @@ Your worktree shares its checkout with firstmate's, which already has the defaul
   # On CONFLICT: run \`git merge --abort\`, then append
   #   \`blocked: [key=autoland-conflict] fm/$ID conflicts with \$DEFAULT, needs authoring-lane resolve\`
   #   to the status file and STOP. Do not resolve it yourself.
-  git push origin "fm-landing:\$DEFAULT"
+  FM_ALLOW_DEFAULT_PUSH=1 git push origin "fm-landing:\$DEFAULT"   # authorized default-branch land (pre-push guard passes it)
   git checkout "fm/$ID"
 
 After the push succeeds, append the merge evidence and stop:
@@ -777,6 +777,7 @@ $RULE1
    \`$FM_ROOT/bin/fm-heavy-run.sh --task $ID -- <command>\` (it prints a queued notice while you wait; that is normal, not a hang). Cap \`VITEST_MAX_WORKERS=2\` (never 4).
 9. Announce test runs: \`working: TEST START - {what, rough scale}\` before, \`working: TEST END - {outcome}\` after.
 10. Announce live browser use: \`working: BROWSER START - {what}\` before, \`working: BROWSER END - {outcome}\` after - a non-blocking announce, never wait on firstmate for a slot.
+11. If any push is refused, STOP and report it - never run \`no-mistakes axi sync --recover\` to take custody back and bypass the refusal, and never hand-push to the default branch. A refused push means a gate said no; push your \`fm/$ID\` branch and let the configured merge authority land it. (A worktree pre-push guard enforces this: a direct push to the default branch is blocked and non-zero.)
 
 $RTK_SECTION
 

@@ -208,6 +208,11 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 # fm_session_store_profile from the token-sessions lib sourced just above.
 # shellcheck source=bin/fm-jcode-profile-lib.sh
 . "$SCRIPT_DIR/fm-jcode-profile-lib.sh"
+# Worktree-scoped pre-push guard (fm_install_prepush_guard): refuses an
+# out-of-band worker push to the repository default branch. Installed on the
+# final crew worktree below. Side-effect-free on source.
+# shellcheck source=bin/fm-prepush-guard-lib.sh
+. "$SCRIPT_DIR/fm-prepush-guard-lib.sh"
 # Resume-command mapping + resume-token helper for stuck-crewmate recovery
 # (bin/fm-resume-lib.sh). Side-effect-free on source, like the two libs above;
 # the post-launch capture below stamps the resume token so a dead session can be
@@ -1801,6 +1806,16 @@ EOF
       exclude_path '.fm-grok-turnend'
       ;;
   esac
+fi
+
+# Worktree-scoped pre-push guard: refuse an out-of-band worker push to the
+# repository default branch (bin/fm-prepush-guard-lib.sh). Installed for every
+# crew worktree (ship and scout alike - a scout must never land either), skipped
+# only for a secondmate home, which is a full firstmate checkout that firstmate
+# itself operates, not a disposable crew worktree. Best-effort: a failure warns
+# and never aborts the spawn; the brief stop-rule remains the layered defense.
+if [ "$KIND" != secondmate ]; then
+  fm_install_prepush_guard "$WT" || true
 fi
 
 # Per-project delivery mode + yolo flag (bin/fm-project-mode.sh; the project-management skill and AGENTS.md task lifecycle).

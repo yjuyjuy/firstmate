@@ -166,6 +166,10 @@ test_direct_push_autoland_dod_semantics() {
     "autoland brief did not spell out the --no-ff merge of its own branch"
   assert_grep "fm-landing:" "$brief" \
     "autoland brief did not land through a private landing ref"
+  # The one legitimate default-branch push carries the pre-push-guard sentinel
+  # inline, so the guard passes it while still blocking an out-of-band hand-push.
+  assert_grep "FM_ALLOW_DEFAULT_PUSH=1 git push origin \"fm-landing:" "$brief" \
+    "autoland brief did not mark the self-land push with the pre-push-guard sentinel"
   assert_grep "git merge --abort" "$brief" \
     "autoland brief did not tell the worker to abort on conflict"
   assert_grep "needs authoring-lane resolve" "$brief" \
@@ -185,6 +189,40 @@ test_direct_push_autoland_dod_semantics() {
   assert_no_grep "open a PR" "$brief" \
     "autoland brief must not tell the worker to open a PR"
   pass "fm-brief.sh: direct-push +autoland DOD self-lands the green branch with the baked-in guardrails"
+}
+
+# Every generated ship brief must carry the explicit anti-bypass stop-rule: the
+# 2026-08-20 hole was a worker running `no-mistakes axi sync --recover` to take
+# custody back after a refused push and then hand-pushing to the default branch.
+# The rule is the instruction half of the fix (the enforcement half is the
+# worktree pre-push guard in bin/fm-prepush-guard-lib.sh). It rides on the ship
+# scaffold's Rules list so every future ship brief inherits it structurally.
+test_ship_brief_carries_no_bypass_stop_rule() {
+  local home brief mode
+  home="$TMP_ROOT/no-bypass-home"
+  write_registry "$home"
+  # Assert across every ship delivery mode: the rule is in the shared ship Rules
+  # list, so it must appear whatever the project's mode. An unregistered name
+  # (nm-default-proj) exercises the no-mistakes default path.
+  for mode in nm-default-proj push-autoland-proj push-proj local-proj; do
+    FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "nb-$mode" "$mode" >/dev/null 2>&1
+    brief="$home/data/nb-$mode/brief.md"
+    assert_present "$brief" "ship brief for $mode was not scaffolded"
+    assert_grep 'no-mistakes axi sync --recover' "$brief" \
+      "ship brief ($mode) must name the sync --recover custody bypass it forbids"
+    assert_grep 'never hand-push to the default branch' "$brief" \
+      "ship brief ($mode) must forbid a hand-push to the default branch"
+    assert_grep 'If any push is refused, STOP and report it' "$brief" \
+      "ship brief ($mode) must tell the worker to stop and report a refused push"
+    assert_grep 'worktree pre-push guard enforces this' "$brief" \
+      "ship brief ($mode) must point at the enforcing pre-push guard"
+  done
+  # A scout never pushes, so it does not carry the ship push-bypass rule.
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" nb-scout nm-default-proj --scout >/dev/null 2>&1
+  brief="$home/data/nb-scout/brief.md"
+  assert_no_grep 'no-mistakes axi sync --recover' "$brief" \
+    "scout brief must not carry the ship push-bypass rule"
+  pass "fm-brief.sh: every ship brief carries the no-bypass / no-hand-push stop-rule"
 }
 
 # hyfin and hyfin-server ship briefs carry a "Live stack repro" block with the
@@ -963,6 +1001,7 @@ test_captain_rules_preserve_existing_brief_contracts
 test_ship_modes_generate_clean_briefs
 test_direct_push_dod_semantics
 test_direct_push_autoland_dod_semantics
+test_ship_brief_carries_no_bypass_stop_rule
 test_hyfin_live_stack_repro_block
 test_faster_paths_use_configured_authority_without_stacked_review
 test_pr_description_skeleton_required_on_body_writing_lanes

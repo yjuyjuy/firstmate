@@ -66,6 +66,7 @@ The shared no-mistakes gate refusal for fleet lifecycle entrypoints is summarize
 | `fm-pending-reply-lib.sh` | Parent-owned secondmate pending-reply expectations, recovery, and one-shot escalation |
 | `fm-secondmate-report.sh` | Optional helper to append a correlated parent status or document-pointer report       |
 | `fm-gate-refuse-lib.sh`  | Shared no-mistakes gate-context refusal for fleet lifecycle entrypoints               |
+| `fm-prepush-guard-lib.sh` | Install a worktree-scoped pre-push hook (`fm_install_prepush_guard`) that refuses an out-of-band worker push to the repository default branch; allows the no-mistakes gate mirror, an `fm/<id>` branch, and the `FM_ALLOW_DEFAULT_PUSH=1` autoland land; sourced by `fm-spawn.sh`, never executed |
 | `fm-nm-preflight.sh`     | Clear a lane to run no-mistakes: refuse a detached HEAD, optionally re-assert the worktree belongs to the intended clone, warn about an unrelated in-flight run, and print the drive-by-id instruction |
 | `fm-watch-arm.sh`        | Verified home-scoped watcher arm wrapper with loud cycle endings and bounded lifecycle ledger; `--converge` collapses a multi-watcher/arm-loop tangle for this home and re-arms one owner |
 | `fm-watch-scope-lib.sh`  | Shared absolute-path home-scoped watcher/arm process enumeration (`fm_home_watcher_pids`/`fm_home_arm_pids`) so tangle-collapse and the wake-path guard share one audited never-cross-home scoping |
