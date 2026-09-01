@@ -16,13 +16,17 @@
 # liveness. Nothing here re-derives any of those contracts, so a change to an
 # owner changes this brief with it.
 #
-# SIDE EFFECTS. The drain in section 1 is the only mutating component, and it is
-# the same already-approved drain firstmate is required to run first anyway.
-# Everything after it is strictly read-only. This script never arms, restarts,
-# or touches the watcher: arming remains a separate call, because the supervision
-# protocols require it to be its own background task and never bundled
-# (docs/supervision-protocols/). fm-wake-drain.sh's own liveness assertion still
-# fires from inside section 1, so a lapsed chain still surfaces here.
+# SIDE EFFECTS. The drain in section 1 is the only mutating component that
+# changes fleet state, and it is the same already-approved drain firstmate is
+# required to run first anyway. The only other write is this reader's own tiny
+# .wake-brief-seen-* marker per briefed task, used to skip reprinting a status
+# tail that has not changed since the last wake; it never touches a task's own
+# records nor the watcher's .seen-*/.hash-* internals. This script never arms,
+# restarts, or touches the watcher: arming remains a separate call, because the
+# supervision protocols require it to be its own background task and never
+# bundled (docs/supervision-protocols/). fm-wake-drain.sh's own liveness
+# assertion still fires from inside section 1, so a lapsed chain still surfaces
+# here.
 #
 # Usage:
 #   fm-wake-brief.sh              brief the tasks named by the drained wakes
@@ -60,6 +64,23 @@ TAIL_LINES=${FM_WAKE_BRIEF_TAIL:-5}
 case "$TAIL_LINES" in
   ''|*[!0-9]*|0) TAIL_LINES=5 ;;
 esac
+
+# A cheap size:mtime signature of a status file, the same shape the watcher uses
+# for its own change detection (bin/fm-watch.sh's stat_sig). Prints nothing when
+# the file cannot be read, so an unreadable signature is indistinguishable from
+# "no prior reading" and both fall back to printing the full tail.
+if [ "$(uname)" = Darwin ]; then
+  brief_stat_sig() { stat -f '%z:%Fm' "$1" 2>/dev/null; }
+else
+  brief_stat_sig() { stat -c '%s:%Y' "$1" 2>/dev/null; }
+fi
+
+# The reader-owned "last seen" sidecar for a task's status file. Distinct from
+# the watcher's .seen-* and .hash-* internals (AGENTS.md section 2): this reader
+# writes only its own .wake-brief-seen-* markers and never touches the watcher's.
+seen_marker_for() {
+  printf '%s/.wake-brief-seen-%s' "$STATE" "$(basename "$1" | tr '.' '_')"
+}
 
 usage() {
   cat <<'EOF'
@@ -222,9 +243,23 @@ for id in $IDS; do
 
   status="$STATE/$id.status"
   if [ -f "$status" ]; then
-    printf 'status tail (last %s line(s), wake-EVENT history, not current state; full log: %s):\n' \
-      "$TAIL_LINES" "$status"
-    tail -n "$TAIL_LINES" "$status"
+    # Skip reprinting an identical tail on a re-read: compare the status file's
+    # cheap size:mtime signature against this reader's own last-seen marker. Only
+    # a CONFIDENT unchanged reading (a marker exists, is readable, and matches the
+    # current signature) suppresses the tail; every doubt - no marker yet, an
+    # unreadable signature, a first-ever wake - prints the full tail. A tail that
+    # is suppressed still prints its full-log path, so the reader can always go
+    # deeper. The marker is advanced to the current signature either way.
+    sig=$(brief_stat_sig "$status")
+    marker=$(seen_marker_for "$status")
+    if [ -n "$sig" ] && [ "$sig" = "$(cat "$marker" 2>/dev/null)" ]; then
+      printf 'status tail: (unchanged since last wake) (full log: %s)\n' "$status"
+    else
+      printf 'status tail (last %s line(s), wake-EVENT history, not current state; full log: %s):\n' \
+        "$TAIL_LINES" "$status"
+      tail -n "$TAIL_LINES" "$status"
+    fi
+    [ -n "$sig" ] && printf '%s\n' "$sig" > "$marker" 2>/dev/null || true
   else
     printf 'status tail: ABSENT (%s)\n' "$status"
   fi

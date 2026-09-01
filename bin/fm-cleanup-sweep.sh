@@ -8,7 +8,8 @@
 #     path, so any survivor is crash residue)
 #   - watcher suppression markers for tasks that no longer exist: .seen-*,
 #     .hash-*, .count-*, .stale-*, .paused-*, .hb-surfaced-*,
-#     .wedge-escalations-*, .sm-context-surfaced-*
+#     .wedge-escalations-*, .sm-context-surfaced-*, and the wake-brief reader's
+#     own .wake-brief-seen-* last-seen markers
 #   - isolated copies still registered in a project clone after their task is
 #     gone
 #
@@ -118,7 +119,8 @@ if [ "$INFLIGHT" -eq 0 ]; then
   done
   for marker in "$STATE"/.seen-* "$STATE"/.hash-* "$STATE"/.count-* \
     "$STATE"/.stale-* "$STATE"/.paused-* "$STATE"/.hb-surfaced-* \
-    "$STATE"/.wedge-escalations-* "$STATE"/.sm-context-surfaced-*; do
+    "$STATE"/.wedge-escalations-* "$STATE"/.sm-context-surfaced-* \
+    "$STATE"/.wake-brief-seen-*; do
     [ -f "$marker" ] || continue
     [ "$(fm_hourly_age_of "$marker")" -ge "$MARKER_SECS" ] || continue
     name=$(basename "$marker")

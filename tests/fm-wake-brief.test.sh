@@ -167,10 +167,85 @@ test_bounded_tail_is_configurable() {
     *) fail "default tail must be the LAST lines: $out" ;;
   esac
 
+  # The unchanged-tail skip would suppress a second read of the same file, so
+  # change the status file (and age the marker past the mtime boundary) before
+  # re-reading, keeping this test focused on the tail bound rather than the skip.
+  touch -t 200001010000 "$state/.wake-brief-seen-beta_status"
+  printf 'l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n' > "$state/beta.status"
   out=$(FM_WAKE_BRIEF_TAIL=2 run_brief "$home" beta) || fail "brief must exit 0"
   lines=$(printf '%s\n' "$out" | grep -c '^l[0-9]$')
   [ "$lines" -eq 2 ] || fail "FM_WAKE_BRIEF_TAIL must bound the tail, got $lines"
   pass "wake brief bounds the status tail at 5 lines and honors FM_WAKE_BRIEF_TAIL"
+}
+
+# Count the status-tail body lines the brief printed for a task whose status
+# lines are all of the form l<N>.
+tail_body_lines() { printf '%s\n' "$1" | grep -c '^l[0-9]'; }
+
+test_first_wake_prints_the_full_tail() {
+  local home state out
+  home=$(make_home firstwake)
+  state="$home/state"
+  fm_write_meta "$state/delta.meta" 'window=firstmate:fm-delta'
+  printf 'l1\nl2\nl3\n' > "$state/delta.status"
+
+  # No prior marker exists, so the first-ever wake must show the full tail.
+  out=$(run_brief "$home" delta) || fail "brief must exit 0"
+  case "$out" in
+    *"(unchanged since last wake)"*) fail "first-ever wake must not be reported unchanged: $out" ;;
+  esac
+  [ "$(tail_body_lines "$out")" -eq 3 ] || fail "first wake must print the full tail: $out"
+  [ -f "$state/.wake-brief-seen-delta_status" ] \
+    || fail "first wake must record the last-seen marker: $out"
+  pass "wake brief prints the full tail on the first-ever wake for a task"
+}
+
+test_unchanged_status_is_reported_unchanged_on_reread() {
+  local home state out
+  home=$(make_home unchanged)
+  state="$home/state"
+  fm_write_meta "$state/delta.meta" 'window=firstmate:fm-delta'
+  printf 'l1\nl2\nl3\n' > "$state/delta.status"
+
+  run_brief "$home" delta >/dev/null || fail "first brief must exit 0"
+  # Second read with the status file untouched: the tail must be suppressed with
+  # an (unchanged...) line, and the full-log path must still be printed.
+  out=$(run_brief "$home" delta) || fail "second brief must exit 0"
+  case "$out" in
+    *"(unchanged since last wake)"*) ;;
+    *) fail "an unchanged status must be reported (unchanged...): $out" ;;
+  esac
+  [ "$(tail_body_lines "$out")" -eq 0 ] || fail "an unchanged tail must not be reprinted: $out"
+  case "$out" in
+    *"full log: $state/delta.status"*) ;;
+    *) fail "the full-log path must still print when the tail is suppressed: $out" ;;
+  esac
+  pass "wake brief reports (unchanged...) and suppresses the tail on an unchanged re-read"
+}
+
+test_changed_status_prints_the_full_tail_again() {
+  local home state out
+  home=$(make_home changed)
+  state="$home/state"
+  fm_write_meta "$state/delta.meta" 'window=firstmate:fm-delta'
+  printf 'l1\nl2\nl3\n' > "$state/delta.status"
+
+  run_brief "$home" delta >/dev/null || fail "first brief must exit 0"
+  # Age the marker past the one-second mtime boundary, then append a genuinely new
+  # event, so the size:mtime signature is guaranteed to differ.
+  touch -t 200001010000 "$state/.wake-brief-seen-delta_status"
+  printf 'l4\n' >> "$state/delta.status"
+
+  out=$(run_brief "$home" delta) || fail "second brief must exit 0"
+  case "$out" in
+    *"(unchanged since last wake)"*) fail "a changed status must never be suppressed: $out" ;;
+  esac
+  [ "$(tail_body_lines "$out")" -eq 4 ] || fail "a changed status must reprint the full tail: $out"
+  case "$out" in
+    *l4*) ;;
+    *) fail "a changed tail must show the new line: $out" ;;
+  esac
+  pass "wake brief reprints the full tail when the status file gained a line"
 }
 
 test_absent_files_are_marked_not_skipped() {
@@ -298,7 +373,11 @@ test_brief_writes_nothing_beyond_the_drain_it_runs() {
   before=$(state_fingerprint "$brief_home/state")
   run_brief "$brief_home" >/dev/null || fail "brief must exit 0"
   after=$(state_fingerprint "$brief_home/state")
-  brief_footprint=$(footprint "$before" "$after")
+  # The reader owns exactly one extra write beyond the drain: its own
+  # .wake-brief-seen-* last-seen marker, used to skip an unchanged tail. Exclude
+  # it from the difference (it is asserted on its own below) and require the rest
+  # of the footprint to match a bare drain's exactly.
+  brief_footprint=$(footprint "$before" "$after" | grep -v '^\.wake-brief-seen-' || true)
 
   drain_home=$(seed_readonly_home readonly-drain)
   before=$(state_fingerprint "$drain_home/state")
@@ -308,8 +387,8 @@ test_brief_writes_nothing_beyond_the_drain_it_runs() {
   after=$(state_fingerprint "$drain_home/state")
   drain_footprint=$(footprint "$before" "$after")
 
-  [ "$brief_footprint" = "$drain_footprint" ] || fail "brief wrote state beyond its drain:
---- brief ---
+  [ "$brief_footprint" = "$drain_footprint" ] || fail "brief wrote state beyond its drain and its own seen marker:
+--- brief (minus seen marker) ---
 $brief_footprint
 --- bare drain ---
 $drain_footprint"
@@ -319,6 +398,8 @@ $drain_footprint"
     *epsilon.meta*) fail "brief must not touch task metadata" ;;
     *epsilon.status*) fail "brief must not touch a task status log" ;;
   esac
+  [ -f "$state/.wake-brief-seen-epsilon_status" ] \
+    || fail "brief must record its own last-seen marker for the briefed task"
   [ ! -s "$state/.wake-queue" ] || fail "brief must consume the queue it drained"
 
   # Second run: the queue is empty now, so nothing names a task, and the task's
@@ -326,9 +407,9 @@ $drain_footprint"
   before=$(state_fingerprint "$state")
   run_brief "$brief_home" >/dev/null || fail "brief must exit 0 on a re-run"
   case "$(footprint "$before" "$(state_fingerprint "$state")")" in
-    *epsilon.*) fail "re-running the brief modified a task's records" ;;
+    *epsilon.meta*|*epsilon.status*) fail "re-running the brief modified a task's records" ;;
   esac
-  pass "wake brief writes nothing in state/ beyond the already-approved drain it runs"
+  pass "wake brief writes nothing in state/ beyond its drain and its own reader marker"
 }
 
 test_failed_drain_is_distinct_from_an_empty_queue() {
@@ -530,6 +611,9 @@ test_invalid_explicit_id_is_reported_not_dropped
 test_glob_like_id_is_not_expanded_against_the_working_dir
 test_tmux_listing_is_read_once_for_the_whole_sweep
 test_bounded_tail_is_configurable
+test_first_wake_prints_the_full_tail
+test_unchanged_status_is_reported_unchanged_on_reread
+test_changed_status_prints_the_full_tail_again
 test_absent_files_are_marked_not_skipped
 test_explicit_ids_join_the_wake_named_ones
 test_stale_wake_key_resolves_through_the_window_label
