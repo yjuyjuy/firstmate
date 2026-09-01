@@ -29,6 +29,11 @@ So a hold that is Done while still bearing the sentinel, and carrying no resolut
 `guard` reads the active backlog and the retention archive directly and fails closed when any kind `captain` item is in that state, because tasks-axi cannot address an item once retention pruning has moved it into the archive file (the archive is a flat, non-backlog file).
 Detection is pure file reading and needs no tasks-axi; only `--restore` mutates, reopening and re-holding an active-backlog offender and reporting an archived offender for manual un-archiving.
 `fm-teardown.sh` runs the read-only `guard` as a fail-closed gate before its own close-and-prune reminder, the closest firstmate-owned point ahead of the pruning `tasks-axi done`; `verify` alone could not catch this because it only inspects the torn-down origin's own inventory, never a sibling hold being buried.
+On refusal, teardown captures the guard stderr, extracts each offending hold id (by the canonical `<origin>-decision-<key>` shape), and prints the exact copy-paste recovery inline: the `guard --restore` step followed by one `resolve <origin> <key> ...` line per hold, so recovery is not archaeology.
+
+The `close` subcommand is the safe replacement for a bare `tasks-axi done` on a captain hold, catching the retention-loss at close time rather than only at teardown.
+It refuses to close a kind `captain` hold that still bears the awaiting sentinel and carries no resolution record, naming the offending hold and inlining the `resolve` recipe.
+A durably resolved hold, an ordinary captain hold with no sentinel, and any non-captain item all pass straight through to a plain `tasks-axi done`.
 
 The `hold` subcommand keys "already durably resolved" off the resolution record, not the tasks-axi Done flag.
 This resolves a former contradiction where `hold` reported a bare-`done` hold as already resolved while `verify_hold_durable` reported the same id as neither held nor durably resolved.

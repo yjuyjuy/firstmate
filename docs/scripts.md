@@ -19,7 +19,7 @@ The shared no-mistakes gate refusal for fleet lifecycle entrypoints is summarize
 | `fm-bearings-snapshot.sh` | Project the fleet snapshot to the compact TOON bearings view; local-only unless `--include-prs` |
 | `fm-update.sh`           | Fast-forward-only self-update of firstmate and secondmate homes from origin          |
 | `fm-backlog-handoff.sh`  | Validate and delegate queued backlog-item moves into a secondmate home               |
-| `fm-decision-hold.sh`    | Create, verify, complete, and resolve durable captain-held decisions                 |
+| `fm-decision-hold.sh`    | Create, verify, complete, resolve, and safely close durable captain-held decisions   |
 | `fm-decision-desk-ledger.sh` | Log decision-desk requests at routing time and surface a routed/ruled/overturned tally on demand |
 | `fm-dashboard.sh`        | The captain's dashboard TUI: fzf panels cycled by keybind over every home read-only (ADR-0032). The backlog panel merges every home's queued/in-flight tasks with sort/filter cycling; the captain-decisions panel merges captain-kind holds, decision-desk requests, and unanswered transcript questions, each row tagged with home and source. Snapshot-at-launch with a manual refresh; ctrl-y composes a one-line note about the selected row to the captain's local clipboard via OSC 52 for manual paste into the primary firstmate (issues #198, #199, #200) |
 | `fm-brief.sh`            | Scaffold ship, scout, interactive, secondmate-charter, and Herdr-lab briefs          |
