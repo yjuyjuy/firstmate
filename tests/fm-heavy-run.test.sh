@@ -452,6 +452,106 @@ test_pressure_guard_fails_open_when_status_absent_or_stale() {
   pass "fm-heavy-run.sh: the pressure guard fails open on an absent or stale verdict"
 }
 
+# --- ledger-recorded ceiling fallback ---------------------------------------
+
+# Write a fixture ledger entry directly, including the new ceiling field. The pid
+# need not be alive: resolve_slots reads the ledger without a reap, so a fixture
+# with any numeric pid and a live state counts as a recorded ceiling. Pass an
+# empty ceiling arg to omit the field entirely (an OLD pre-ceiling entry).
+write_ledger_entry() {  # <seq> <state> <ceiling-or-empty>
+  mkdir -p "$QUEUE"
+  {
+    printf 'seq=%s\n' "$1"
+    printf 'pid=%s\n' 999999
+    printf 'identity=%s\n' fixture-identity
+    printf 'state=%s\n' "$2"
+    printf 'started=%s\n' "$(date +%s)"
+    printf 'home=%s\n' "$HOME_DIR"
+    printf 'task=%s\n' fixture
+    printf 'label=-\n'
+    printf 'cmd=fixture\n'
+    [ -n "$3" ] && printf 'ceiling=%s\n' "$3"
+  } > "$(printf '%s/%012d.entry' "$QUEUE" "$1")"
+}
+
+test_ledger_ceiling_replaces_bare_one_fallback() {
+  # A process with no FM_HEAVY_SLOTS and no config file must adopt the highest
+  # recorded ceiling among live ledger entries instead of falling back to 1, so a
+  # raised ceiling is honoured by the exact processes queuing on the shared ledger.
+  reset_queue
+  rm -f "$HOME_DIR/config/heavy-run-slots"
+  write_ledger_entry 1 running 2
+  [ "$("$HR" --slots 2>/dev/null)" = 2 ] \
+    || fail "no env/config but a ledger ceiling=2 entry must resolve 2, not the bare-1 fallback"
+  # The highest live entry wins when several are recorded.
+  write_ledger_entry 2 waiting 3
+  [ "$("$HR" --slots 2>/dev/null)" = 3 ] \
+    || fail "the highest recorded live ceiling must win"
+  pass "fm-heavy-run.sh: a bare-1 fallback adopts the highest recorded ledger ceiling"
+}
+
+test_explicit_ceiling_wins_over_ledger() {
+  # An explicit local ceiling is authoritative; the ledger read is only the
+  # fallback that replaces bare 1. FM_HEAVY_SLOTS and the config file both win.
+  reset_queue
+  write_ledger_entry 1 running 5
+  [ "$(FM_HEAVY_SLOTS=2 "$HR" --slots 2>/dev/null)" = 2 ] \
+    || fail "an explicit FM_HEAVY_SLOTS must win over a higher recorded ledger ceiling"
+  printf '1\n' > "$HOME_DIR/config/heavy-run-slots"
+  [ "$("$HR" --slots 2>/dev/null)" = 1 ] \
+    || fail "an explicit config ceiling must win over a higher recorded ledger ceiling"
+  pass "fm-heavy-run.sh: an explicit ceiling wins over the ledger read"
+}
+
+test_empty_ledger_and_no_config_resolves_one() {
+  # With neither config nor any recorded ceiling, the safe bare-1 fallback stands.
+  reset_queue
+  rm -f "$HOME_DIR/config/heavy-run-slots"
+  rm -rf "$QUEUE"
+  [ "$("$HR" --slots 2>/dev/null)" = 1 ] \
+    || fail "an empty ledger with no config must still resolve 1"
+  pass "fm-heavy-run.sh: no config and no recorded ceiling still resolves 1"
+}
+
+test_malformed_recorded_ceiling_falls_to_one_loudly() {
+  # A garbage recorded ceiling must be ignored loudly and fall to 1, exactly like
+  # a malformed config value, rather than silently trusted.
+  local out
+  reset_queue
+  rm -f "$HOME_DIR/config/heavy-run-slots"
+  write_ledger_entry 1 running lots
+  out=$("$HR" --slots 2>&1)
+  assert_contains "$out" "malformed recorded heavy-run ceiling" "a malformed recorded ceiling must warn"
+  [ "$("$HR" --slots 2>/dev/null)" = 1 ] \
+    || fail "a malformed recorded ceiling must fall back to 1, not be trusted"
+  pass "fm-heavy-run.sh: a malformed recorded ceiling falls to 1 loudly"
+}
+
+test_entry_ceiling_round_trips_and_old_entry_parses() {
+  # entry_write must stamp ceiling= into a real admitted run, and entry_read must
+  # tolerate an OLD entry with no ceiling field (backward compat): a pre-existing
+  # ledger entry must not break parsing or admission.
+  local holder entry rc
+  reset_queue
+  printf '2\n' > "$HOME_DIR/config/heavy-run-slots"
+  # An OLD-format entry with no ceiling field occupying one slot. It must parse
+  # (so --status/admission still see it) and must not break the new resolve path.
+  write_ledger_entry 1 running ''
+  [ "$("$HR" --slots 2>/dev/null)" = 2 ] \
+    || fail "an old entry without a ceiling field must not break resolution"
+  # A real run must stamp its resolved ceiling into its own live record.
+  "$HR" --task stamp -- sleep 3 & holder=$!
+  STRAYS+=("$holder")
+  wait_status running 1 10 || fail "the stamping run never showed as running"
+  entry=$(grep -l 'task=stamp' "$QUEUE"/*.entry 2>/dev/null | head -n 1)
+  [ -n "$entry" ] || fail "could not find the stamping run's record"
+  grep -q '^ceiling=2$' "$entry" \
+    || fail "entry_write must stamp the resolved ceiling into the live record; record was:"$'\n'"$(cat "$entry")"
+  kill "$holder" 2>/dev/null
+  wait "$holder" 2>/dev/null || true
+  pass "fm-heavy-run.sh: entry_write stamps ceiling= and entry_read tolerates an old entry"
+}
+
 # --- stale-ceiling FIFO deadlock (regression) -------------------------------
 
 test_stale_ceiling_head_waiter_picks_up_raised_ceiling() {
@@ -510,6 +610,11 @@ test_symlinked_ledger_dir_is_refused() {
 test_script_parses
 test_symlinked_ledger_dir_is_refused
 test_stale_ceiling_head_waiter_picks_up_raised_ceiling
+test_ledger_ceiling_replaces_bare_one_fallback
+test_explicit_ceiling_wins_over_ledger
+test_empty_ledger_and_no_config_resolves_one
+test_malformed_recorded_ceiling_falls_to_one_loudly
+test_entry_ceiling_round_trips_and_old_entry_parses
 test_help_includes_entire_header
 test_usage_error_runs_nothing
 test_passes_through_output_and_status

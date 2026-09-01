@@ -52,12 +52,14 @@
 #
 # LEASE RECORDS. <queue>/<seq>.entry, one per participant, each with seq, pid, a
 # PID identity (start time plus command line), state=waiting or state=running,
-# started, the operational home that owns the run, task, label, and a truncated
-# command string. The home field is attribution only, so --status and firstmate
-# can see which home each shared-ledger run belongs to. The admission lock is
-# held only while records are read and rewritten, never while a command runs.
-# Records are written to a temp file and renamed, so an unlocked --status never
-# reads a half-written record.
+# started, the operational home that owns the run, task, label, a truncated
+# command string, and the ceiling this run resolved. The home field is
+# attribution only, so --status and firstmate can see which home each
+# shared-ledger run belongs to. The ceiling field is the authoritative shared cap
+# a waiter reads when its own env/config chain would fall back to bare 1 (see
+# resolve_slots). The admission lock is held only while records are read and
+# rewritten, never while a command runs. Records are written to a temp file and
+# renamed, so an unlocked --status never reads a half-written record.
 #
 # FAIRNESS AND VISIBILITY. Sequence numbers are monotonic and the lowest waiting
 # sequence is admitted first, so a queued run cannot be starved by later
@@ -172,15 +174,46 @@ one_line() {
   printf '%s' "$1" | LC_ALL=C tr '\t\r\n' '   ' | cut -c1-200
 }
 
+# The highest ceiling recorded among live (waiting/running) ledger entries, or
+# empty when none carries one. This is the authoritative shared cap a waiter can
+# read when its own env/config chain would otherwise fall back to bare 1: the
+# recorded value was itself resolved and stamped by a real config read (see
+# entry_write), so adopting it resolves the SAME cap every home agreed on rather
+# than guessing a permissive number. A malformed or below-floor recorded value is
+# ignored loudly, exactly like a malformed config value. Reads the ledger without
+# a lock and tolerates an OLD entry with no ceiling field.
+ledger_max_ceiling() {
+  local f best='' c
+  for f in "$QUEUE"/*.entry; do
+    [ -f "$f" ] || continue
+    entry_read "$f" || continue
+    c=$E_CEILING
+    [ -n "$c" ] || continue
+    case "$c" in
+      *[!0-9]*)
+        log "warning: ignoring malformed recorded heavy-run ceiling '$c'"
+        continue
+        ;;
+    esac
+    [ "$c" -ge 1 ] || continue
+    if [ -z "$best" ] || [ "$c" -gt "$best" ]; then best=$c; fi
+  done
+  [ -n "$best" ] && printf '%s\n' "$best"
+}
+
 # --- ceiling ----------------------------------------------------------------
 #
 # FM_HEAVY_SLOTS (operator override and test seam), then the authoritative
-# ceiling file, then 1. The authoritative file is FM_HEAVY_SLOTS_FILE (the
-# primary home's config/heavy-run-slots) when it is set and readable, so every
-# home sharing the host-global ledger resolves ONE cap; otherwise this home's own
-# config/heavy-run-slots. A malformed value falls back to 1 rather than to a
-# permissive number: the failure mode of guessing high is the host thrash this
-# exists to prevent.
+# ceiling file, then the highest ceiling recorded in the shared host-global
+# ledger, then 1. The authoritative file is FM_HEAVY_SLOTS_FILE (the primary
+# home's config/heavy-run-slots) when it is set and readable, so every home
+# sharing the host-global ledger resolves ONE cap; otherwise this home's own
+# config/heavy-run-slots. When neither env nor a config file supplies a ceiling -
+# the exact case of a no-mistakes heavy-run subprocess spawned with no config and
+# no pointer - the ledger read replaces the bare-1 fallback so a raised ceiling
+# is honoured by the processes actually queuing on it. A malformed value falls
+# back to 1 rather than to a permissive number: the failure mode of guessing high
+# is the host thrash this exists to prevent.
 resolve_slots() {
   local raw='' source_file=$SLOTS_FILE
   if [ -n "$SLOTS_POINTER" ] && [ -f "$SLOTS_POINTER" ] && [ -r "$SLOTS_POINTER" ]; then
@@ -191,7 +224,12 @@ resolve_slots() {
   elif [ -f "$source_file" ]; then
     raw=$(grep -v '^[[:space:]]*$' "$source_file" 2>/dev/null | head -n 1 | tr -d '[:space:]')
   fi
-  [ -n "$raw" ] || { printf '1\n'; return 0; }
+  if [ -z "$raw" ]; then
+    # No explicit local ceiling: adopt the shared cap recorded in the ledger if
+    # one exists, else the safe bare-1 floor.
+    raw=$(ledger_max_ceiling)
+    [ -n "$raw" ] || { printf '1\n'; return 0; }
+  fi
   case "$raw" in
     ''|*[!0-9]*)
       log "warning: ignoring malformed heavy-run ceiling '$raw'; using 1"
@@ -219,10 +257,10 @@ identity_of() {  # <pid>
   one_line "$(fm_pid_identity "$1" 2>/dev/null || true)"
 }
 
-E_SEQ=; E_PID=; E_IDENTITY=; E_STATE=; E_STARTED=; E_HOME=; E_TASK=; E_LABEL=; E_CMD=
+E_SEQ=; E_PID=; E_IDENTITY=; E_STATE=; E_STARTED=; E_HOME=; E_TASK=; E_LABEL=; E_CMD=; E_CEILING=
 entry_read() {  # <file>: populate E_*; non-zero when the record is unusable
   local file=$1 line
-  E_SEQ=; E_PID=; E_IDENTITY=; E_STATE=; E_STARTED=; E_HOME=; E_TASK=; E_LABEL=; E_CMD=
+  E_SEQ=; E_PID=; E_IDENTITY=; E_STATE=; E_STARTED=; E_HOME=; E_TASK=; E_LABEL=; E_CMD=; E_CEILING=
   [ -f "$file" ] || return 1
   while IFS= read -r line; do
     case "$line" in
@@ -235,6 +273,7 @@ entry_read() {  # <file>: populate E_*; non-zero when the record is unusable
       task=*) E_TASK=${line#task=} ;;
       label=*) E_LABEL=${line#label=} ;;
       cmd=*) E_CMD=${line#cmd=} ;;
+      ceiling=*) E_CEILING=${line#ceiling=} ;;
     esac
   done < "$file"
   case "$E_PID" in ''|*[!0-9]*) return 1 ;; esac
@@ -242,6 +281,9 @@ entry_read() {  # <file>: populate E_*; non-zero when the record is unusable
   return 0
 }
 
+# The ceiling this run resolved, stamped into its own record so any waiter on the
+# shared host-global ledger can read the real cap (see resolve_slots's ledger
+# fallback). A pre-ceiling entry simply lacks this line, which entry_read tolerates.
 entry_write() {  # <file> <state>: atomic rewrite preserving this run's fields
   local file=$1 state=$2 tmp
   tmp=$(mktemp "$QUEUE/.entry.XXXXXX") || return 1
@@ -255,6 +297,7 @@ entry_write() {  # <file> <state>: atomic rewrite preserving this run's fields
     printf 'task=%s\n' "$TASK"
     printf 'label=%s\n' "$LABEL"
     printf 'cmd=%s\n' "$CMD_TEXT"
+    printf 'ceiling=%s\n' "$SLOTS"
   } > "$tmp" || { rm -f "$tmp"; return 1; }
   mv -f "$tmp" "$file" || { rm -f "$tmp"; return 1; }
 }
