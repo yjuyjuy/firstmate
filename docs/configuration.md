@@ -935,6 +935,8 @@ FM_WAKE_BRIEF_TAIL=5    # state/*.status lines printed per task in the fm-wake-b
 FM_STATUS_APPEND_CAP=300   # max chars a crew status line (state/<id>.status) may reach via bin/fm-status-append.sh; a longer line spills its full body to data/<id>/status-overflow/<ts>.txt and appends a truncated line suffixed "... [full: <path>]" (docs/scripts.md fm-status-append.sh)
 FM_WAKE_DRAIN_BIN=bin/fm-wake-drain.sh   # test override for the drain fm-wake-brief.sh composes, mainly to exercise its failed-drain path
 FM_SPAWN_ALLOW_DUPLICATE=   # deliberate override for fm-spawn.sh's pre-spawn duplicate-dispatch guard; truthy 1 spawns a crewmate/scout even if the task id is already in data/completions.tsv or its recorded pr= is already merged
+FM_TOKEN_CAPTURE_RETRIES=8   # fm-token-sessions-lib.sh fm_token_sessions_capture: bounded retries resolving a just-spawned crew's harness session while the store settles asynchronously before it gives up and logs one diagnostic (best-effort, never blocks the spawn)
+FM_TOKEN_CAPTURE_SLEEP=0.25  # seconds fm_token_sessions_capture waits between those resolve retries
 FMX_PAIRING_TOKEN=      # X mode pairing token; .env opt-in authorizes replies and eligible lifecycle actions
 FMX_RELAY_URL=https://myfirstmate.io   # optional X relay override, mainly for local relay development
 FMX_ENV_FILE=           # optional alternate .env file for direct X client invocations; bootstrap still checks $FM_HOME/.env
