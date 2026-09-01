@@ -43,7 +43,7 @@ The shared no-mistakes gate refusal for fleet lifecycle entrypoints is summarize
 | `fm-subagent-pretool-check.sh` | Primary-home delegation-shape PreToolUse guard (docs/subagent-guard.md) |
 | `fm-supervision-instructions.sh` | Render the session-start primary-harness supervision block or the one-line repair instruction |
 | `fm-home-seed.sh`        | Transactionally provision a secondmate home and maintain `data/secondmates.md`       |
-| `fm-secondmate-context.sh` | Read-only report of a secondmate's context-window usage against the handoff threshold (claude only; else unknown) |
+| `fm-secondmate-context.sh` | Read-only report of a secondmate's context-window usage against the handoff threshold (claude and jcode; else unknown) |
 | `fm-secondmate-handoff.sh` | Hand a context-full secondmate to a fresh agent (stow + continuation doc + respawn) instead of `/compact`; idempotent, fail-closed |
 | `fm-spawn.sh`            | Spawn crewmates, scouts, `id=repo` batches, and secondmates on the resolved harness and runtime backend; refuses crewmate/scout spawns onto already-completed or already-merged work unless `FM_SPAWN_ALLOW_DUPLICATE=1` |
 | `fm-dispatch-select.sh`  | Resolve a dispatch rule/default to one profile, owning quota-aware arrays and random fallback |

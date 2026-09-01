@@ -87,8 +87,26 @@ This is safe for a threshold monitor - it can only over-report, never silently m
 
 jcode (github.com/1jehuang/jcode) is a Claude-Agent-SDK runtime, but it does NOT write to claude's `~/.claude/projects/` transcript directory.
 It persists its own per-session journal at `<jcode-home>/sessions/session_<id>.journal.jsonl`, where `<jcode-home>` is `$JCODE_HOME`, else `~/.jcode`.
-The context count is the LAST record's `append_messages[].token_usage` object, summed as `input_tokens + cache_creation_input_tokens + cache_read_input_tokens` - the same three-component formula as claude, but a different object (`append_messages[].token_usage`, not claude's `message.usage`) in a different, record-append journal.
+The context count is the LAST POSITIVE per-record `append_messages[].token_usage` sum, each summed as `input_tokens + cache_creation_input_tokens + cache_read_input_tokens` - the same three-component formula as claude, but a different object (`append_messages[].token_usage`, not claude's `message.usage`) in a different, record-append journal.
 jcode has its own reader, `fm_sm_jcode_context_tokens`, and `fm_sm_context_tokens` dispatches jcode to it rather than to the claude reader.
+
+**Why the last POSITIVE record, not simply the last record.**
+A real jcode journal can END on a degenerate `token_usage` record - `{"input_tokens":0,"output_tokens":0}` with no cache fields - after many high-usage turns.
+This is an interrupted, placeholder, or system turn that carries no context accounting.
+A naive last-record read sums that to `0`, fails the `> 0` guard, and returns `unknown`, so a high-occupancy session (even ~500000 tokens) reads as `unknown` and no handoff fires.
+Observed live in `session_unicorn_1787764311482_c2b58efc0fa21e76.journal.jsonl` (this machine, 2026-09-01): 28 `token_usage` records climbing to `84661`, then a final `{"input_tokens":0,"output_tokens":0}` that a tail-1 read scored as `0`.
+The reader instead walks the per-record sums and keeps the last POSITIVE one, so the trailing degenerate turn cannot mask real occupancy.
+It still returns `unknown` when NO record is positive (a genuinely empty or format-shifted journal), so the fail-closed contract holds.
+
+```
+$ f=~/.jcode/sessions/session_unicorn_1787764311482_c2b58efc0fa21e76.journal.jsonl
+$ grep '"token_usage"' "$f" | jq '([.append_messages[]?.token_usage//empty]|last) as $u
+        | (($u.input_tokens//0)+($u.cache_creation_input_tokens//0)+($u.cache_read_input_tokens//0))' | tail -3
+83399
+84661
+0
+# last-record read -> 0 -> unknown (the bug); last-positive read -> 84661 (correct)
+```
 
 A session is keyed to its home by its FIRST journal line's `.meta.working_dir`, compared for EXACT string equality against the home path (jcode stores the raw absolute path, so there is no path-munging step).
 Multiple stale same-home journals can exist, so selection prefers the journal whose `session_<id>` basename is present in `<jcode-home>/active_pids/` (the running session), falling back to the newest-mtime `working_dir` match when no active-pid match exists (a resumed or edge session).
@@ -117,8 +135,8 @@ $ grep '"token_usage"' "$F" | tail -1 | jq '.append_messages[].token_usage | key
 ["cache_creation_input_tokens","cache_read_input_tokens","input_tokens","output_tokens"]
 ```
 
-The reader mirrors the claude reader's fail-closed discipline: an absent `jq`, an absent sessions directory, no `working_dir` match, no `token_usage` line, or a sum that is not a positive integer all return `unknown` rather than a wrong number.
-Every field is guarded with jq `// 0` and the final sum is validated with `[[ =~ ^[0-9]+$ ]] && > 0`, so any jcode format shift (a renamed field or a moved directory) makes all matches fail and the reader returns `unknown`.
+The reader mirrors the claude reader's fail-closed discipline: an absent `jq`, an absent sessions directory, no `working_dir` match, no `token_usage` line, or no record with a positive sum all return `unknown` rather than a wrong number.
+Every field is guarded with jq `// 0` and each per-record sum is validated with `[[ =~ ^[0-9]+$ ]] && > 0`, keeping only the last positive one, so any jcode format shift (a renamed field or a moved directory) makes all matches fail and the reader returns `unknown`.
 Only each file's first line is scanned for `working_dir` before parsing usage, which is sub-second even across ~130 session files on the slow-poll cadence.
 This same read is what the supervision daemon uses for firstmate's OWN context-stow nudge (`config/context-stow-threshold`, docs/configuration.md), pointed at firstmate's home instead of a secondmate's - which is why this correction also restores that nudge, which the stale-mirror read had silently under-reported.
 

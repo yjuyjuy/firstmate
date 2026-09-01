@@ -147,13 +147,14 @@ fm_sm_context_tokens() {  # <cwd> <harness>
 # read: find the journal whose FIRST line .meta.working_dir equals <home> (exact
 # string equality - jcode stores the raw absolute path, no munging), preferring
 # the active-pid-confirmed live journal over a stale same-home leftover; the
-# context count is the last append_messages[].token_usage summed as
-# input_tokens + cache_creation_input_tokens + cache_read_input_tokens. Every
-# failure path (no jq, no sessions dir, no working_dir match, no usage line,
-# non-integer or <= 0 sum, or any jcode format shift that renames the field or
-# moves the dir) returns empty so the caller treats context as unknown and fails
-# closed - it never returns a wrong number. Verified 2026-08-01; see
-# docs/secondmate-context-handoff.md.
+# context count is the LAST POSITIVE per-record append_messages[].token_usage
+# sum (input_tokens + cache_creation_input_tokens + cache_read_input_tokens),
+# which skips a trailing degenerate zero-usage turn that would otherwise mask
+# real occupancy. Every failure path (no jq, no sessions dir, no working_dir
+# match, no usage line, no positive-sum record, or any jcode format shift that
+# renames the field or moves the dir) returns empty so the caller treats context
+# as unknown and fails closed - it never returns a wrong number. Verified
+# 2026-08-01; see docs/secondmate-context-handoff.md.
 
 # fm_sm_jcode_home: jcode's config root - $JCODE_HOME, else ~/.jcode.
 fm_sm_jcode_home() {
@@ -206,27 +207,42 @@ fm_sm_jcode_journal() {  # <home>
 # fm_sm_jcode_context_tokens: the last turn's context-window occupancy
 # (input + cache_creation + cache_read input tokens) from <home>'s live jcode
 # journal. Empty when the journal, jq, or a usable token_usage line is missing,
-# or when the sum is not a positive integer - the caller then treats context as
+# or when no record yields a positive sum - the caller then treats context as
 # unknown and fails closed.
 fm_sm_jcode_context_tokens() {  # <home>
-  local home=$1 f line tokens
+  local f sums s tokens=''
+  local home=$1
   command -v jq >/dev/null 2>&1 || return 0
   f=$(fm_sm_jcode_journal "$home") || return 0
   [ -n "$f" ] || return 0
-  # Last record carrying a token_usage; grep streams the file so a multi-MB
-  # journal stays cheap on the slow-poll cadence.
-  line=$(grep '"token_usage"' "$f" 2>/dev/null | tail -1 || true)
-  [ -n "$line" ] || return 0
-  # Take the last append_messages entry that has a token_usage (the most recent
-  # turn's cumulative context), summing its three input components. Guard every
-  # field with // 0 so a renamed field fails closed rather than misreporting.
-  tokens=$(printf '%s' "$line" | jq '
+  # Every record carrying a token_usage, in file order; grep streams the file so
+  # a multi-MB journal stays cheap on the slow-poll cadence. For each record take
+  # its LAST append_messages[].token_usage (the turn's cumulative context) and
+  # sum the three input components, guarding each field with // 0 so a renamed
+  # field yields 0 (fails closed) rather than misreporting.
+  sums=$(grep '"token_usage"' "$f" 2>/dev/null | jq '
       ([.append_messages[]?.token_usage // empty] | last) as $u
     | (($u.input_tokens // 0)
      + ($u.cache_creation_input_tokens // 0)
      + ($u.cache_read_input_tokens // 0))' 2>/dev/null || true)
-  [[ "$tokens" =~ ^[0-9]+$ ]] || return 0
-  [ "$tokens" -gt 0 ] || return 0
+  [ -n "$sums" ] || return 0
+  # Take the last POSITIVE per-record sum, not the last record's sum. A real
+  # journal can END on a degenerate token_usage ({"input_tokens":0,
+  # "output_tokens":0}, no cache fields - an interrupted, placeholder, or system
+  # turn) after many high-usage turns; a naive tail-1 read would sum that to 0,
+  # fail the >0 guard, and return unknown, masking real occupancy so no handoff
+  # fires (observed live in session_unicorn_... at ~84661 real tokens). Walking
+  # to the last positive sum reports the true last real occupancy instead, and
+  # still returns empty when NO record is positive (a genuinely empty or
+  # format-shifted journal), preserving the fail-closed contract.
+  while IFS= read -r s; do
+    [[ "$s" =~ ^[0-9]+$ ]] || continue
+    [ "$s" -gt 0 ] || continue
+    tokens=$s
+  done <<EOF
+$sums
+EOF
+  [ -n "$tokens" ] || return 0
   printf '%s' "$tokens"
 }
 

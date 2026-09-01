@@ -3,8 +3,9 @@
 # Usage: fm-secondmate-context.sh <id>
 #
 # Resolves the secondmate from this home's state/<id>.meta, reads its context
-# tokens from its harness transcript (claude only; every other harness reports
-# unknown - see docs/secondmate-context-handoff.md), and prints:
+# tokens from its harness transcript (claude and jcode have a verified read;
+# every other harness reports unknown - see docs/secondmate-context-handoff.md),
+# and prints:
 #
 #   id=<id>
 #   harness=<harness>
@@ -38,7 +39,7 @@ Usage: fm-secondmate-context.sh <id>
 
 Read-only report of a secondmate's context-window usage, resolved from this
 home's state/<id>.meta. Prints id=, harness=, home=, threshold=, context_tokens=
-(claude only; every other harness prints unknown), and over_threshold=yes|no|unknown.
+(claude and jcode have a verified read; every other harness prints unknown), and over_threshold=yes|no|unknown.
 Threshold defaults to 200000 and is set with config/secondmate-context-threshold.
 Exit 0 on a report (including a clean unknown read), 2 on a bad request or a
 non-secondmate. See docs/secondmate-context-handoff.md.

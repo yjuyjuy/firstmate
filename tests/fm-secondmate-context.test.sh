@@ -191,6 +191,26 @@ test_jcode_ignores_stale_same_home_session() {
   pass "the live active-pid journal wins over a newer stale same-home session"
 }
 
+test_jcode_ignores_trailing_degenerate_turn() {
+  # REGRESSION: a real jcode journal can end on a degenerate token_usage record -
+  # {"input_tokens":0,"output_tokens":0} with NO cache fields (an interrupted,
+  # placeholder, or system turn) - after many high-usage turns. Observed live in
+  # session_unicorn_...: 28 token_usage records climbing to 84661, then a final
+  # {"input_tokens":0,"output_tokens":0}. A naive tail-1 read sums that last record
+  # to 0, fails the >0 guard, and returns unknown - so a 500k session reads as
+  # unknown and NO handoff fires. The read must instead take the last POSITIVE
+  # per-record sum, so real occupancy is reported.
+  local jhome="$TMP_ROOT/jcode-degen" home="/root/degen/home" out
+  # A high-usage turn, then a degenerate zero-usage placeholder turn LAST.
+  local high='{"type":"record","append_messages":[{"token_usage":{"input_tokens":10,"cache_creation_input_tokens":20,"cache_read_input_tokens":170000}}]}'
+  local degenerate='{"type":"record","append_messages":[{"token_usage":{"input_tokens":0,"output_tokens":0}}]}'
+  # write_jcode_journal seeds one record (1+1+1=3), then we append high then degenerate.
+  write_jcode_journal "$jhome" "$home" session_degen 1 1 1 active "$high" "$degenerate" >/dev/null
+  out=$(JCODE_HOME="$jhome" fm_sm_context_tokens "$home" jcode)
+  [ "$out" = 170030 ] || fail "a trailing degenerate zero-usage turn must not mask the last real occupancy, got: $out"
+  pass "jcode read skips a trailing degenerate zero-usage turn and reports the last real occupancy"
+}
+
 test_jcode_fails_closed() {
   local jhome="$TMP_ROOT/jcode-fc" home="/root/fc/home" nojqbin tool out
   write_jcode_journal "$jhome" "$home" session_fc 10 20 170000 active >/dev/null
@@ -329,6 +349,7 @@ test_reporter_over_under_unknown
 test_reporter_refuses_non_secondmate
 test_jcode_reads_journal_token_usage
 test_jcode_ignores_stale_same_home_session
+test_jcode_ignores_trailing_degenerate_turn
 test_jcode_fails_closed
 test_context_stow_threshold_default_and_config
 test_context_stow_should_nudge_state_machine

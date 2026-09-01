@@ -479,8 +479,9 @@ recorded_windows() {
 }
 
 # secondmate_context_sweep: the slow-poll context monitor. For each live
-# secondmate window, read its context-window occupancy (claude only; every other
-# harness reads unknown and is skipped - fail closed, no false handoff) and act
+# secondmate window, read its context-window occupancy (claude and jcode have a
+# verified read; every other harness reads unknown and is skipped - fail closed,
+# no false handoff) and act
 # once when it first crosses the configured threshold, so a proactive handoff
 # replaces the context-full agent BEFORE it must /compact.
 #

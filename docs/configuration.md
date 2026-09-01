@@ -427,8 +427,8 @@ For Pi secondmate launches, `fm-spawn.sh` starts Pi with `-e` pointed at the sec
 The first non-empty, non-comment line is parsed; an absent file, a non-integer, or a non-positive value falls back to the default `200000`, so a typo never silently disables the safety net.
 `200000` is the point a 200k-window model reaches auto-compact; raise the knob for a larger-window model.
 This is the primary's monitoring knob and is not inherited into secondmate homes, because secondmates do not spawn secondmates and so have nothing downstream that reads it.
-The primary's watcher reads each live secondmate's usage on its slow-poll cadence (claude only; every other harness reads unknown and is skipped) and acts once when the count first crosses the threshold, either by waking firstmate to run the handoff by hand or, when automatic handoff is enabled below, by handing off automatically.
-The read mechanism and the evidence behind the claude-only support live in [`docs/secondmate-context-handoff.md`](secondmate-context-handoff.md); the handoff procedure lives in the `secondmate-provisioning` skill; exact flags and paths live in the headers and `--help` of [`bin/fm-secondmate-context.sh`](../bin/fm-secondmate-context.sh) and [`bin/fm-secondmate-handoff.sh`](../bin/fm-secondmate-handoff.sh).
+The primary's watcher reads each live secondmate's usage on its slow-poll cadence (claude and jcode have a verified read; every other harness reads unknown and is skipped) and acts once when the count first crosses the threshold, either by waking firstmate to run the handoff by hand or, when automatic handoff is enabled below, by handing off automatically.
+The read mechanism and the evidence behind the claude and jcode support live in [`docs/secondmate-context-handoff.md`](secondmate-context-handoff.md); the handoff procedure lives in the `secondmate-provisioning` skill; exact flags and paths live in the headers and `--help` of [`bin/fm-secondmate-context.sh`](../bin/fm-secondmate-context.sh) and [`bin/fm-secondmate-handoff.sh`](../bin/fm-secondmate-handoff.sh).
 
 ## Automatic secondmate context handoff (config/secondmate-auto-handoff)
 
