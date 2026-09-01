@@ -382,6 +382,49 @@ test_no_mistakes_dod_requires_preflight() {
   pass "fm-brief.sh: no-mistakes DOD requires the pre-run guard and drive-by-id reads"
 }
 
+# jcode/opus ship crews reliably COMMIT the fix then STOP before running the
+# pipeline or pushing, because the no-mistakes DOD embedded the pipeline in prose
+# paragraphs so a crew read it as "commit then done". The DOD must render as an
+# EXPLICIT NUMBERED terminal step list whose last steps are the pipeline
+# invocation and the stop-at-green PR gate, so the brief structurally cannot read
+# as "commit then done": committing locally is a mid-step, never the finish, and
+# the only "done" is a green PR url. (data/learnings.md; this home 2026-08-17
+# "3 crews stalled after /no-mistakes activation without calling no-mistakes axi run").
+test_no_mistakes_dod_numbered_terminal_pipeline() {
+  local home id brief
+  home="$TMP_ROOT/nm-terminal-home"
+  mkdir -p "$home/data"
+  id="brief-nm-terminal-b5"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj >/dev/null 2>&1
+  brief="$home/data/$id/brief.md"
+  assert_present "$brief" "brief was not scaffolded"
+  # The finish must be an explicit numbered sequence, not prose.
+  assert_grep "1. **Implement**" "$brief" \
+    "no-mistakes DOD lost its numbered terminal step list (step 1 implement)"
+  assert_grep "fm-nm-preflight.sh" "$brief" \
+    "no-mistakes DOD numbered list lost the preflight step"
+  # The pipeline invocation is an explicit required numbered step, not prose.
+  # shellcheck disable=SC2016  # single quotes are deliberate: the backticks must stay literal
+  assert_grep '4. **Run /no-mistakes** (`no-mistakes axi run`)' "$brief" \
+    "no-mistakes DOD numbered list lost the explicit run-the-pipeline step"
+  # Committing locally must be marked a mid-step, never the finish.
+  assert_grep "Committing locally is a mid-step, NEVER the finish" "$brief" \
+    "no-mistakes DOD must state committing locally is never the finish"
+  assert_grep "a local commit is NOT done" "$brief" \
+    "no-mistakes DOD must state a local commit is not done"
+  # The only "done" is the green PR url.
+  assert_grep 'done: PR {url} checks green' "$brief" \
+    "no-mistakes DOD numbered list lost the green-PR done gate"
+  # The two-phase handshake is gone: the crew drives the pipeline itself in one
+  # continuous flow, never stopping for a firstmate steer.
+  assert_no_grep "Firstmate will then instruct you to run /no-mistakes" "$brief" \
+    "no-mistakes DOD must not defer pipeline start to a firstmate steer"
+  # shellcheck disable=SC2016  # single quotes are deliberate: the backticks must stay literal
+  assert_no_grep 'append \`done: {summary}\` to the status file and stop' "$brief" \
+    "no-mistakes DOD must not stop at a local-commit done handshake"
+  pass "fm-brief.sh: no-mistakes DOD renders a numbered terminal pipeline step ending at a green PR"
+}
+
 test_ship_project_memory_wording() {
   local home id brief
   home="$TMP_ROOT/project-memory-home"
@@ -1011,6 +1054,7 @@ test_faster_paths_use_configured_authority_without_stacked_review
 test_pr_description_skeleton_required_on_body_writing_lanes
 test_no_mistakes_dod_wording
 test_no_mistakes_dod_requires_preflight
+test_no_mistakes_dod_numbered_terminal_pipeline
 test_ship_project_memory_wording
 test_herdr_lab_contract_is_explicit_and_complete
 test_herdr_lab_contract_quotes_foreign_firstmate_path
