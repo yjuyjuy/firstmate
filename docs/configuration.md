@@ -932,6 +932,7 @@ FM_CREW_STATE_NM_TIMEOUT=10   # seconds allowed per no-mistakes query inside fm-
 FM_CREW_STATE_RUNS_LIMIT=200  # recent no-mistakes run rows scanned when axi status cannot be attributed to the current code
 FM_CREW_STATE_BIN=bin/fm-crew-state.sh   # test override for the current-state reader used by working/paused watcher triage and by fm-wake-brief.sh
 FM_WAKE_BRIEF_TAIL=5    # state/*.status lines printed per task in the fm-wake-brief.sh wake-handling brief
+FM_STATUS_APPEND_CAP=300   # max chars a crew status line (state/<id>.status) may reach via bin/fm-status-append.sh; a longer line spills its full body to data/<id>/status-overflow/<ts>.txt and appends a truncated line suffixed "... [full: <path>]" (docs/scripts.md fm-status-append.sh)
 FM_WAKE_DRAIN_BIN=bin/fm-wake-drain.sh   # test override for the drain fm-wake-brief.sh composes, mainly to exercise its failed-drain path
 FM_SPAWN_ALLOW_DUPLICATE=   # deliberate override for fm-spawn.sh's pre-spawn duplicate-dispatch guard; truthy 1 spawns a crewmate/scout even if the task id is already in data/completions.tsv or its recorded pr= is already merged
 FMX_PAIRING_TOKEN=      # X mode pairing token; .env opt-in authorizes replies and eligible lifecycle actions

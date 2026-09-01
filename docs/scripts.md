@@ -101,6 +101,7 @@ The shared no-mistakes gate refusal for fleet lifecycle entrypoints is summarize
 | `fm-mutex-lib.sh`        | Side-effect-free portable advisory-mutex primitives (`fm_lock_try_acquire` and friends) |
 | `fm-pid-lib.sh`          | Side-effect-free process liveness and pid-identity helpers shared by the wake and daemon libs |
 | `fm-classify-lib.sh`     | Shared captain-relevant and declared-external-wait wake classification vocabulary    |
+| `fm-status-append.sh`    | The single capped write point for crew status appends: a line at/under the cap (default 300, `FM_STATUS_APPEND_CAP` overrides) is appended unchanged; a longer line spills its full body to `data/<id>/status-overflow/<ts>.txt` first, then appends a truncated line suffixed `... [full: <path>]`, keeping the state-verb prefix at the front so `fm-classify-lib.sh` triage is unaffected |
 | `fm-send.sh`             | Send one verified literal line or supported key through the target's recorded backend |
 | `fm-steer-templates.sh` | Emit a fixed, cache-warm crewmate-steer prefix (`nudge`, `decision-delivery`, `blocker-query`, `gate-response`, `wrapup`) plus a variable tail for a supervisor to send |
 | `fm-tmux-lib.sh`         | Shared tmux pane primitives for busy detection, composer capture, and verified submit |
