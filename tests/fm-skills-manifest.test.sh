@@ -81,6 +81,14 @@ run_skills() {  # <case-dir> <manifest> <args...>
   FM_ERR=$(cat "$err")
 }
 
+# A manifest the test itself owns. Cases that assert on how many skills are
+# reported must run against this, never against the tracked fleet manifest:
+# appending a real skill is a correct change and must not turn a test red.
+FIXTURE_MANIFEST='example/alpha-axi@alpha-axi
+example/beta-axi@beta-axi
+example/gamma-axi@gamma-axi'
+FIXTURE_SKILLS='alpha-axi beta-axi gamma-axi'
+
 new_case() {  # <name> [manifest-body]
   local name=$1 body=${2:-} dir
   dir="$TMP_ROOT/$name"
@@ -130,14 +138,21 @@ test_tracked_manifest_one_source_per_line() {
 # --- check is detect-only ----------------------------------------------------
 
 test_check_reports_missing_without_installing() {
-  local dir calls
-  dir=$(new_case check-missing)
+  local dir calls skill want
+  dir=$(new_case check-missing "$FIXTURE_MANIFEST")
+  want=$(printf '%s\n' "$FIXTURE_MANIFEST" | grep -c .)
   run_skills "$dir" "$dir/manifest" check
   [ "$FM_RC" -eq 0 ] || fail "check exited $FM_RC on a home with missing skills"
   case "$FM_OUT" in
-    "SKILLS_MANIFEST: 8 manifest skill(s) missing: "*"(install: bin/fm-skills-manifest.sh install)") ;;
+    "SKILLS_MANIFEST: $want manifest skill(s) missing: "*"(install: bin/fm-skills-manifest.sh install)") ;;
     *) fail "check printed an unexpected line: $FM_OUT" ;;
   esac
+  for skill in $FIXTURE_SKILLS; do
+    case "$FM_OUT" in
+      *"$skill"*) ;;
+      *) fail "check did not name the missing $skill skill: $FM_OUT" ;;
+    esac
+  done
   [ "$(printf '%s\n' "$FM_OUT" | grep -c .)" -eq 1 ] \
     || fail "check printed more than one line: $FM_OUT"
   calls=$(grep -c . "$dir/npx-calls" || true)
@@ -176,13 +191,17 @@ test_check_is_the_default_subcommand() {
 # --- install: idempotent and additive-only -----------------------------------
 
 test_install_installs_every_missing_skill() {
-  local dir calls
+  local dir calls want skills skill
   dir=$(new_case install-all)
+  run_skills "$dir" "$dir/manifest" list
+  skills=$(printf '%s\n' "$FM_OUT" | awk '{print $2}')
+  want=$(printf '%s\n' "$skills" | grep -c .)
+  : > "$dir/npx-calls"
   run_skills "$dir" "$dir/manifest" install
   [ "$FM_RC" -eq 0 ] || fail "install exited $FM_RC: $FM_ERR"
   calls=$(grep -c . "$dir/npx-calls")
-  [ "$calls" -eq 8 ] || fail "install fetched $calls source(s), expected 8"
-  for skill in tasks-axi gh-axi chrome-devtools-axi quota-axi mongosh-axi lavish no-mistakes axi; do
+  [ "$calls" -eq "$want" ] || fail "install fetched $calls source(s), expected $want"
+  for skill in $skills; do
     [ -f "$dir/home/.agents/skills/$skill/SKILL.md" ] \
       || fail "install did not land the $skill skill"
   done
