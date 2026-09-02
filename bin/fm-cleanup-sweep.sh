@@ -11,7 +11,9 @@
 #     .wedge-escalations-*, .sm-context-surfaced-*, and the wake-brief reader's
 #     own .wake-brief-seen-* last-seen markers
 #   - isolated copies still registered in a project clone after their task is
-#     gone
+#     gone, except available treehouse pool slots: those are idle pool
+#     INVENTORY, not leftover task copies, and are skipped by consulting the
+#     pool itself (treehouse status, run inside the clone)
 #
 # THE SAFETY LINE, AND WHY IT IS DRAWN HERE: the first two are pure bookkeeping
 # - no work of any kind lives in them - so this pass reclaims them SILENTLY and
@@ -22,10 +24,14 @@
 # incapable of discarding work: refusing costs a line of prose, and being wrong
 # costs a crewmate's unlanded branch.
 #
-# Nothing here writes to a project, and nothing here touches the network. The
-# project-clone inspection is a read-only `git worktree list`; even a
+# Nothing here writes a project file, and nothing here touches the network.
+# The project-clone inspection is a read-only `git worktree list`; even a
 # `git worktree prune` (which would be safe in isolation) is deliberately not
-# run, because it is a write into a clone firstmate must only read. The merge
+# run, because it is a write into a clone firstmate must only read. The only
+# pool-adjacent write is `treehouse status` refreshing treehouse's own
+# treehouse-state.json bookkeeping while the sweep consults it; that file
+# belongs to treehouse, never to task work, and the pass writes no other
+# project file. The merge
 # queue is deliberately NOT swept here either: its merged test fetches into a
 # clone, which an unattended poll must never do, so sweeping it stays
 # firstmate's own action through bin/fm-merge-queue.sh.
@@ -142,6 +148,98 @@ if [ "$INFLIGHT" -eq 0 ]; then
 fi
 
 # --- report 1: isolated copies still registered after their task is gone ------
+# The orphan filter must never read a treehouse pool slot as a leftover task
+# copy: an available slot is idle pool INVENTORY with no task meta by
+# definition, so it would trip the "no task recorded" test every hour (the
+# false findings this pass used to spam). The pool itself is the authoritative
+# owner of that judgment, so the sweep asks it: `treehouse status` run INSIDE
+# the clone, exactly the signal the captain reads, and skips only the slots
+# treehouse reports `available`. Every other status - leased, in-use,
+# you're here, dirty, damaged, or a future word - is NOT pool inventory and
+# stays subject to the orphan filter, as does any registered worktree the pool
+# does not know about.
+#
+# When the treehouse signal is unavailable for a clone, the sweep falls back to
+# a conservative git-side proxy per candidate: a slot that is clean, on a
+# detached HEAD, and at the clone's default-branch tip looks exactly like pool
+# inventory and is not spammed; anything else (dirty, on a task branch, at
+# another commit) is still flagged. That matches what treehouse itself means by
+# available - idle, clean, at the reset target - so a healthy pool stays quiet
+# even where treehouse is not installed. Both directions keep report 1
+# flag-only: nothing here removes a slot, teardown owns removal.
+
+# Value of one JSON string field out of a single treehouse status record, with
+# backslash escapes resolved. Prints the value and returns 0 on success; a
+# malformed record prints nothing and returns 1. The caller treats an
+# unparseable record as "not matched", so a pathological slot can only fail
+# toward the orphan filter (flag-only), never toward a silent skip.
+fm_cleanup_json_str() {  # <record> <field>
+  local record=$1 field=$2 mark rest val ch esc
+  mark="\"$field\":\""
+  case "$record" in *"$mark"*) ;; *) return 1 ;; esac
+  rest=${record#*"$mark"}
+  val=
+  while [ -n "$rest" ]; do
+    ch=${rest%"${rest#?}"}
+    rest=${rest#?}
+    if [ "$ch" = "\\" ]; then
+      esc=${rest%"${rest#?}"}
+      rest=${rest#?}
+      case "$esc" in '"'|\\|'/') val="$val$esc" ;; *) return 1 ;; esac
+      continue
+    fi
+    [ "$ch" = '"' ] && { printf '%s' "$val"; return 0; }
+    val="$val$ch"
+  done
+  return 1
+}
+
+# The clone's pool-inventory paths: the absolute paths of the slots treehouse
+# reports `available`, one per line. Returns 0 when treehouse answered (even
+# with zero available slots - its answer is authoritative), 1 when the signal
+# is unusable (no treehouse binary, clone not a repo, no pool, or unparseable
+# output) and the caller must fall back to the git-side proxy.
+fm_cleanup_treehouse_available() {  # <clone>
+  local clone=$1 out rest rec path status parsed=0
+  out=$(cd "$clone" 2>/dev/null && NO_COLOR=1 treehouse status --json 2>/dev/null || true)
+  [ -n "$out" ] || return 1
+  rest=$out
+  while [ -n "$rest" ]; do
+    # Treehouse renders the pool as one JSON array on a single line; records
+    # are adjacent objects, so the separator is '},{' (brace, comma, brace).
+    case "$rest" in
+      *'},{'*) rec=${rest%%'},{'*} rest=${rest#*'},{'} ;;
+      *) rec=$rest rest= ;;
+    esac
+    path=$(fm_cleanup_json_str "$rec" path) || continue
+    status=$(fm_cleanup_json_str "$rec" status) || continue
+    parsed=1
+    [ "$status" = available ] || continue
+    printf '%s\n' "$path"
+  done
+  [ "$parsed" -eq 1 ]
+}
+
+# True when <worktree> looks exactly like an available pool slot: clean, on a
+# detached HEAD, at the clone's default-branch tip (origin/HEAD when the clone
+# has a remote, else the clone's own checked-out HEAD). Anything else - dirty,
+# on a branch, at another commit - is not pool inventory. Used only when the
+# treehouse signal is unavailable for the clone.
+fm_cleanup_looks_like_pool_inventory() {  # <clone> <worktree>
+  local clone=$1 wt=$2 default tip head
+  git -C "$wt" symbolic-ref -q HEAD >/dev/null 2>&1 && return 1
+  [ -n "$(git -C "$wt" status --porcelain 2>/dev/null || true)" ] && return 1
+  default=$(git -C "$clone" symbolic-ref -q refs/remotes/origin/HEAD 2>/dev/null || true)
+  if [ -n "$default" ]; then
+    tip=$(git -C "$clone" rev-parse "$default" 2>/dev/null || true)
+  else
+    tip=$(git -C "$clone" rev-parse HEAD 2>/dev/null || true)
+  fi
+  [ -n "$tip" ] || return 1
+  head=$(git -C "$wt" rev-parse HEAD 2>/dev/null || true)
+  [ -n "$head" ] && [ "$head" = "$tip" ]
+}
+
 LIVE_WORKTREES=
 for meta in "$STATE"/*.meta; do
   [ -f "$meta" ] || continue
@@ -153,12 +251,36 @@ done
 if [ -d "$PROJECTS" ]; then
   for clone in "$PROJECTS"/*; do
     [ -d "$clone/.git" ] || [ -f "$clone/.git" ] || continue
+    # Build the pool-inventory set once per clone. A clone whose pool answered
+    # (POOL_AUTHORITATIVE) is judged ONLY by that answer; a clone whose pool
+    # did not answer uses the git-side proxy per candidate
+    # (fm_cleanup_looks_like_pool_inventory).
+    POOL_AUTHORITATIVE=0
+    if POOL_AVAILABLE=$(fm_cleanup_treehouse_available "$clone"); then
+      POOL_AUTHORITATIVE=1
+    fi
     while IFS= read -r line; do
       case "$line" in worktree\ *) ;; *) continue ;; esac
       wt=${line#worktree }
       [ "$wt" = "$clone" ] && continue
       case "$LIVE_WORKTREES" in *"|$wt|"*) continue ;; esac
       [ -d "$wt" ] || continue
+      # An available pool slot is inventory, not a leftover task copy; it needs
+      # no age test because it is idle by definition. The POOL_AVAILABLE scan
+      # walks its newline-delimited lines instead of word-splitting, so a pool
+      # path carrying a glob character cannot expand against the cwd.
+      if [ "$POOL_AUTHORITATIVE" -eq 1 ]; then
+        skip=0
+        rest=$POOL_AVAILABLE
+        while [ -n "$rest" ]; do
+          p=${rest%%$'\n'*}
+          rest=${rest#*$'\n'}
+          [ "$p" = "$wt" ] && { skip=1; break; }
+        done
+        [ "$skip" -eq 1 ] && continue
+      elif fm_cleanup_looks_like_pool_inventory "$clone" "$wt"; then
+        continue
+      fi
       [ "$(fm_hourly_age_of "$wt")" -ge "$ORPHAN_SECS" ] || continue
       fm_hourly_add_finding "worktree:$wt" \
         "an isolated copy in $(basename "$clone") outlived its task" \
