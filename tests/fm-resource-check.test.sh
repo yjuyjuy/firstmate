@@ -1020,6 +1020,18 @@ seed_reading() {  # <home> <epoch> <status> <reading-tail>
   touch "$1/state/.last-resource"
 }
 
+# enter_single_shot_heartbeat <home>: seed state/.last-heartbeat in the past so
+# the watcher's heartbeat fires on its FIRST loop iteration instead of on a
+# later poll after the 1-second mtime gate ages out. An old stamp is the exact
+# state a watcher that crashed and then restarted leaves behind, so the
+# immediate-fire path is real production behavior, not a test shim. This removes
+# the extra poll from the checkpoint window: the heartbeat lands as soon as the
+# main loop reaches it, so a loaded host can no longer close the window before
+# the annotation fires (observed on PR #222 and #230 at host load ~8.3/12).
+enter_single_shot_heartbeat() {
+  touch -t 202001010000 "$1/state/.last-heartbeat"
+}
+
 test_main_loop_surfaces_from_the_cache_without_probing() {
   local home out status now
   home=$(make_home surface-from-cache)
@@ -1028,12 +1040,14 @@ test_main_loop_surfaces_from_the_cache_without_probing() {
   printf 'healthy\n' > "$home/state/.resource-surfaced"
   out="$home/out.txt"
   status=0
-  # Interval far larger than the checkpoint window, so no probe runs: any wake
-  # can only come from the cheap surface read of the seeded cache.
+  # Interval far larger than a broad dead-man ceiling, so no probe runs: any wake
+  # can only come from the cheap surface read of the seeded cache. The wake exits
+  # the watcher as soon as iteration one lands, so the window is not the
+  # completion signal - it only bounds how long a genuinely broken path may hang.
   env "${HEALTHY_ENV[@]}" FM_RESOURCE_INTERVAL=999999 \
     FM_HOME="$home" FM_RESOURCE_PROBE_LOCK="$home/state/.resource-probe.lock" \
     FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
-    "$CHECKPOINT" --seconds 6 >"$out" 2>/dev/null || status=$?
+    "$CHECKPOINT" --seconds 45 >"$out" 2>/dev/null || status=$?
   expect_code 0 "$status" "cache-surface checkpoint exit"
   assert_contains "$(cat "$out")" "check: host-resources" "the cached pressure was not surfaced"
   assert_contains "$(cat "$out")" "load 40" "the surfaced wake lost the cached reading"
@@ -1078,10 +1092,16 @@ test_watcher_surfaces_pressure_once_and_queues_it() {
   home=$(make_home watcher-critical)
   out="$home/out.txt"
   status=0
+  # An OLD cadence stamp makes the probe launch on the watcher's first
+  # iteration instead of waiting for the 1-second age gate, so the probe's
+  # publish time - not the poll schedule - decides when the surface wakes.
+  # The 45s checkpoint window is a dead-man ceiling only; the wake exits the
+  # watcher the moment the published reading is surfaced.
+  touch -t 202001010000 "$home/state/.last-resource"
   env "${HEALTHY_ENV[@]}" FM_RESOURCE_INTERVAL=1 FM_RESOURCE_LOAD1=40 \
     FM_HOME="$home" FM_RESOURCE_PROBE_LOCK="$home/state/.resource-probe.lock" \
     FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
-    "$CHECKPOINT" --seconds 8 >"$out" 2>/dev/null || status=$?
+    "$CHECKPOINT" --seconds 45 >"$out" 2>/dev/null || status=$?
   expect_code 0 "$status" "resource wake checkpoint exit"
   assert_contains "$(cat "$out")" "check: host-resources" "host pressure was not surfaced"
   assert_contains "$(cat "$out")" "critical" "the surfaced wake lost the status"
@@ -1119,10 +1139,15 @@ test_watcher_stays_quiet_on_a_healthy_host_and_rearms() {
   seed_reading "$home" "$now" healthy "healthy | load 5 (0.5x over 10 cores)"
   out="$home/out.txt"
   status=0
+  # The 45s window is a dead-man ceiling. The re-arm lands on iteration one
+  # (the seeded reading is surfaced within seconds even on a loaded host); a
+  # 4s window could close before it, failing the re-arm assertion purely on
+  # scheduling. The watcher then stays quiet to the window's close, which is
+  # the 'no wake' verdict this test asserts.
   env "${HEALTHY_ENV[@]}" FM_RESOURCE_INTERVAL=999999 \
     FM_HOME="$home" FM_RESOURCE_PROBE_LOCK="$home/state/.resource-probe.lock" \
     FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
-    "$CHECKPOINT" --seconds 4 >"$out" 2>/dev/null || status=$?
+    "$CHECKPOINT" --seconds 45 >"$out" 2>/dev/null || status=$?
   expect_code 124 "$status" "healthy-host checkpoint should stay quiet"
   assert_not_contains "$(cat "$out")" "host-resources" "a healthy host must not wake firstmate"
   assert_grep healthy "$home/state/.resource-surfaced" "recovery must re-arm the surfaced level"
@@ -1151,18 +1176,21 @@ annotated_heartbeat_reason() {
   home=$(make_home "$1")
   enter_daemon_owned_away_mode "$home"
   printf 'critical\n' > "$home/state/.resource-surfaced"
-  # Seed a FRESH cached reading and use a cadence far longer than the checkpoint
-  # window, so the annotation comes deterministically from the cached file rather
-  # than racing a backgrounded probe that may not publish .resource-status before
-  # the heartbeat fires. touch .last-resource so no probe launches to overwrite it.
+  # Seed a FRESH cached reading and use a cadence far longer than any window,
+  # so the annotation comes deterministically from the cached file rather than
+  # racing a backgrounded probe that may not publish .resource-status before
+  # the heartbeat fires. touch .last-resource so no probe launches to overwrite
+  # it, and seed the heartbeat stamp in the past so the heartbeat fires on the
+  # watcher's first iteration instead of after the 1-second age gate.
   printf 'critical\n' > "$home/state/.resource-status"
   touch "$home/state/.last-resource"
+  enter_single_shot_heartbeat "$home"
   out="$home/out.txt"
   status=0
   env "${HEALTHY_ENV[@]}" FM_RESOURCE_INTERVAL=999999 \
     FM_HOME="$home" FM_RESOURCE_PROBE_LOCK="$home/state/.resource-probe.lock" \
     FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
-    FM_HEARTBEAT=1 "$CHECKPOINT" --seconds 8 >"$out" 2>/dev/null || status=$?
+    FM_HEARTBEAT=1 "$CHECKPOINT" --seconds 30 >"$out" 2>/dev/null || status=$?
   [ "$status" = 0 ] || fail "annotated-heartbeat checkpoint exited $status"
   grep -m1 '^heartbeat' "$out" || fail "the watcher printed no heartbeat wake"
 }
@@ -1197,15 +1225,18 @@ test_heartbeat_carries_the_cached_pressure() {
   printf 'critical\n' > "$home/state/.resource-surfaced"
   # Seed a FRESH cached reading and use a long cadence so the annotation comes
   # deterministically from the cached file, not from racing a backgrounded probe
-  # that may not publish .resource-status before the heartbeat fires.
+  # that may not publish .resource-status before the heartbeat fires. Seed the
+  # heartbeat stamp in the past so the heartbeat fires on the first iteration
+  # and a loaded host cannot close the window before the annotation lands.
   printf 'critical\n' > "$home/state/.resource-status"
   touch "$home/state/.last-resource"
+  enter_single_shot_heartbeat "$home"
   out="$home/out.txt"
   status=0
   env "${HEALTHY_ENV[@]}" FM_RESOURCE_INTERVAL=999999 \
     FM_HOME="$home" FM_RESOURCE_PROBE_LOCK="$home/state/.resource-probe.lock" \
     FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
-    FM_HEARTBEAT=1 "$CHECKPOINT" --seconds 8 >"$out" 2>/dev/null || status=$?
+    FM_HEARTBEAT=1 "$CHECKPOINT" --seconds 30 >"$out" 2>/dev/null || status=$?
   expect_code 0 "$status" "heartbeat checkpoint exit"
   assert_contains "$(cat "$out")" "heartbeat: host resources critical" \
     "the heartbeat lost its host-resource annotation"
@@ -1213,15 +1244,22 @@ test_heartbeat_carries_the_cached_pressure() {
 }
 
 test_heartbeat_is_unannotated_on_a_healthy_host() {
-  local home out status
+  local home out status now
   home=$(make_home heartbeat-healthy)
   enter_daemon_owned_away_mode "$home"
+  # Seed a FRESH healthy cached reading and a long cadence, exactly like the
+  # re-arm test, so the heartbeat composes against the cached file without
+  # racing a backgrounded probe. Seed the heartbeat stamp in the past so the
+  # heartbeat fires on the first iteration.
+  now=$(date +%s)
+  seed_reading "$home" "$now" healthy "healthy | load 5 (0.5x over 10 cores)"
+  enter_single_shot_heartbeat "$home"
   out="$home/out.txt"
   status=0
-  env "${HEALTHY_ENV[@]}" FM_RESOURCE_INTERVAL=1 \
+  env "${HEALTHY_ENV[@]}" FM_RESOURCE_INTERVAL=999999 \
     FM_HOME="$home" FM_RESOURCE_PROBE_LOCK="$home/state/.resource-probe.lock" \
     FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
-    FM_HEARTBEAT=1 "$CHECKPOINT" --seconds 8 >"$out" 2>/dev/null || status=$?
+    FM_HEARTBEAT=1 "$CHECKPOINT" --seconds 30 >"$out" 2>/dev/null || status=$?
   expect_code 0 "$status" "healthy heartbeat checkpoint exit"
   assert_contains "$(cat "$out")" "heartbeat" "the heartbeat itself went missing"
   assert_not_contains "$(cat "$out")" "host resources" \
@@ -1235,14 +1273,16 @@ test_disabled_monitor_never_annotates_from_a_stale_reading() {
   enter_daemon_owned_away_mode "$home"
   # Nothing ever clears .resource-status, so a home that switches the monitor off
   # after a bad stretch keeps a critical file on disk forever. It must not leak
-  # into the heartbeat.
+  # into the heartbeat. Seed the heartbeat stamp in the past so the heartbeat
+  # fires on the first iteration instead of after the 1-second age gate.
   printf 'critical\n' > "$home/state/.resource-status"
+  enter_single_shot_heartbeat "$home"
   out="$home/out.txt"
   status=0
   env "${HEALTHY_ENV[@]}" FM_RESOURCE_INTERVAL=0 \
     FM_HOME="$home" FM_RESOURCE_PROBE_LOCK="$home/state/.resource-probe.lock" \
     FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
-    FM_HEARTBEAT=1 "$CHECKPOINT" --seconds 8 >"$out" 2>/dev/null || status=$?
+    FM_HEARTBEAT=1 "$CHECKPOINT" --seconds 30 >"$out" 2>/dev/null || status=$?
   expect_code 0 "$status" "disabled-monitor heartbeat checkpoint exit"
   assert_contains "$(cat "$out")" "heartbeat" "the heartbeat itself went missing"
   assert_not_contains "$(cat "$out")" "host resources" \
@@ -1257,8 +1297,10 @@ test_stale_reading_never_annotates_a_heartbeat() {
   printf 'critical\n' > "$home/state/.resource-status"
   touch -t 202001010000 "$home/state/.resource-status"
   # A fresh sweep marker keeps the long cadence from firing one immediately and
-  # overwriting the stale reading this test is about.
+  # overwriting the stale reading this test is about. Seed the heartbeat stamp
+  # in the past so the heartbeat fires on the first iteration.
   touch "$home/state/.last-resource"
+  enter_single_shot_heartbeat "$home"
   out="$home/out.txt"
   status=0
   # Enabled, but with a cadence long enough that no sweep runs inside the
@@ -1266,7 +1308,7 @@ test_stale_reading_never_annotates_a_heartbeat() {
   env "${HEALTHY_ENV[@]}" FM_RESOURCE_INTERVAL=999999 \
     FM_HOME="$home" FM_RESOURCE_PROBE_LOCK="$home/state/.resource-probe.lock" \
     FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
-    FM_HEARTBEAT=1 "$CHECKPOINT" --seconds 8 >"$out" 2>/dev/null || status=$?
+    FM_HEARTBEAT=1 "$CHECKPOINT" --seconds 30 >"$out" 2>/dev/null || status=$?
   expect_code 0 "$status" "stale-reading heartbeat checkpoint exit"
   assert_contains "$(cat "$out")" "heartbeat" "the heartbeat itself went missing"
   assert_not_contains "$(cat "$out")" "host resources" \
