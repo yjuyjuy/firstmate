@@ -23,6 +23,13 @@
 #      complete landed-work test and refuses uncommitted or genuinely unpushed and
 #      unlanded work, so a refusal is reported as a fact and never worked around.
 #      --force is never passed.
+#      A branch on origin is NOT proof of finished delivery: a lane whose
+#      no-mistakes run is still active and has not opened its PR yet is held and
+#      reported once, never torn down mid-pipeline. The doclint two-run pass
+#      (bin/fm-doclint-batch.sh) pushes its branch inside its second delivery run
+#      and only opens the PR steps later, so a pushed branch can still be
+#      mid-delivery (observed 2026-09-02: two doclint lanes were reaped between
+#      push and PR, stranding the branches on origin with no delivery).
 #   2. Nudge a lane that finished but never pushed. A done lane whose branch is
 #      ABSENT from origin is steered ONCE with bin/fm-send.sh to finish its own
 #      delivery flow. The driver never pushes project code itself: the lane's own
@@ -192,8 +199,63 @@ crew_state() {  # <task-id>
 
 # --- step 1 and 2: finished lanes -------------------------------------------
 
-# Advance ONE done lane: clean it up when its branch is durable on origin, or
-# steer it once when it finished without pushing.
+# The driver must never treat a pushed branch as proof of finished delivery.
+# fm-crew-state.sh resolves run-step attribution through `no-mistakes runs`
+# (that script owns the attribution rules and this probe only reuses its row
+# format), but its answer degrades to the status log when attribution misses, so
+# the driver asks the pipeline itself before it tears a done lane down. The
+# bounded call below mirrors fm-crew-state.sh's nm_run pattern in miniature; it
+# cannot be sourced because that script executes top to bottom.
+NM_RUNS_LIMIT=200
+NM_CALL_TIMEOUT=10
+
+# 0 = HOLD cleanup, 1 = safe to proceed. A lane is held when the pipeline state
+# for its branch shows a run that is active and has not opened a PR yet, or when
+# the pipeline state cannot be read at all: unverifiable delivery never
+# destroys a live pipeline (fail closed, the same bias as the worker-cap
+# overcount). Terminal runs and runs whose PR is already open are delivered or
+# over, so they proceed exactly as before. A host without the no-mistakes CLI
+# has no pipeline that could be mid-run and proceeds too.
+lane_pipeline_holds_cleanup() {  # <worktree> <branch>
+  local wt=$1 branch=$2 head out rc=0 row st rest br sha full tcmd
+  command -v no-mistakes >/dev/null 2>&1 || return 1
+  head=$(git -C "$wt" rev-parse HEAD 2>/dev/null) || return 1
+  tcmd=timeout
+  command -v timeout >/dev/null 2>&1 || tcmd=gtimeout
+  command -v "$tcmd" >/dev/null 2>&1 || return 0
+  out=$(cd "$wt" && "$tcmd" "$NM_CALL_TIMEOUT" no-mistakes runs --limit "$NM_RUNS_LIMIT" 2>/dev/null) || rc=$?
+  [ "$rc" -eq 0 ] || return 0
+  while IFS= read -r row; do
+    row=$(printf '%s' "$row" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+    [ -n "$row" ] || continue
+    st=${row%% *}
+    rest=${row#* }
+    rest=$(printf '%s' "$rest" | sed 's/^[[:space:]]*//')
+    br=${rest%% *}
+    [ "$br" = "$branch" ] || continue
+    rest=${rest#* }
+    rest=$(printf '%s' "$rest" | sed 's/^[[:space:]]*//')
+    sha=${rest%% *}
+    # Same code-identity rule fm-crew-state.sh applies: only a row whose head
+    # matches this worktree (equal, or the worktree head is an ancestor of the
+    # run tip) counts for this lane, so a rewritten or reused branch never
+    # attributes a foreign or dead run to it.
+    full=$(git -C "$wt" rev-parse --verify "${sha}^{commit}" 2>/dev/null) || continue
+    [ "$full" = "$head" ] \
+      || git merge-base --is-ancestor "$head" "$full" >/dev/null 2>&1 || continue
+    case "$st" in
+      completed|failed|cancelled) return 1 ;;
+      # Still active: delivered only once the run's row carries its PR url.
+      *) printf '%s' "$row" | grep -qE 'https?://' && return 1 || return 0 ;;
+    esac
+  done <<< "$out"
+  return 1
+}
+
+# Advance ONE done lane: clean it up when its branch is durable on origin AND
+# its delivery pipeline, if any, is finished or already opened its PR; hold it
+# while a no-mistakes run is still active; steer it once when it finished
+# without pushing.
 advance_done_lane() {  # <task-id> <worktree>
   local id=$1 wt=$2 key branch out rc
   key=$(marker_key "$id")
@@ -214,6 +276,12 @@ advance_done_lane() {  # <task-id> <worktree>
   git -C "$wt" ls-remote --exit-code origin "refs/heads/$branch" >/dev/null 2>&1 || rc=$?
   case "$rc" in
     0)
+      if lane_pipeline_holds_cleanup "$wt" "$branch"; then
+        report_once pipeline-active "$key" \
+          "$id has an active or unverifiable no-mistakes run; cleanup held until its delivery finishes" \
+          && note "held cleanup for $id: its no-mistakes delivery is still active or unverifiable, so the branch on origin is not treated as delivered"
+        return 0
+      fi
       if [ "$DRY_RUN" -eq 1 ]; then
         note "would clean up $id (branch $branch is on origin)"
         return 0
