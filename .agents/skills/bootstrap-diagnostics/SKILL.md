@@ -2,7 +2,7 @@
 name: bootstrap-diagnostics
 description: >-
   Agent-only handling playbook for session-start bootstrap diagnostics.
-  Use whenever the session-start digest's bootstrap section prints an actionable diagnostic line - MISSING, MISSING_MANUAL, BACKEND_INVALID, NEEDS_GH_AUTH, TANGLE, CONFIG_DRIFT, NM_SANDBOX, CREW_DISPATCH invalid, FLEET_SYNC, PRESENT_DAEMON, LIVENESS_WATCHDOG, LIVENESS_ESCALATION, PR_CHECK_MIGRATION, SECONDMATE_SYNC, SECONDMATE_LIVENESS, AFK_DAEMON, AFK_READER, NUDGE_SECONDMATES, or FMX - or when a standalone bin/fm-bootstrap.sh run prints one of those lines.
+  Use whenever the session-start digest's bootstrap section prints an actionable diagnostic line - MISSING, MISSING_MANUAL, BACKEND_INVALID, NEEDS_GH_AUTH, TANGLE, CONFIG_DRIFT, NM_SANDBOX, CREW_DISPATCH invalid, SKILLS_MANIFEST, FLEET_SYNC, PRESENT_DAEMON, LIVENESS_WATCHDOG, LIVENESS_ESCALATION, PR_CHECK_MIGRATION, SECONDMATE_SYNC, SECONDMATE_LIVENESS, AFK_DAEMON, AFK_READER, NUDGE_SECONDMATES, or FMX - or when a standalone bin/fm-bootstrap.sh run prints one of those lines.
   A silent bootstrap section, or a BOOTSTRAP_INFO fact, means no skill load.
 user-invocable: false
 metadata:
@@ -36,6 +36,10 @@ When any diagnostic needs captain attention, report the plain consequence and re
   `bin/fm-nm-daemon.sh restart` reinjects the flag durably (`bin/fm-nm-daemon.sh` owns the injection), but a restart kills every lane's in-flight pipeline run, so this is a firstmate decision under the same never-restart-the-shared-daemon rule the briefs carry, not an automatic fix: relaunch through the wrapper when no run is mid-flight, or wait for a safe window, and never bare-restart the daemon around the wrapper.
   Surface the consequence and the restart cost to the captain per `AGENTS.md` section 9 when a lane is actually blocked on it.
 - `CREW_DISPATCH: invalid config/crew-dispatch.json - <reason>` - the optional dispatch profile file exists but failed low-cost bootstrap validation; continue with the normal fallback chain, resolve and pass the chosen fallback harness explicitly while the file remains present, fix the malformed schema, unverified harness name, unknown selector, or invalid harness/effort pair when convenient, and do not select a bad profile.
+- `SKILLS_MANIFEST: <n> manifest skill(s) missing: <names> (install: bin/fm-skills-manifest.sh install)` - this home is missing first-party tool skills the tracked fleet manifest names, so a crewmate or firstmate action that reaches for one of those tools will fail on a tool that is supposed to be standard equipment.
+  The check is detect-only by design and prints in both read-only and full modes, so it is a report, not a change already made.
+  Installing is a tool installation like any other: name the missing skills and their purpose to the captain, get consent, then run the printed `bin/fm-skills-manifest.sh install`, which installs only what is missing and never overwrites, prunes, or reconciles anything already there (`docs/configuration.md` "Fleet skills manifest").
+  Rerun the check afterwards to confirm the line is gone; a skill that still reports missing failed to install and needs the named source investigated rather than a retry loop.
 - `FLEET_SYNC: <repo>: skipped: <reason>` - a benign one-off skip (no origin, local-only, an unreadable ref); bootstrap continued, investigate only if it blocks work.
   A skip can also report the bounded fleet-refresh timeout (`FM_FLEET_SYNC_BOOTSTRAP_TIMEOUT`, or a fleet-size-aware default with a 20 second floor); a timeout never blocks startup.
 - `FLEET_SYNC: <repo>: FETCH FAILED: <git error> - clone is not receiving new commits ...` - that clone stopped updating, and nothing else about it looks wrong.

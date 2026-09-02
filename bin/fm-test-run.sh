@@ -129,7 +129,8 @@ family_for_basename() {
     fm-install-herdr.test.sh|fm-nm-test-contract.test.sh|fm-no-mistakes-ownership.test.sh|\
     fm-nm-preflight.test.sh|\
     fm-operational-input.test.sh|fm-pi-primary-types.test.sh|fm-project-mode.test.sh|\
-    fm-send-popup-settle.test.sh|fm-send-settle.test.sh|fm-stow-contract.test.sh|\
+    fm-send-popup-settle.test.sh|fm-send-settle.test.sh|fm-skills-manifest.test.sh|\
+    fm-stow-contract.test.sh|\
     fm-subagent-pretool-check.test.sh|\
     fm-supervision-instructions.test.sh|fm-tmux-submit-busy.test.sh|fm-transition-lib.test.sh|\
     fm-test-run.test.sh|fm-test-isolation-proof.test.sh)
@@ -694,6 +695,13 @@ families_for_changed_path() {
       # Pin or cleanup changes also select the real-Herdr family so the required
       # lane's contract coverage re-runs.
       printf '%s\n' real-herdr-gated
+      ;;
+    bin/fm-skills-manifest.sh|config/skills-manifest)
+      # The manifest applier is contract-tested directly, and its two consumers
+      # are session start (detect-only) and secondmate seeding (installs).
+      printf '%s\n' pure-contract-unit
+      printf '%s\n' session-bootstrap
+      printf '%s\n' secondmate
       ;;
     bin/fm-lint.sh|bin/fm-install-shellcheck.sh|\
     bin/fm-brief.sh|bin/fm-ensure-agents-md.sh|bin/fm-crew-state.sh|\
