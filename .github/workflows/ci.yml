@@ -359,11 +359,12 @@ jobs:
       - name: Personal fleet paths must not be tracked
         run: |
           set -eu
-          # config/token-prices.json and config/model-tiers.json are intentionally
-          # tracked default snapshots shipped with the repo and read by
-          # bin/fm-token-lib.sh / bin/fm-token-tier-lib.sh; every other config/ path
-          # is personal fleet state and must stay untracked.
-          tracked=$(git ls-files -- data state config projects .no-mistakes ':!config/token-prices.json' ':!config/model-tiers.json')
+          # config/token-prices.json, config/model-tiers.json, and
+          # config/skills-manifest are intentionally tracked default snapshots
+          # shipped with the repo and read by bin/fm-token-lib.sh,
+          # bin/fm-token-tier-lib.sh, and bin/fm-skills-manifest.sh; every other
+          # config/ path is personal fleet state and must stay untracked.
+          tracked=$(git ls-files -- data state config projects .no-mistakes ':!config/token-prices.json' ':!config/model-tiers.json' ':!config/skills-manifest')
           if [ -n "$tracked" ]; then
             echo "::error::Personal fleet paths are tracked in git:"
             printf '%s\n' "$tracked"
