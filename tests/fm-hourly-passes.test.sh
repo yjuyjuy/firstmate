@@ -14,6 +14,11 @@
 #   - the cleanup sweep RECLAIMS only bookkeeping (watcher temp residue, dead
 #     suppression markers with nothing in flight) and REPORTS without removing
 #     anything that could hold unlanded work
+#   - report 1 consults the treehouse pool itself: a slot treehouse reports
+#     `available` is pool inventory and is never read as an orphan, while a
+#     non-available slot with no task meta still is; with no treehouse signal,
+#     a conservative git proxy keeps a clean detached-at-default-tip slot
+#     quiet and still flags one that turned dirty
 #   - an open decision ages from when it opened, so a later unrelated status
 #     append cannot reset its clock, and a blocked or held queue item is never
 #     counted as idle dispatch capacity
@@ -88,6 +93,46 @@ backdate() {
   stamp=$(date -r $(( $(date +%s) - secs )) '+%Y%m%d%H%M.%S' 2>/dev/null) \
     || stamp=$(date -d "@$(( $(date +%s) - secs ))" '+%Y%m%d%H%M.%S')
   touch -t "$stamp" "$path"
+}
+
+# new_pool_fixture <home> <name>: a clone plus one old detached pool-style slot
+# (clean, at the clone's default-branch tip, no task meta). Prints "<clone> <slot>".
+new_pool_fixture() {
+  local home=$1 name=$2 clone slot
+  clone="$home/projects/$name"
+  git init -q -b main "$clone"
+  git -C "$clone" commit -q --allow-empty -m init
+  slot="$TMP_ROOT/$name-pool-1/slot"
+  mkdir -p "$(dirname "$slot")"
+  git -C "$clone" worktree add -q --detach "$slot" HEAD
+  backdate "$slot" 200000
+  printf '%s %s' "$clone" "$slot"
+}
+
+# fake_treehouse <dir> <slot> <status>: a treehouse binary that answers
+# `status --json` with one slot in the real treehouse v2 JSON record shape.
+fake_treehouse() {
+  local dir=$1 slot=$2 status=$3
+  mkdir -p "$dir"
+  cat > "$dir/treehouse" <<EOF
+#!/usr/bin/env bash
+set -u
+[ "\${1:-}" = status ] || exit 0
+printf '%s\n' "[{\"name\":\"1\",\"path\":\"$slot\",\"status\":\"$status\",\"lease_id\":\"\",\"lease_holder\":\"\",\"leased_at\":null,\"processes\":[]}]"
+EOF
+  chmod +x "$dir/treehouse"
+}
+
+# fake_treehouse_broken <dir>: a treehouse binary that always fails, so the
+# sweep must fall back to its git-side proxy for the clone.
+fake_treehouse_broken() {
+  local dir=$1
+  mkdir -p "$dir"
+  cat > "$dir/treehouse" <<'SH'
+#!/usr/bin/env bash
+exit 3
+SH
+  chmod +x "$dir/treehouse"
 }
 
 # --- review: silence on a healthy home ---------------------------------------
@@ -231,6 +276,82 @@ t_cleanup_reports_orphan_worktree() {
   out=$(run_cleanup "$home")
   [ -z "$out" ] || fail "an unchanged cleanup candidate must not surface again, got: $out"
   pass "cleanup reports an orphan copy once and never removes it"
+}
+
+# --- cleanup: an available treehouse pool slot is inventory, never an orphan ---
+# The pool's own status is authoritative: a slot treehouse reports `available`
+# (clean, idle, at the reset target) is pool inventory with no task meta by
+# definition, so report 1 must not read it as a leftover task copy.
+t_cleanup_skips_available_pool_slot() {
+  local home out clone slot
+  home=$(new_home cleanup-pool-available)
+  read -r clone slot <<EOF
+$(new_pool_fixture "$home" alpha)
+EOF
+  fake_treehouse "$TMP_ROOT/cleanup-pool-available-bin" "$slot" available
+
+  out=$(run_cleanup "$home" PATH="$TMP_ROOT/cleanup-pool-available-bin:$PATH")
+  [ -z "$out" ] || fail "an available treehouse pool slot is pool inventory, not an orphan, got: $out"
+  assert_grep "no candidates" "$home/state/.hourly-cleanup.latest" "the report must not list the available slot"
+  assert_present "$slot" "cleanup must never remove a pool slot"
+  pass "cleanup skips a treehouse pool slot reported available"
+}
+
+# --- cleanup: a NON-available pool slot with no meta is still a real orphan ----
+t_cleanup_still_flags_non_available_pool_slot() {
+  local home out clone slot
+  home=$(new_home cleanup-pool-dirty)
+  read -r clone slot <<EOF
+$(new_pool_fixture "$home" beta)
+EOF
+  fake_treehouse "$TMP_ROOT/cleanup-pool-dirty-bin" "$slot" dirty
+
+  out=$(run_cleanup "$home" PATH="$TMP_ROOT/cleanup-pool-dirty-bin:$PATH")
+  assert_contains "$out" "outlived its task" "a dirty pool slot with no task meta must still be reported as an orphan"
+  assert_present "$slot" "cleanup must never remove it itself"
+  pass "cleanup still flags a pool slot treehouse does not report available"
+}
+
+# --- cleanup: no treehouse signal, a pool-like slot stays quiet -----------------
+# When `treehouse status` cannot answer, report 1 falls back to a conservative
+# git proxy that mirrors treehouse's own notion of available: clean, detached,
+# at the default tip. A slot that looks exactly like that is not spammed.
+t_cleanup_fallback_suppresses_pool_like_slot() {
+  local home out clone slot
+  home=$(new_home cleanup-pool-fallback)
+  read -r clone slot <<EOF
+$(new_pool_fixture "$home" gamma)
+EOF
+  fake_treehouse_broken "$TMP_ROOT/cleanup-pool-fallback-bin"
+
+  out=$(run_cleanup "$home" PATH="$TMP_ROOT/cleanup-pool-fallback-bin:$PATH")
+  [ -z "$out" ] || fail "a clean detached slot at the default tip is pool inventory even without a treehouse signal, got: $out"
+  assert_present "$slot" "cleanup must never remove a pool slot"
+  pass "cleanup's fallback keeps a clean detached pool-like slot quiet"
+}
+
+# --- cleanup: the fallback still flags a slot that holds unlanded work ---------
+# Same fixture as above, but the slot is now dirty: unlanded work makes it a
+# real orphan, and the fallback must keep flagging it after the first silent
+# (clean) run.
+t_cleanup_fallback_still_flags_dirty_slot() {
+  local home out clone slot
+  home=$(new_home cleanup-pool-fallback-dirty)
+  read -r clone slot <<EOF
+$(new_pool_fixture "$home" delta)
+EOF
+  fake_treehouse_broken "$TMP_ROOT/cleanup-pool-fallback-dirty-bin"
+
+  out=$(run_cleanup "$home" PATH="$TMP_ROOT/cleanup-pool-fallback-dirty-bin:$PATH")
+  [ -z "$out" ] || fail "a clean detached slot must stay quiet before it turns dirty, got: $out"
+
+  printf 'unlanded\n' > "$slot/junk.txt"
+  # The new entry refreshed the slot directory's mtime, so re-age it or the
+  # age gate hides the finding.
+  backdate "$slot" 200000
+  out=$(run_cleanup "$home" PATH="$TMP_ROOT/cleanup-pool-fallback-dirty-bin:$PATH")
+  assert_contains "$out" "outlived its task" "a dirty slot can hold unlanded work, so the fallback must flag it"
+  pass "cleanup's fallback still flags a slot that became dirty"
 }
 
 # --- cleanup: a project clone is never written to -------------------------------
@@ -608,6 +729,10 @@ t_review_auth_exhaustion_distinct_accounts_not_aggregated
 t_cleanup_reclaims_quietly
 t_cleanup_keeps_markers_in_flight
 t_cleanup_reports_orphan_worktree
+t_cleanup_skips_available_pool_slot
+t_cleanup_still_flags_non_available_pool_slot
+t_cleanup_fallback_suppresses_pool_like_slot
+t_cleanup_fallback_still_flags_dirty_slot
 t_cleanup_never_sweeps_merge_queue
 t_secondmate_is_not_work_under_way
 t_review_stall_without_status_file
