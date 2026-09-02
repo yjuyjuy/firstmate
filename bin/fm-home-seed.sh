@@ -18,7 +18,12 @@
 #       is copied to data/charter.md, newly cloned no-mistakes and direct-push
 #       projects are initialized, an ignored .fm-secondmate-home identity marker
 #       is written, and
-#       data/secondmates.md is updated.
+#       data/secondmates.md is updated. The fleet skills manifest is applied
+#       through bin/fm-skills-manifest.sh install, so a freshly provisioned
+#       secondmate ends up with every manifest skill under ~/.agents/skills with
+#       no manual step. That application is additive and idempotent (it installs
+#       only absent skills and never prunes anything), and a failed install warns
+#       without failing or rolling back the seed.
 #       An uninitialized preexisting clone of either mode is refused rather than
 #       mutated, which aborts the whole seed; initialize that clone and reseed.
 #       Seeding is transactional: on validation, clone, init, or registry failure,
@@ -813,6 +818,24 @@ initialize_no_mistakes_project() {
   }
 }
 
+ensure_fleet_skills() {
+  local out
+  # The agent skills tree (~/.agents/skills) is box-global, not per-home, so a
+  # secondmate home is fully provisioned once this box carries every manifest
+  # skill. bin/fm-skills-manifest.sh is additive and idempotent: it installs only
+  # what is absent and never touches a skill the manifest does not name, so
+  # running it on every seed is safe and is a no-op on an already-converged box.
+  # A failed install is reported and does NOT fail the seed: a network blip must
+  # not roll back a provisioned home, and the same line at the next session start
+  # tells the agent exactly how to finish the job by hand.
+  if ! out=$("$FM_ROOT/bin/fm-skills-manifest.sh" install 2>&1); then
+    printf 'warning: fleet skills manifest did not fully install; run %s/bin/fm-skills-manifest.sh install\n' "$FM_ROOT" >&2
+    [ -z "$out" ] || printf '%s\n' "$out" >&2
+    return 0
+  fi
+  [ -z "$out" ] || printf '%s\n' "$out"
+}
+
 write_registry() {
   local id=$1 home=$2 projects_csv=$3 brief=$4 scope summary tmp today
   mkdir -p "$DATA"
@@ -1019,6 +1042,7 @@ seed_home() {
   done
 
   cp "$SEED_PARENT_BRIEF" "$home/data/charter.md"
+  ensure_fleet_skills
 
   projects_csv=$(join_projects "$@")
   printf '%s\n' "$id" > "$home/$SUB_HOME_MARKER"

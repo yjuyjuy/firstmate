@@ -11,6 +11,7 @@ The shared no-mistakes gate refusal for fleet lifecycle entrypoints is summarize
 | `fm-sessionstart-nudge.sh` | Print the native session-start hook nudge when the primary has not already run the digest |
 | `fm-operational-input.sh` | Construct and parse the canonical cross-language operational-input protocol |
 | `fm-bootstrap.sh`        | Detect toolchain and fleet problems, run the locked session-start sweeps, and install approved tools |
+| `fm-skills-manifest.sh`  | Own the tracked fleet skills manifest `config/skills-manifest`: detect the gap at session start, install it additively during secondmate seeding, never prune or overwrite (docs/configuration.md "Fleet skills manifest") |
 | `fm-fleet-sync.sh`       | Refresh project clones with safe fast-forwards, self-heals, `STUCK:` reports, branch pruning, and bounded recovery from an orphaned `.git/packed-refs.lock` |
 | `fm-treehouse-pin.sh`    | Pin one project clone's treehouse worktree pool to this home, so a spawn cannot be handed a worktree of another copy of the repo (docs/treehouse-pools.md) |
 | `fm-lease-extra-worktree.sh` | Lease a SECOND treehouse worktree for a task and record it durably in the task's meta, so teardown returns it too (docs/treehouse-pools.md) |

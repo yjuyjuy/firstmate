@@ -22,6 +22,7 @@
 #                 "BOOTSTRAP_INFO: nudged fm-<id> with '<message>'",
 #                 "BOOTSTRAP_INFO: skipped AGENTS.md re-read nudge for fm-<id> (idle secondmate with no work in flight; picks up new instructions at next routed task or respawn)",
 #                 "SECONDMATE_LIVENESS: secondmate <id>: skipped: <reason>|respawn failed: <reason>",
+#                 "SKILLS_MANIFEST: <n> manifest skill(s) missing: <names> (install: bin/fm-skills-manifest.sh install)",
 #                 "AFK_READER: away-mode escalation reader is not running ...",
 #                 "FMX: X mode on ..." or "FMX: X mode off ...".
 #          When a RUNNING secondmate worktree is fast-forwarded to firstmate's
@@ -1034,6 +1035,13 @@ fi
 # bin/fm-nm-sandbox-check.sh owns the mechanism; bin/fm-nm-daemon.sh owns the
 # durable injection this alarms about the absence of.
 "$SCRIPT_DIR/fm-nm-sandbox-check.sh" || true
+# Fleet skills manifest: report first-party tool skills this box is missing from
+# the tracked config/skills-manifest. DETECT ONLY in both modes, exactly like the
+# tool checks above - a session start never installs into the shared, live
+# ~/.agents/skills tree behind the captain's back, and the manifest is
+# additive-only, so nothing here can remove a skill it does not name.
+# bin/fm-skills-manifest.sh owns the manifest format and the install command.
+"$SCRIPT_DIR/fm-skills-manifest.sh" check || true
 crew=
 [ -f "$CONFIG/crew-harness" ] && crew=$(tr -d '[:space:]' < "$CONFIG/crew-harness" || true)
 if [ "${FM_BOOTSTRAP_VERBOSE_FACTS:-0}" = 1 ] && [ -n "$crew" ] && [ "$crew" != "default" ]; then
