@@ -83,6 +83,20 @@ status=0
 exit "$status"
 SH
 
+  # Pipeline state: `no-mistakes runs` answers from a per-case fixture so a test
+  # states the run state it means, exactly like the fm-crew-state stub. The
+  # fixture rows copy the real CLI format: "<status> <branch> <short-sha>
+  # <date> <time> [<pr-url>]". Absent fixture means no runs at all.
+  : > "$dir/home/state/.nm-runs"
+  cat > "$dir/fakebin/no-mistakes" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FM_HOME/no-mistakes.log"
+[ "${1:-}" = runs ] || exit 0
+[ -e "$FM_STATE_OVERRIDE/.nm-fail" ] && exit 1
+[ -r "$FM_STATE_OVERRIDE/.nm-runs" ] && cat "$FM_STATE_OVERRIDE/.nm-runs"
+exit 0
+SH
+
   # Backlog backend: the ready list is whatever the case wrote.
   cat > "$dir/fakebin/tasks-axi" <<'SH'
 #!/usr/bin/env bash
@@ -96,7 +110,7 @@ while IFS= read -r id; do
 done < "$file"
 SH
 
-  chmod +x "$dir/bin/"*.sh "$dir/fakebin/tasks-axi"
+  chmod +x "$dir/bin/"*.sh "$dir/fakebin/tasks-axi" "$dir/fakebin/no-mistakes"
   : > "$dir/home/state/.afk"
   printf 'paneless\n' > "$dir/home/state/.afk-delivery"
   printf '%s\n' "$dir"
@@ -196,6 +210,88 @@ test_active_lane_is_left_alone() {
   [ ! -e "$dir/home/teardown.log" ] || fail "a working lane was torn down"
   [ ! -e "$dir/home/send.log" ] || fail "a working lane was steered"
   pass "a lane still working is never cleaned up or steered"
+}
+
+# --- driver: active no-mistakes pipeline guard ------------------------------
+
+# A done + pushed lane whose no-mistakes run is STILL ACTIVE and has not opened
+# a PR yet is mid-delivery, not finished: the doclint two-run pass pushes the
+# branch in its delivery run and only opens the PR steps later, so a branch on
+# origin is not proof of durable delivery. Seeding the pipeline fixture with the
+# lane's own head sha keeps the attribution deterministic.
+seed_active_pipeline() {  # <case-dir> <id> <status> [--no-pr|--pr]
+  local dir=$1 id=$2 status=$3 pr=$4 wt="$TMP_ROOT/worktrees/$2"
+  local head
+  head=$(git -C "$wt" rev-parse --short HEAD)
+  if [ "$pr" = --pr ]; then
+    printf '%s %s %s 2026-09-02 00:00 https://github.com/yjuyjuy/firstmate/pull/1\n' \
+      "$status" "fm/$id" "$head" > "$dir/home/state/.nm-runs"
+  else
+    printf '%s %s %s 2026-09-02 00:00\n' \
+      "$status" "fm/$id" "$head" > "$dir/home/state/.nm-runs"
+  fi
+}
+
+test_done_lane_with_active_pipeline_is_never_torn_down() {
+  local dir out
+  dir=$(make_case active-pipeline)
+  seed_done_lane "$dir" rho 1
+  seed_active_pipeline "$dir" rho running --no-pr
+
+  out=$(run_driver "$dir") || fail "the tick failed: $out"
+  [ ! -e "$dir/home/teardown.log" ] \
+    || fail "a lane whose no-mistakes run is still mid-delivery was torn down: $(cat "$dir/home/teardown.log")"
+  assert_contains "$out" "held cleanup for rho" \
+    "an active undelivered pipeline was not reported as held: $out"
+  [ -e "$dir/home/state/rho.meta" ] || fail "the held lane's durable record was discarded"
+  assert_contains "$(outbox_records "$dir")" "held cleanup for rho" \
+    "the held cleanup was not reported to the captain's catch-up"
+
+  # Second tick over unchanged state: the hold must not be re-reported.
+  out=$(run_driver "$dir") || fail "the second tick failed: $out"
+  [ "$(outbox_records "$dir" | wc -l | tr -d ' ')" -eq 1 ] \
+    || fail "an unchanged second tick reported the held lane again: $(outbox_records "$dir")"
+  pass "a done + pushed lane whose pipeline is still active is held, never torn down"
+}
+
+test_done_lane_with_open_pr_still_cleans_up() {
+  local dir out
+  dir=$(make_case pipeline-pr-open)
+  seed_done_lane "$dir" sigma 1
+  seed_active_pipeline "$dir" sigma running --pr
+
+  out=$(run_driver "$dir") || fail "the tick failed: $out"
+  assert_contains "$out" "cleaned up sigma" \
+    "a lane whose active run already opened its PR was not cleaned up: $out"
+  assert_grep 'sigma' "$dir/home/teardown.log" "cleanup never called the guarded teardown path"
+  pass "a done lane whose pipeline already opened its PR cleans up exactly as before"
+}
+
+test_done_lane_with_terminal_run_still_cleans_up() {
+  local dir out
+  dir=$(make_case pipeline-terminal)
+  seed_done_lane "$dir" tau 1
+  seed_active_pipeline "$dir" tau completed --no-pr
+
+  out=$(run_driver "$dir") || fail "the tick failed: $out"
+  assert_contains "$out" "cleaned up tau" \
+    "a lane whose run reached a terminal state was not cleaned up: $out"
+  assert_grep 'tau' "$dir/home/teardown.log" "cleanup never called the guarded teardown path"
+  pass "a done lane whose run is terminal cleans up exactly as before"
+}
+
+test_unreadable_pipeline_state_holds_cleanup() {
+  local dir out
+  dir=$(make_case pipeline-unreadable)
+  seed_done_lane "$dir" upsilon 1
+  : > "$dir/home/state/.nm-fail"
+
+  out=$(run_driver "$dir") || fail "the tick failed: $out"
+  [ ! -e "$dir/home/teardown.log" ] \
+    || fail "a lane whose pipeline state could not be read was torn down: $(cat "$dir/home/teardown.log")"
+  assert_contains "$out" "held cleanup for upsilon" \
+    "an unreadable pipeline state was not held and reported: $out"
+  pass "a pipeline state that cannot be read holds cleanup rather than risking a mid-run teardown"
 }
 
 # --- driver: dispatch --------------------------------------------------------
@@ -537,6 +633,10 @@ test_pushed_lane_is_cleaned_up_and_reported
 test_unpushed_lane_is_not_torn_down_and_is_steered_once
 test_teardown_refusal_is_reported_and_never_forced
 test_active_lane_is_left_alone
+test_done_lane_with_active_pipeline_is_never_torn_down
+test_done_lane_with_open_pr_still_cleans_up
+test_done_lane_with_terminal_run_still_cleans_up
+test_unreadable_pipeline_state_holds_cleanup
 test_ready_item_with_brief_and_recipe_is_started
 test_incomplete_brief_is_never_dispatched
 test_missing_recipe_is_never_dispatched
