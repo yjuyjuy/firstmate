@@ -625,6 +625,202 @@ JSON
   pass "the model->tier map is data-driven (config-owned patterns + override file), no code edit per model"
 }
 
+# --- attribution joins: nm run, secondmate home, spawn window ----------------
+#
+# Captain-approved join set (data/token-attribution-gap/decision-join-sources.md,
+# approved 2026-08-23): producers other than bin/fm-spawn.sh never write a ledger
+# row, so their sessions rendered "unattributed" even though a durable record
+# elsewhere already names their ticket. These cases build a self-contained world
+# per join - a fixture no-mistakes state.sqlite with a runs table, a fixture
+# sibling secondmate home carrying its own token-sessions.tsv, and a fixture
+# spawn window in the local ledger - and assert:
+#   - each join maps its session to the right ticket;
+#   - the two KEYED joins (nm run id, secondmate ledger) are labeled exact;
+#   - the coarse spawn-window join is ALWAYS labeled ESTIMATE and never exact
+#     (captain decision D4), both in the human line and in --json;
+#   - a session that no join matches still lands in "unattributed";
+#   - the nm state database is opened READ-ONLY (a read-only file works, and the
+#     file is byte-identical afterwards).
+
+# Build the shared attribution world. Echoes its root; the caller reads
+# $ATTR_STORE, $ATTR_DATA, $ATTR_NM_HOME, $ATTR_SIBLING out of it.
+attr_world() {
+  local root
+  root=$(fm_test_tmproot fm-token-report-attr)
+  ATTR_STORE="$root/sessions"
+  ATTR_DATA="$root/data"
+  ATTR_NM_HOME="$root/nm"
+  ATTR_SIBLING="$root/sibling-home"
+  mkdir -p "$ATTR_STORE" "$ATTR_DATA" "$ATTR_NM_HOME/worktrees" "$ATTR_SIBLING/data"
+
+  # nm state database, shaped like the real one: runs(id, branch). Two run ids,
+  # one branch carrying the "fm/" prefix and one bare (both forms occur), plus a
+  # third worktree whose run id is absent so the miss path is exercised.
+  python3 - "$ATTR_NM_HOME/state.sqlite" <<'PY'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.execute("CREATE TABLE runs (id TEXT PRIMARY KEY, branch TEXT)")
+c.executemany(
+    "INSERT INTO runs (id, branch) VALUES (?, ?)",
+    [
+        ("01M0JGH5RH9M2JR2WRPF7EYN3K", "fm/nm-ticket"),
+        ("01M0JGH5RH9M2JR2WRPF7EYN4L", "fix/bare-branch-ticket"),
+    ],
+)
+c.commit()
+c.close()
+PY
+
+  # A no-mistakes pipeline child (run id in its worktree path, "fm/" stripped).
+  write_attr_session nm1 "$ATTR_NM_HOME/worktrees/324df5ded712/01M0JGH5RH9M2JR2WRPF7EYN3K" \
+    "2026-08-22T04:00:00.000Z" 1000000
+  # A second nm child on a BARE branch name that itself contains a slash: only a
+  # leading "fm/" is stripped, so the ticket keeps its "fix/" prefix.
+  write_attr_session nm2 "$ATTR_NM_HOME/worktrees/324df5ded712/01M0JGH5RH9M2JR2WRPF7EYN4L" \
+    "2026-08-22T04:10:00.000Z" 1000000
+  # An nm worktree whose run id is NOT in the database: the join misses and the
+  # session must stay unattributed rather than being force-fit.
+  write_attr_session nmmiss "$ATTR_NM_HOME/worktrees/324df5ded712/01MISSINGRUNIDXXXXXXXXXXXX" \
+    "2026-08-22T04:20:00.000Z" 1000000
+  # A session inside the registered sibling secondmate home, recorded in THAT
+  # home's own ledger (not in this home's).
+  write_attr_session sib1 "$ATTR_SIBLING/.treehouse/proj/1/proj" \
+    "2026-08-22T05:00:00.000Z" 1000000
+  # Two orphan swarm workers in a worktree the LOCAL ledger knows: they fall in
+  # the first spawn window (window-task), not the second (later-task).
+  write_attr_session sw1 "$root/wt/slot3" "2026-08-22T03:16:33.000Z" 1000000
+  write_attr_session sw2 "$root/wt/slot3" "2026-08-22T03:27:40.000Z" 1000000
+  # An orphan in the SAME worktree but after the next task's spawn: it belongs to
+  # that later task's window, proving the window boundary is real.
+  write_attr_session sw3 "$root/wt/slot3" "2026-08-22T07:00:00.000Z" 1000000
+  # Ad-hoc work in a primary checkout no join knows: stays unattributed.
+  write_attr_session adhoc "$root/plain-checkout" "2026-08-22T08:00:00.000Z" 1000000
+  # An orphan running from a SUBDIRECTORY of the ledgered worktree (an agent
+  # started in a crate dir): the nearest ledgered ancestor owns the lane.
+  write_attr_session swsub "$root/wt/slot3/crates/app-core" "2026-08-22T03:20:00.000Z" 1000000
+
+  # Local ledger: the coordinator's own row (exact) plus the two spawn instants
+  # that bound the window fallback in /wt/slot3.
+  printf '%s\n' \
+    '# fixture ledger' \
+    "ledger-task	session_sw0	$root/wt/other	2026-08-22T01:00:00Z	jcode" \
+    "window-task	session_win_coord	$root/wt/slot3	2026-08-22T03:11:35Z	jcode" \
+    "later-task	session_later	$root/wt/slot3	2026-08-22T06:47:02Z	jcode" \
+    > "$ATTR_DATA/token-sessions.tsv"
+  # The sibling secondmate home's OWN ledger already records its session exactly.
+  printf '%s\n' \
+    '# sibling fixture ledger' \
+    "sibling-task	session_sib1	$ATTR_SIBLING/.treehouse/proj/1/proj	2026-08-22T04:59:00Z	jcode" \
+    > "$ATTR_SIBLING/data/token-sessions.tsv"
+  # Registry entry in this home's data dir, in the real one-line "(home: ...)"
+  # shape bin/fm-ff-lib.sh parses.
+  printf -- '- sibling-mate - fixture secondmate. (home: %s; scope: fixture; projects: ; added 2026-08-22)\n' \
+    "$ATTR_SIBLING" > "$ATTR_DATA/secondmates.md"
+  printf '%s\n' "$root"
+}
+
+# One jcode-shaped store session with a working_dir and a single priced message.
+# Args: name working_dir created_at input_tokens
+write_attr_session() {
+  local name=$1 wd=$2 created=$3 tokens=$4
+  cat > "$ATTR_STORE/session_$name.json" <<JSON
+{"id":"session_$name","model":"claude-opus-4-8","provider_key":"claude","route_api_method":null,"working_dir":"$wd","created_at":"$created","updated_at":"$created","messages":[{"role":"assistant","timestamp":"$created","token_usage":{"input_tokens":$tokens,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}]}
+JSON
+}
+
+run_attr() { # run the CLI against the attribution world
+  JCODE_SESSIONS_DIR="$ATTR_STORE" FM_TOKEN_PRICES="$PRICE" \
+    FM_DATA_OVERRIDE="$ATTR_DATA" FM_NM_HOME="$ATTR_NM_HOME" "$CLI" "$@"
+}
+
+test_attribution_joins_map_and_label() {
+  attr_world >/dev/null
+  local out
+  out=$(run_attr --period all --by-ticket)
+  # 1. nm join: worktree run id -> runs.branch -> ticket, "fm/" stripped, EXACT.
+  assert_contains "$out" "ticket=nm-ticket  sessions=1  cost_if_api \$5.00  covered \$0.00 / api \$5.00  [exact]" \
+    "nm join must attribute the pipeline child exactly: $out"
+  # Only a LEADING fm/ is stripped: a bare "fix/..." branch keeps its prefix.
+  assert_contains "$out" "ticket=fix/bare-branch-ticket  sessions=1" \
+    "a bare branch name must keep its own prefix: $out"
+  # 2. sibling-secondmate join: resolved from THAT home's own ledger, EXACT.
+  assert_contains "$out" "ticket=sibling-task  sessions=1  cost_if_api \$5.00  covered \$0.00 / api \$5.00  [exact]" \
+    "secondmate join must read the sibling home's ledger exactly: $out"
+  # 3. spawn-window fallback: two orphans inside [03:11:35, 06:47:02) attribute
+  #    to window-task and MUST be labeled ESTIMATE, never exact (D4).
+  # sw1, sw2, and the subdirectory orphan swsub all land on window-task.
+  assert_contains "$out" "ticket=window-task  sessions=3  cost_if_api \$15.00  covered \$0.00 / api \$15.00  [ESTIMATE]" \
+    "window fallback must attribute every in-window orphan and label ESTIMATE: $out"
+  printf '%s\n' "$out" | grep -F 'ticket=window-task' | grep -qF '[exact]' \
+    && fail "the coarse window join must NEVER be labeled exact: $out"
+  assert_contains "$out" "NOT an exact per-ticket cost (D4)" \
+    "an ESTIMATE row must carry the D4 note: $out"
+  # The later spawn owns the window after it: sw3 lands on later-task.
+  assert_contains "$out" "ticket=later-task  sessions=1" \
+    "the next spawn must own the window after it: $out"
+  # 4. no join matches the ad-hoc checkout and the unknown nm run: unattributed.
+  assert_contains "$out" "ticket=unattributed  sessions=2  cost_if_api \$10.00" \
+    "an unmatched session must stay unattributed: $out"
+  pass "the approved joins attribute nm, secondmate, and window sessions, exact vs ESTIMATE labeled"
+}
+
+test_attribution_json_labels() {
+  attr_world >/dev/null
+  local out
+  out=$(run_attr --period all --by-ticket --json)
+  printf '%s\n' "$out" | python3 -c '
+import json, sys
+o = json.load(sys.stdin)
+rows = {r["ticket"]: r for r in o["rows"]}
+for t in ("nm-ticket", "sibling-task", "window-task", "unattributed"):
+    assert t in rows, list(rows)
+# Keyed joins are exact and never flagged as an estimate.
+assert rows["nm-ticket"]["attribution"] == "exact", rows["nm-ticket"]
+assert rows["nm-ticket"]["attribution_sources"] == ["nm"], rows["nm-ticket"]
+assert rows["nm-ticket"]["cost_if_api_estimate"] is False, rows["nm-ticket"]
+assert rows["sibling-task"]["attribution"] == "exact", rows["sibling-task"]
+assert rows["sibling-task"]["attribution_sources"] == ["secondmate"], rows["sibling-task"]
+# The coarse window join is ALWAYS an estimate (D4).
+assert rows["window-task"]["attribution"] == "ESTIMATE", rows["window-task"]
+assert rows["window-task"]["attribution_sources"] == ["window"], rows["window-task"]
+assert rows["window-task"]["cost_if_api_estimate"] is True, rows["window-task"]
+assert rows["window-task"]["sessions"] == 3, rows["window-task"]
+# The unattributed bucket is a bucket, not a ticket: no attribution label.
+assert rows["unattributed"]["attribution"] is None, rows["unattributed"]
+print("ok")
+' >/dev/null || fail "attribution JSON labels wrong: $out"
+  pass "--by-ticket --json labels each row exact or ESTIMATE with its join sources"
+}
+
+test_attribution_nm_db_read_only() {
+  # The nm state database belongs to the shared no-mistakes daemon: this report
+  # must only ever READ it. Proven two ways - the report works with the database
+  # file mode set read-only, and its bytes are unchanged afterwards.
+  attr_world >/dev/null
+  local db="$ATTR_NM_HOME/state.sqlite" before after out
+  before=$(sha256sum "$db" | cut -d' ' -f1)
+  chmod 444 "$db"
+  out=$(run_attr --period all --by-ticket) || fail "report failed on a read-only nm database: $out"
+  chmod 644 "$db"
+  after=$(sha256sum "$db" | cut -d' ' -f1)
+  [ "$before" = "$after" ] || fail "the nm state database was modified (must be opened read-only)"
+  assert_contains "$out" "ticket=nm-ticket" "the read-only nm join must still resolve: $out"
+  pass "the no-mistakes state database is opened READ-ONLY and never written"
+}
+
+test_attribution_absent_sources_are_silent() {
+  # Every join source is optional: with no nm database, no registry, and no
+  # windows, the report still runs and everything simply stays unattributed.
+  attr_world >/dev/null
+  rm -f "$ATTR_NM_HOME/state.sqlite" "$ATTR_DATA/secondmates.md" "$ATTR_DATA/token-sessions.tsv"
+  local out
+  out=$(run_attr --period all --by-ticket) || fail "report must survive absent join sources: $out"
+  assert_contains "$out" "ticket=unattributed  sessions=9" \
+    "with no join source every session stays unattributed: $out"
+  assert_not_contains "$out" "ESTIMATE" "no window data means no ESTIMATE row: $out"
+  pass "absent join sources are silent: the report still runs and nothing is force-fit"
+}
+
 test_session_matches_lib_exactly
 test_period_sums_range
 test_period_prices_non_anthropic_provider
@@ -643,3 +839,7 @@ test_ticket_arg_guards
 test_by_tier_groups_spend_and_tickets
 test_by_tier_applies_only_to_period
 test_tier_lib_is_data_driven
+test_attribution_joins_map_and_label
+test_attribution_json_labels
+test_attribution_nm_db_read_only
+test_attribution_absent_sources_are_silent

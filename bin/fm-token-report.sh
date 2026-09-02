@@ -90,8 +90,12 @@
 #   fm-token-report.sh --period <range> --by-model       group by model
 #   fm-token-report.sh --period <range> --by-provider    group by provider
 #   fm-token-report.sh --period <range> --by-ticket      group by ticket id
-#                                                        (sessions with no
-#                                                        ledger row land in
+#                                                        (a session with no
+#                                                        direct ledger row is
+#                                                        joined through the
+#                                                        attribution sources
+#                                                        below; anything still
+#                                                        unmatched lands in
 #                                                        "unattributed")
 #   fm-token-report.sh --period <range> --by-tier        group by SPEND TIER of
 #                                                        the recorded model
@@ -138,6 +142,38 @@
 # The data dir for the ledger + completions is $FM_DATA_OVERRIDE, else
 # $FM_HOME/data, else <repo-root>/data (the standard firstmate override
 # chain) so tests and the dashboard point them at fixtures, never the real ones.
+#
+# ATTRIBUTION SOURCES for --period --by-ticket (captain-approved join set,
+# data/token-attribution-gap/decision-join-sources.md, approved 2026-08-23).
+# Producers other than bin/fm-spawn.sh never write a ledger row, so their
+# sessions used to render "unattributed" even though a durable record elsewhere
+# names their ticket. These joins are READ-SIDE ONLY: nothing is appended to any
+# ledger and every join recomputes on each run, so the tool's read-only contract
+# is unchanged. In precedence order:
+#   1. ledger    (exact)    the home's own data/token-sessions.tsv row.
+#   2. nm        (exact)    a no-mistakes pipeline child, whose worktree path
+#                           <nm-home>/worktrees/<repo_id>/<run_id> carries the
+#                           run id; the run's branch in <nm-home>/state.sqlite
+#                           (opened READ-ONLY) names the task, with an optional
+#                           leading "fm/" stripped. A miss falls through.
+#   3. secondmate (exact)   a session running inside a registered secondmate
+#                           home (data/secondmates.md "home:"), resolved against
+#                           THAT home's own data/token-sessions.tsv with the
+#                           same first-match-wins semantics as the local ledger.
+#   4. window    (ESTIMATE) an orphan session whose working_dir is a ledgered
+#                           task worktree is attributed to the task whose
+#                           [spawn_ts, next-spawn_ts) window covers its
+#                           created_at (consecutive spawns of the same task are
+#                           one window; with no next spawn the window is bounded
+#                           by that task's completions close date). Captain
+#                           decision D4 binds this path: it is coarse, so it
+#                           ALWAYS carries the ESTIMATE label and is never
+#                           presented as exact.
+# Sources 1-3 are keyed 1:1 joins against firstmate's own durable records and are
+# exact. Anything still unmatched (ad-hoc work, unticketed sessions) stays in the
+# labeled "unattributed" bucket, never force-fit to a ticket.
+# $FM_NM_HOME (else $NM_HOME, else ~/.no-mistakes) locates the no-mistakes state
+# database, so a relocated no-mistakes home and the tests both resolve correctly.
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -156,7 +192,7 @@ FM_PROG=fm-token-report FM_DIE_CODE=2
 . "$SCRIPT_DIR/fm-token-tier-lib.sh"
 
 usage() {
-  sed -n '2,138p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,176p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 # --- argument parse ----------------------------------------------------------
@@ -246,6 +282,9 @@ PRICE_FILE=$(fm_token_prices_path)
 PRICE_SOURCE=$(fm_token_prices_field price_source "$PRICE_FILE" 2>/dev/null || true)
 PRICE_CACHED=$(fm_token_prices_field cached_at "$PRICE_FILE" 2>/dev/null || true)
 TOKEN_SESSIONS_FILE=$(fm_token_sessions_file "$DATA")
+COMPLETIONS_FILE=$(fm_completions_file "$DATA")
+SECONDMATES_FILE="$DATA/secondmates.md"
+NM_STATE_DB="${FM_NM_HOME:-${NM_HOME:-$HOME/.no-mistakes}}/state.sqlite"
 
 command -v python3 >/dev/null 2>&1 || die "python3 is required to parse the jcode session store" 3
 
@@ -359,12 +398,15 @@ commafy() {
 # bucketing rule. Emits a leading "@period" line then TSV rows. No costing here.
 aggregate_tokens() {
   FM_TR_DIR="$SESSIONS_DIR" FM_TR_PERIOD="$PERIOD" FM_TR_BYTIME="$BY_TIME" \
-    FM_TR_PRECISE="$PRECISE" FM_TR_LEDGER_FILE="$TOKEN_SESSIONS_FILE" python3 - <<'PY'
+    FM_TR_PRECISE="$PRECISE" FM_TR_LEDGER_FILE="$TOKEN_SESSIONS_FILE" \
+    FM_TR_NM_DB="$NM_STATE_DB" FM_TR_SECONDMATES="$SECONDMATES_FILE" \
+    FM_TR_COMPLETIONS="$COMPLETIONS_FILE" python3 - <<'PY'
 import calendar
 import glob
 import json
 import os
 import re
+import sqlite3
 import sys
 import time
 from datetime import datetime, timezone
@@ -374,11 +416,16 @@ period = (os.environ.get("FM_TR_PERIOD", "all") or "all").strip()
 bytime = os.environ.get("FM_TR_BYTIME", "").strip()
 precise = os.environ.get("FM_TR_PRECISE", "") == "1"
 # The session ledger (data/token-sessions.tsv) maps a session id to its ticket
-# id. Every store session either matches a ledger row (attributed to that
-# ticket) or lands in the labeled "unattributed" bucket - never force-fit. The
-# first match in file order wins for a (pathological) duplicate session id.
+# id. A store session with no row here is offered to the approved attribution
+# joins below (nm run, secondmate home, spawn-window ESTIMATE) and lands in the
+# labeled "unattributed" bucket only when every one of them misses - never
+# force-fit. The first match in file order wins for a (pathological) duplicate
+# session id.
 ledger_file = os.environ.get("FM_TR_LEDGER_FILE", "")
 sid_to_ticket = {}
+# Ledger rows grouped by realpath'd working_dir, each (spawn_epoch, ticket), for
+# the spawn-window ESTIMATE fallback.
+wd_spawns = {}
 if ledger_file:
     try:
         with open(ledger_file) as lfh:
@@ -389,6 +436,10 @@ if ledger_file:
                 parts = line.split("\t")
                 if len(parts) >= 2 and parts[1] not in sid_to_ticket:
                     sid_to_ticket[parts[1]] = parts[0]
+                if len(parts) >= 4 and parts[2]:
+                    wd_spawns.setdefault(os.path.realpath(parts[2]), []).append(
+                        (parts[3], parts[0])
+                    )
     except OSError:
         pass
 
@@ -409,6 +460,228 @@ def to_epoch(s):
     y, mo, d, h, mi, se = (int(m.group(i)) for i in range(1, 7))
     frac = ((m.group(7) or "0") + "000000")[:6]
     return calendar.timegm((y, mo, d, h, mi, se, 0, 0, 0)) + int(frac) / 1_000_000.0
+
+
+# --- attribution joins (captain-approved sources; see the header) -------------
+#
+# Each join answers "which ticket ran this session" from a DURABLE record that
+# already exists, and each returns (ticket, source) or None. Nothing is written
+# anywhere: every lookup is a read, memoized only in this process.
+
+nm_db = os.environ.get("FM_TR_NM_DB", "")
+nm_worktrees = (
+    os.path.realpath(os.path.join(os.path.dirname(nm_db), "worktrees")) if nm_db else ""
+)
+_nm_conn = None
+_nm_conn_tried = False
+_nm_cache = {}
+
+
+def nm_ticket(working_dir):
+    """no-mistakes pipeline child -> its run's branch -> the task id (exact).
+
+    The nm daemon launches pipeline agents itself, so they never pass through
+    bin/fm-spawn.sh and never get a ledger row; their worktree path carries the
+    run id instead. The state database is opened READ-ONLY (sqlite URI
+    mode=ro), so this report can never write to the daemon's own state.
+    """
+    global _nm_conn, _nm_conn_tried
+    if not working_dir or not nm_worktrees:
+        return None
+    rest = None
+    if working_dir.startswith(nm_worktrees + os.sep):
+        rest = working_dir[len(nm_worktrees) + 1 :]
+    if rest is None:
+        return None
+    bits = rest.split(os.sep)
+    if len(bits) < 2 or not bits[1]:
+        return None
+    run_id = bits[1]
+    if run_id in _nm_cache:
+        return _nm_cache[run_id]
+    if not _nm_conn_tried:
+        _nm_conn_tried = True
+        try:
+            _nm_conn = sqlite3.connect("file:%s?mode=ro" % nm_db, uri=True)
+        except sqlite3.Error:
+            _nm_conn = None
+    if _nm_conn is None:
+        return None
+    branch = None
+    try:
+        row = _nm_conn.execute(
+            "SELECT branch FROM runs WHERE id = ?", (run_id,)
+        ).fetchone()
+        if row:
+            branch = row[0]
+    except sqlite3.Error:
+        branch = None
+    ticket = None
+    if branch:
+        # Both branch forms occur in the runs table: "fm/<task>" and a bare
+        # "<task>" (which may itself contain a slash, e.g. "fix/orphan-...").
+        # Strip only a leading "fm/".
+        ticket = branch[3:] if branch.startswith("fm/") else branch
+        ticket = ticket or None
+    _nm_cache[run_id] = ticket
+    return ticket
+
+
+# Registered secondmate homes (data/secondmates.md "(home: <path>; ..."). Each
+# home keeps its OWN token-sessions.tsv, so a session that ran there is already
+# recorded exactly - just in a ledger this home does not read by default.
+secondmate_homes = []
+_sm_file = os.environ.get("FM_TR_SECONDMATES", "")
+if _sm_file:
+    try:
+        with open(_sm_file) as sfh:
+            for line in sfh:
+                if not line.startswith("- "):
+                    continue
+                m = re.search(r"\(home:\s*([^;)]+)[;)]", line)
+                if not m:
+                    continue
+                home = m.group(1).strip()
+                if home:
+                    secondmate_homes.append(os.path.realpath(home))
+    except OSError:
+        pass
+_sm_ledgers = {}
+
+
+def secondmate_ticket(working_dir, sid):
+    """A session inside a registered secondmate home -> that home's own ledger."""
+    if not working_dir or not secondmate_homes:
+        return None
+    for home in secondmate_homes:
+        if working_dir != home and not working_dir.startswith(home + os.sep):
+            continue
+        table = _sm_ledgers.get(home)
+        if table is None:
+            table = {}
+            try:
+                with open(os.path.join(home, "data", "token-sessions.tsv")) as fh:
+                    for line in fh:
+                        line = line.rstrip("\n")
+                        if not line or line.startswith("#"):
+                            continue
+                        parts = line.split("\t")
+                        if len(parts) >= 2 and parts[1] not in table:
+                            table[parts[1]] = parts[0]
+            except OSError:
+                pass
+            _sm_ledgers[home] = table
+        hit = table.get(sid)
+        if hit:
+            return hit
+    return None
+
+
+# Per-task completion close day, the right-hand bound of a task's LAST spawn
+# window when no later spawn reused the same worktree.
+close_epoch = {}
+_comp_file = os.environ.get("FM_TR_COMPLETIONS", "")
+if _comp_file:
+    try:
+        with open(_comp_file) as cfh:
+            for line in cfh:
+                line = line.rstrip("\n")
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("\t")
+                if len(parts) < 2 or not parts[1]:
+                    continue
+                # The close field is a bare date on legacy rows and a full UTC
+                # timestamp on newer ones; its leading 10 chars are the day
+                # either way. The window ends at the END of that day.
+                day = to_epoch(parts[1][:10] + "T00:00:00Z")
+                if day is None:
+                    continue
+                end = day + 86400
+                # A re-shipped task has several rows; the LAST close wins, the
+                # same rule the --retro path uses.
+                close_epoch[parts[0]] = end
+    except OSError:
+        pass
+
+# Windows per worktree: consecutive spawns of the SAME task collapse into one
+# window, so a relaunch does not split its own lane.
+wd_windows = {}
+for _wd, _rows in wd_spawns.items():
+    _pairs = []
+    for _ts, _task in _rows:
+        _ep = to_epoch(_ts)
+        if _ep is not None:
+            _pairs.append((_ep, _task))
+    _pairs.sort()
+    _collapsed = []
+    for _ep, _task in _pairs:
+        if _collapsed and _collapsed[-1][1] == _task:
+            continue
+        _collapsed.append((_ep, _task))
+    _out = []
+    for _i, (_ep, _task) in enumerate(_collapsed):
+        if _i + 1 < len(_collapsed):
+            _end = _collapsed[_i + 1][0]
+        else:
+            _end = close_epoch.get(_task)
+        _out.append((_ep, _end, _task))
+    wd_windows[_wd] = _out
+
+
+def window_ticket(working_dir, created):
+    """Coarse spawn-window attribution (captain decision D4: always ESTIMATE).
+
+    An orphan session that ran in a worktree the ledger knows belongs to the
+    task whose spawn window covers its creation instant. This is positional,
+    not keyed, so it is never presented as exact.
+
+    An agent may run from a SUBDIRECTORY of its leased worktree (a crate dir,
+    say), so the nearest ledgered ancestor of the session's working_dir owns the
+    lane; the nearest one wins, so a nested lease never loses to its parent.
+    """
+    if not working_dir or created is None:
+        return None
+    candidate = None
+    for wd in wd_windows:
+        if working_dir == wd or working_dir.startswith(wd + os.sep):
+            if candidate is None or len(wd) > len(candidate):
+                candidate = wd
+    if candidate is None:
+        return None
+    for start_ep, end_ep, task in wd_windows[candidate]:
+        if created < start_ep:
+            continue
+        if end_ep is not None and created >= end_ep:
+            continue
+        return task
+    return None
+
+
+_attr_cache = {}
+
+
+def attribute(sid, working_dir, created):
+    """Resolve (ticket, source) for one store session, in precedence order."""
+    hit = _attr_cache.get(sid)
+    if hit is not None:
+        return hit
+    ticket = sid_to_ticket.get(sid)
+    source = "ledger"
+    if not ticket:
+        real_wd = os.path.realpath(working_dir) if working_dir else ""
+        ticket = nm_ticket(real_wd)
+        source = "nm"
+        if not ticket:
+            ticket = secondmate_ticket(real_wd, sid)
+            source = "secondmate"
+        if not ticket:
+            ticket = window_ticket(real_wd, created)
+            source = "window"
+    if not ticket:
+        ticket, source = "unattributed", "none"
+    _attr_cache[sid] = (ticket, source)
+    return ticket, source
 
 
 def day_floor(ep):
@@ -478,9 +751,9 @@ def bucket_of(ep):
 agg = {}
 
 
-def add(key, ti, to, cr, cw, sid):
-    ticket = sid_to_ticket.get(sid) or "unattributed"
-    full_key = key + (ticket,)
+def add(key, ti, to, cr, cw, sid, working_dir, created):
+    ticket, source = attribute(sid, working_dir, created)
+    full_key = key + (ticket, source)
     row = agg.get(full_key)
     if row is None:
         row = [0, 0, 0, 0, set()]
@@ -503,6 +776,7 @@ for path in glob.glob(os.path.join(sess_dir, "session_*.json")):
     provider = str(d.get("provider_key") or "None")
     route = str(d.get("route_api_method") or "None")
     created = to_epoch(d.get("created_at"))
+    working_dir = str(d.get("working_dir") or "")
     msgs = d.get("messages") or []
     if precise:
         # Per-message attribution (D5 option b): each assistant message's tokens
@@ -525,6 +799,8 @@ for path in glob.glob(os.path.join(sess_dir, "session_*.json")):
                 int(tu.get("cache_read_input_tokens", 0) or 0),
                 int(tu.get("cache_creation_input_tokens", 0) or 0),
                 sid,
+                working_dir,
+                created,
             )
     else:
         # Whole-session attribution by created_at (D5 default): every token lands
@@ -543,7 +819,16 @@ for path in glob.glob(os.path.join(sess_dir, "session_*.json")):
             cr += int(tu.get("cache_read_input_tokens", 0) or 0)
             cw += int(tu.get("cache_creation_input_tokens", 0) or 0)
         if ti or to or cr or cw:
-            add((bucket_of(created), model, provider, route), ti, to, cr, cw, sid)
+            add(
+                (bucket_of(created), model, provider, route),
+                ti,
+                to,
+                cr,
+                cw,
+                sid,
+                working_dir,
+                created,
+            )
 
 
 def iso(ep):
@@ -553,7 +838,7 @@ def iso(ep):
 
 
 sys.stdout.write("@period\t%s\t%s\t%s\n" % (period, iso(start), iso(end)))
-for (b, model, provider, route, ticket), row in agg.items():
+for (b, model, provider, route, ticket, source), row in agg.items():
     sys.stdout.write(
         "\t".join(
             [
@@ -567,6 +852,7 @@ for (b, model, provider, route, ticket), row in agg.items():
                 str(row[2]),
                 str(row[3]),
                 ticket,
+                source,
             ]
         )
         + "\n"
@@ -634,6 +920,7 @@ def blank():
         "unk_tokens": 0,
         "unk_models": set(),
         "tickets": set(),
+        "sources": set(),
         "ti": 0,
         "to": 0,
         "cr": 0,
@@ -649,9 +936,22 @@ for line in costed_lines:
     if not line:
         continue
     parts = line.split("\t")
-    if len(parts) != 11:
+    if len(parts) != 12:
         continue
-    bucket, model, provider, covered, ticket, sessions, cost, ti, to, cr, cw = parts
+    (
+        bucket,
+        model,
+        provider,
+        covered,
+        ticket,
+        sessions,
+        cost,
+        ti,
+        to,
+        cr,
+        cw,
+        source,
+    ) = parts
     if bydim == "model":
         dim = model
     elif bydim == "provider":
@@ -678,6 +978,10 @@ for line in costed_lines:
     # is a real bucket, not a ticket, so it never counts.
     if ticket and ticket != "unattributed":
         g["tickets"].add(ticket)
+        # How this group's sessions were attributed, so the render can label a
+        # ticket line exact or ESTIMATE (captain decision D4: the coarse
+        # spawn-window join is NEVER presented as exact).
+        g["sources"].add(source)
     if cost != "":
         c = float(cost)
         g["cost"] += c
@@ -700,6 +1004,7 @@ for g in groups.values():
     total["has_priced"] = total["has_priced"] or g["has_priced"]
     total["unk_models"] |= g["unk_models"]
     total["tickets"] |= g["tickets"]
+    total["sources"] |= g["sources"]
 
 # Sort: by bucket ascending (chronological for every time unit), then by cost
 # descending within a bucket, then dimension name for determinism.
@@ -716,6 +1021,21 @@ def money(x):
     return "{:.2f}".format(x)
 
 
+# Attribution label for one display group (--by-ticket only). Sources ledger, nm,
+# and secondmate are keyed 1:1 joins against firstmate's own durable records, so
+# they are exact; the coarse spawn-window join is an ESTIMATE and captain
+# decision D4 requires it to say so wherever a number carrying it is shown. A
+# group mixing both is labeled partly-ESTIMATE, never exact.
+def attribution_label(sources):
+    if bydim != "ticket" or not sources:
+        return ""
+    if "window" not in sources:
+        return "exact"
+    if sources == {"window"}:
+        return "ESTIMATE"
+    return "partly-ESTIMATE"
+
+
 if as_json:
     rows = []
     for (bucket, dim) in sorted_keys:
@@ -725,6 +1045,8 @@ if as_json:
                 "bucket": bucket if bytime else None,
                 "dimension": dim if bydim else None,
                 "ticket": dim if bydim == "ticket" else None,
+                "attribution": attribution_label(g["sources"]) or None,
+                "attribution_sources": sorted(g["sources"]) if bydim == "ticket" else None,
                 "tier": dim if bydim == "tier" else None,
                 "ticket_count": len(g["tickets"]) if bydim == "tier" else None,
                 "sessions": g["sessions"],
@@ -735,7 +1057,10 @@ if as_json:
                 "cost_if_api": round(g["cost"], 6) if g["has_priced"] else None,
                 "cost_if_api_covered": round(g["covered"], 6),
                 "cost_if_api_billed": round(g["billed"], 6),
-                "cost_if_api_estimate": False,
+                # Attribution never changes the token math, so only the
+                # per-ticket dimension - where a coarse window join can decide
+                # WHICH ticket a real cost lands on - can be an estimate.
+                "cost_if_api_estimate": bydim == "ticket" and "window" in g["sources"],
                 "unknown_model_tokens": g["unk_tokens"],
                 "unknown_models": sorted(g["unk_models"]),
             }
@@ -758,7 +1083,8 @@ if as_json:
             "cost_if_api": round(total["cost"], 6) if total["has_priced"] else None,
             "cost_if_api_covered": round(total["covered"], 6),
             "cost_if_api_billed": round(total["billed"], 6),
-            "cost_if_api_estimate": False,
+            "cost_if_api_estimate": bydim == "ticket" and "window" in total["sources"],
+            "attribution": attribution_label(total["sources"]) or None,
             "unknown_model_tokens": total["unk_tokens"],
             "unknown_models": sorted(total["unk_models"]),
             "ticket_count": len(total["tickets"]) if bydim == "tier" else None,
@@ -785,22 +1111,28 @@ def render_row(label, g):
     # so the cheap-lane-savings question ("how much AND how many tickets") is
     # answered on one line.
     tier_tail = "  tickets=%d" % len(g["tickets"]) if bydim == "tier" else ""
+    label_tail = ""
+    attribution = attribution_label(g["sources"])
+    if attribution:
+        label_tail = "  [%s]" % attribution
     if g["has_priced"]:
-        return "%s  sessions=%d%s  cost_if_api $%s  covered $%s / api $%s%s" % (
+        return "%s  sessions=%d%s  cost_if_api $%s  covered $%s / api $%s%s%s" % (
             label,
             g["sessions"],
             tier_tail,
             money(g["cost"]),
             money(g["covered"]),
             money(g["billed"]),
+            label_tail,
             unk_tail,
         )
     # No priced tokens at all: withhold dollars, show the tokens (never $0).
-    return "%s  sessions=%d%s  cost_if_api UNKNOWN (no price)  tokens %s%s" % (
+    return "%s  sessions=%d%s  cost_if_api UNKNOWN (no price)  tokens %s%s%s" % (
         label,
         g["sessions"],
         tier_tail,
         commafy(g["ti"] + g["to"] + g["cr"] + g["cw"]),
+        label_tail,
         unk_tail,
     )
 
@@ -817,6 +1149,12 @@ for (bucket, dim) in sorted_keys:
 if len(sorted_keys) > 1:
     tlabel = "total (session count is per-bucket activity)" if precise else "total"
     sys.stdout.write(render_row(tlabel, total) + "\n")
+
+if bydim == "ticket" and "window" in total["sources"]:
+    sys.stdout.write(
+        "  [ESTIMATE rows: attributed by spawn window (working_dir + time), not "
+        "a keyed join; NOT an exact per-ticket cost (D4)]\n"
+    )
 PY
 }
 
@@ -825,17 +1163,17 @@ PY
 # fm_token_cost is the ONLY place a cost is computed, and this loop only LOOKS
 # UP coverage (fm_token_subscription_covered) and price presence, both memoized
 # per pair so an unpriced model never spawns a cost call. Reads agg rows
-# (bucket model provider route sessions ti to cr cw ticket) from $1 and writes
-# costed rows (bucket model provider covered ticket sessions cost ti to cr cw)
-# to $2.
+# (bucket model provider route sessions ti to cr cw ticket source) from $1 and
+# writes costed rows
+# (bucket model provider covered ticket sessions cost ti to cr cw source) to $2.
 cost_aggregate_rows() {
   local agg_file=$1 costed_file=$2
   local -A COVERED_CACHE=()
   local -A PRICED_CACHE=()
   local -A RESOLVED_CACHE=()
-  local b model provider route sessions ti to cr cw ticket cov cost pkey ckey rkey resolved
+  local b model provider route sessions ti to cr cw ticket source cov cost pkey ckey rkey resolved
 
-  while IFS=$'\t' read -r b model provider route sessions ti to cr cw ticket; do
+  while IFS=$'\t' read -r b model provider route sessions ti to cr cw ticket source; do
     [ -n "$b" ] || continue
     pkey="$provider|$route"
     if [ -z "${COVERED_CACHE[$pkey]+x}" ]; then
@@ -863,8 +1201,9 @@ cost_aggregate_rows() {
       cost=$(fm_token_cost "$ti" "$to" "$cr" "$cw" "$model" "$PRICE_FILE" "$resolved") || cost=""
     fi
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "$b" "$model" "$provider" "$cov" "$ticket" "$sessions" "$cost" "$ti" "$to" "$cr" "$cw"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$b" "$model" "$provider" "$cov" "$ticket" "$sessions" "$cost" "$ti" "$to" "$cr" "$cw" \
+      "$source"
   done < <(tail -n +2 "$agg_file") > "$costed_file"
 }
 
@@ -1097,7 +1436,7 @@ do_retro() {
   TRE_UNK=0 TRE_UNKMODELS=""
   TRE_CLOSE="$close_date"
   local b model covered n cost cti cto ccr ccw
-  while IFS=$'\t' read -r b model _provider covered _ticket n cost cti cto ccr ccw; do
+  while IFS=$'\t' read -r b model _provider covered _ticket n cost cti cto ccr ccw _source; do
     [ -n "$b" ] || continue
     TRE_SESSIONS=$((TRE_SESSIONS+n))
     TRE_TI=$((TRE_TI+cti)); TRE_TO=$((TRE_TO+cto))
