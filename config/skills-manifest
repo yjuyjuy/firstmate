@@ -3,13 +3,13 @@
 # Each source is "<owner>/<repo>@<skill>". Lines starting with # and blank lines
 # are ignored. Appending a line is how a new first-party tool skill joins the
 # fleet; the manifest is additive-only and never prunes a skill it does not name.
-kunchenguid/tasks-axi@tasks-axi
+yjuyjuy/tasks-axi@tasks-axi
 kunchenguid/gh-axi@gh-axi
 kunchenguid/chrome-devtools-axi@chrome-devtools-axi
 kunchenguid/quota-axi@quota-axi
 yjuyjuy/mongosh-axi@mongosh-axi
-kunchenguid/lavish-axi@lavish
-kunchenguid/no-mistakes@no-mistakes
+yjuyjuy/lavish-axi@lavish-axi
+yjuyjuy/no-mistakes@no-mistakes
 yjuyjuy/axi@axi
 yjuyjuy/herdr@herdr
 yjuyjuy/treehouse@treehouse

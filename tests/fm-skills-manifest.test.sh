@@ -119,7 +119,7 @@ test_tracked_manifest_seeded_sources() {
   local dir want
   dir=$(new_case tracked-seeded)
   run_skills "$dir" "$dir/manifest" list
-  for want in tasks-axi gh-axi chrome-devtools-axi quota-axi mongosh-axi lavish no-mistakes axi; do
+  for want in tasks-axi gh-axi chrome-devtools-axi quota-axi mongosh-axi lavish-axi no-mistakes axi; do
     printf '%s\n' "$FM_OUT" | awk '{print $2}' | grep -Fxq "$want" \
       || fail "tracked manifest does not name the $want skill"
   done
