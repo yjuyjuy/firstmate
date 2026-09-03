@@ -56,6 +56,10 @@ next=$(( $(cat "$COUNT_FILE" 2>/dev/null || echo 0) + 1 ))
 n=$next
 echo "$n" > "$COUNT_FILE"
 if [ -f "$RESP/$n.exit" ]; then
+  # A failing call may still have written partial stdout (the real CLI does):
+  # emit <n>.out when present so tests can cover the "nonzero exit with
+  # plausible-looking stdout" case.
+  [ -f "$RESP/$n.out" ] && cat "$RESP/$n.out"
   exit "$(cat "$RESP/$n.exit")"
 fi
 [ -f "$RESP/$n.out" ] && cat "$RESP/$n.out"
@@ -509,6 +513,22 @@ test_target_ready_fails_when_target_absent() {
   status=$?
   [ "$status" -ne 0 ] || fail "target_ready should fail when list-panes reports the surface not found"
   pass "fm_backend_cmux_target_ready: fails when the workspace/surface is not found (list-panes structural check)"
+}
+
+test_target_ready_fails_when_list_panes_call_fails() {
+  local dir fb status
+  dir="$TMP_ROOT/ready-list-panes-failed"; mkdir -p "$dir/responses"
+  # 1: list-panes exits nonzero but still prints a body naming the surface
+  # (partial/garbage stdout from a failed CLI call). Readiness must follow the
+  # CLI's exit status, not whatever jq can parse out of that stdout.
+  cmux_panes_response "$dir" 1 "bbbbbbbb-1111-1111-1111-111111111111"
+  printf '1' > "$dir/responses/1.exit"
+  fb=$(make_cmux_fakebin "$dir")
+  PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+    bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_target_ready "aaaaaaaa-0000-0000-0000-000000000000:bbbbbbbb-1111-1111-1111-111111111111"' "$ROOT"
+  status=$?
+  [ "$status" -ne 0 ] || fail "target_ready reported ready even though the list-panes call itself failed"
+  pass "fm_backend_cmux_target_ready: a failed list-panes call is not masked by parseable stdout"
 }
 
 test_target_ready_checks_expected_label() {
@@ -1034,6 +1054,7 @@ test_ensure_running_fails_fast_on_unauth_without_launching
 test_create_task_refuses_duplicate_label
 test_create_task_creates_and_parses_ids
 test_target_ready_fails_when_target_absent
+test_target_ready_fails_when_list_panes_call_fails
 test_target_ready_checks_expected_label
 test_target_ready_rejects_label_mismatch
 test_capture_trims_locally
