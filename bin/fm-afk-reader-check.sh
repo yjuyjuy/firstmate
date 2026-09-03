@@ -38,15 +38,33 @@
 #   - away mode is active (state/.afk present),
 #   - the daemon recorded PANELESS delivery for this away session (a pane home
 #     needs no reader at all),
-#   - this home's away-mode daemon is actually LIVE, because a home whose daemon
-#     is gone has a different and larger problem that the daemon revive sweep
-#     owns, and telling that session to arm a reader for a channel nothing is
-#     writing to would point it at the wrong subsystem,
+#   - this home's away-mode daemon is NOT confidently gone, because a home whose
+#     daemon is gone has a different and larger problem that the daemon revive
+#     sweep owns, and telling that session to arm a reader for a channel nothing
+#     is writing to would point it at the wrong subsystem,
 #   - the reader's liveness beacon is absent or staler than the shared window
 #     (bin/fm-afk-outbox-lib.sh's fm_afk_inbox_beacon_stale_secs), and
 #   - at least one unacknowledged record is actually waiting.
 # An outbox that cannot be READ reports nothing: a failed read is never an empty
 # one, and it is equally never proof that a reader is missing.
+#
+# The daemon gate asks fm_afk_daemon_owns_supervision rather than the narrower
+# boolean fm_afk_daemon_alive, because those two differ on exactly one input and
+# this check needs the other answer. fm_afk_daemon_alive folds an UNDETERMINED
+# liveness probe into not-alive, which is correct where it is used - deciding
+# whether to start a second daemon on a hunch - but wrong here. A probe can fail
+# while the daemon is running: fm_pid_identity returns non-zero whenever
+# /proc/<pid>/stat or /proc/<pid>/cmdline cannot be read or comes back
+# truncated, which happens transiently on a loaded host. Reading that as
+# daemon-free makes this detector return silently, which SUPPRESSES the alarm in
+# precisely the state it exists to catch: escalations piling up unread with
+# nobody able to announce it. A reader alarm must never go quiet because a probe
+# was unreadable, so undetermined counts as still daemon-owned here, matching the
+# fail direction bin/fm-afk-daemon-lib.sh's header already documents for every
+# other consumer of this question. The cost of that direction is one spurious
+# re-arm instruction if the daemon really did die at the same moment, and arming
+# a reader is idempotent and safe; the cost of the other direction is a silent
+# overnight.
 #
 # Usage: fm-afk-reader-check.sh
 # Output: one AFK_READER: line when the reader must be re-armed, nothing otherwise.
@@ -75,8 +93,7 @@ main() {
 
   [ -e "$STATE/.afk" ] || return 0
   [ "$(fm_afk_delivery_mode_recorded "$STATE")" = paneless ] || return 0
-  fm_afk_daemon_alive "$STATE/.supervise-daemon.lock" \
-    "$SCRIPT_DIR/fm-supervise-daemon.sh" || return 0
+  fm_afk_daemon_owns_supervision "$STATE" "$SCRIPT_DIR" || return 0
 
   age=$(fm_afk_file_age "$(fm_afk_inbox_beacon_file "$STATE")")
   [ "$age" -ge "$(fm_afk_inbox_beacon_stale_secs)" ] || return 0

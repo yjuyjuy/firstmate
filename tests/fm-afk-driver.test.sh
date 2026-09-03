@@ -116,10 +116,20 @@ SH
   printf '%s\n' "$dir"
 }
 
+# The fake /proc root the scripts under test should read, empty for every ordinary
+# case. Empty rather than unset is safe because fm-pid-lib.sh reads it as
+# ${FM_PROC_ROOT_OVERRIDE:-/proc}, so an empty value still selects the real /proc.
+# Only seed_unprobeable_daemon sets it, and each case that does gets its own
+# freshly seeded value, so nothing leaks between cases. It cannot be cleared from
+# make_case, which every case calls through a command substitution whose subshell
+# would swallow the assignment.
+FAKE_PROC=
+
 run_driver() {  # <case-dir> [args...]
   local dir=$1
   shift
   PATH="$dir/fakebin:$PATH" FM_HOME="$dir/home" FM_STATE_OVERRIDE="$dir/home/state" \
+    FM_PROC_ROOT_OVERRIDE="$FAKE_PROC" \
     "$dir/bin/fm-afk-driver.sh" "${@:-tick}" 2>&1
 }
 
@@ -534,6 +544,7 @@ trap 'stop_daemon_sleepers; fm_test_cleanup' EXIT
 run_reader_check() {  # <case-dir>
   local dir=$1
   FM_HOME="$dir/home" FM_STATE_OVERRIDE="$dir/home/state" \
+    FM_PROC_ROOT_OVERRIDE="$FAKE_PROC" \
     "$dir/bin/fm-afk-reader-check.sh" 2>&1
 }
 
@@ -600,6 +611,65 @@ test_reader_check_is_silent_with_nothing_waiting() {
   pass "an unarmed reader with nothing waiting for it is not an incident"
 }
 
+# Stand in for the transient /proc read failure that makes fm_pid_identity return
+# non-zero for a process that is genuinely alive. A truncated stat field list is
+# the exact shape the real failure takes on a loaded host, and building it from a
+# fake proc root is deterministic, where racing a real fork is not.
+#
+# The fake proc root is published in the FAKE_PROC global rather than on stdout,
+# because seed_live_daemon forks a background sleeper that inherits this
+# function's stdout: a command substitution around it would hold its pipe open
+# until that sleeper exits, and would also lose the sleeper's pid from the
+# cleanup list, since the substitution's subshell owns the array append.
+seed_unprobeable_daemon() {  # <case-dir>, sets FAKE_PROC
+  local dir=$1 lock="$1/home/state/.supervise-daemon.lock" proc="$1/fakeproc" pid
+  seed_live_daemon "$dir"
+  pid=$(cat "$lock/pid")
+  mkdir -p "$proc/$pid"
+  # State char S, so fm_pid_alive - which reads the same proc root - still sees a
+  # live non-zombie process. Only four fields follow the comm delimiter, so
+  # fm_pid_identity's field-count guard rejects the line and returns non-zero.
+  # That is exactly the shape of the failure: a LIVE daemon whose identity cannot
+  # be re-derived, not a dead one.
+  printf '%s (sleep) S 1 2 3\n' "$pid" > "$proc/$pid/stat"
+  printf 'sleep\000120\000' > "$proc/$pid/cmdline"
+  FAKE_PROC=$proc
+}
+
+# The flake this closes: on a loaded host the away-mode daemon's identity re-read
+# can fail transiently for a daemon that is running, and the reader check used to
+# fold that undetermined probe into "no daemon" and return SILENTLY. Silence is
+# the one outcome this alarm can never afford, because a dead reader cannot
+# announce itself through the channel it owns.
+test_reader_check_reports_when_the_daemon_probe_cannot_complete() {
+  local dir out
+  dir=$(make_case reader-daemon-unprobeable)
+  seed_unprobeable_daemon "$dir"
+  seed_unread_record "$dir" 4000
+  touch -t 197001020000 "$dir/home/state/.afk-inbox.beat"
+
+  out=$(run_reader_check "$dir")
+  assert_contains "$out" "AFK_READER:" \
+    "an unreadable daemon probe silenced the reader alarm instead of reporting it: $out"
+  pass "a daemon whose liveness probe cannot complete still reports a dead reader"
+}
+
+test_tick_reports_a_dead_reader_when_the_daemon_probe_cannot_complete() {
+  local dir out before
+  dir=$(make_case tick-daemon-unprobeable)
+  seed_unprobeable_daemon "$dir"
+  seed_unread_record "$dir" 4000
+  touch -t 197001020000 "$dir/home/state/.afk-inbox.beat"
+  before=$(outbox_records "$dir")
+
+  out=$(run_driver "$dir") || fail "the tick failed: $out"
+  assert_contains "$out" "AFK_READER:" \
+    "a tick with an unreadable daemon probe said nothing about the dead reader: $out"
+  assert_contains "$(outbox_records "$dir")" "$before" \
+    "the tick consumed or rewrote the records still waiting for the reader"
+  pass "a tick still surfaces a dead reader when the daemon probe cannot complete"
+}
+
 test_reader_check_is_silent_when_the_daemon_itself_is_gone() {
   local dir out
   dir=$(make_case reader-daemon-gone)
@@ -654,4 +724,6 @@ test_reader_check_reports_a_dead_reader_with_records_waiting
 test_reader_check_is_silent_for_a_live_reader
 test_reader_check_is_silent_with_nothing_waiting
 test_reader_check_is_silent_when_the_daemon_itself_is_gone
+test_reader_check_reports_when_the_daemon_probe_cannot_complete
+test_tick_reports_a_dead_reader_when_the_daemon_probe_cannot_complete
 test_reader_check_is_silent_outside_paneless_away_mode
