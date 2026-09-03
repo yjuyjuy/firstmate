@@ -61,6 +61,9 @@ assert_shared_readonly() {
 
 assert_secondmate_write_fails() {
   local path=$1
+  if [ "$(id -u)" = 0 ]; then
+    return 0
+  fi
   if ( printf '%s\n' "secondmate edit" >> "$path" ) 2>/dev/null; then
     fail "ordinary write unexpectedly succeeded for read-only shared captain file"
   fi
@@ -68,10 +71,6 @@ assert_secondmate_write_fails() {
 
 test_first_copy_readonly_and_local_files_preserved() {
   local rec primary second report out
-  if [ "$(id -u)" = 0 ]; then
-    pass "skipped: running as root, where the read-only shared-file mode does not deny a write"
-    return 0
-  fi
   rec=$(new_home_pair first-copy)
   primary=${rec%%|*}
   second=${rec#*|}
