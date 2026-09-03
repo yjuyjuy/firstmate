@@ -304,6 +304,10 @@ Classify each wake this way:
 - `heartbeat` -> self-handle. The daemon runs its own cheap bash fleet scan
   every `FM_HEARTBEAT_SCAN_SECS` (default 300s) as the catch-all for a
   captain-relevant status line the per-wake classifier might miss.
+  Every housekeeping cadence clock (catch-all scan, housekeeping tick, away-mode
+  driver tick, context-stow check) starts at daemon start, so the first run of
+  each is one full cadence after startup rather than on the first tick. The
+  per-wake signal path stays the primary escalation owner in that window.
 - Unknown reason, or any uncertainty -> escalate fail-safe.
 
 Escalations are buffered up to `FM_ESCALATE_BATCH_SECS` (default 90s; 0 =
