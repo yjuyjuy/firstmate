@@ -38,9 +38,34 @@ test_help_includes_entire_header() {
 
 # Registry with one project per delivery mode, so each ship-mode DOD branch is
 # exercised. A project absent from the registry defaults to no-mistakes.
+# Every direct-PR fixture project needs a real clone under the home's projects/
+# dir, because a direct-PR brief now pins its PR target to that clone's OWN
+# origin and refuses to scaffold without one (bin/fm-brief.sh). The fixture
+# clone is deliberately a FORK shape - origin plus an `upstream` remote - which
+# is the exact case an unpinned `gh-axi pr create` used to resolve wrongly.
+# The Definition-of-done section of a generated brief, so an assertion about
+# what the DoD instructs is not fooled by unrelated prose elsewhere in the
+# brief. Captain rule C7 legitimately discusses opening a PR (it forbids
+# opening one against a repo we do not own), which is not the DoD telling this
+# lane to raise one.
+dod_section() {
+  awk '/^# Definition of done$/ { in_dod = 1 } in_dod { print }' "$1"
+}
+
+write_fork_clone() {
+  local home=$1 name=$2 owner=${3:-yjuyjuy} upstream_owner=${4:-kunchenguid}
+  local repo="$home/projects/$name"
+  mkdir -p "$home/projects"
+  fm_git_init_commit "$repo"
+  git -C "$repo" remote add origin "git@github.com:$owner/$name.git"
+  git -C "$repo" remote add upstream "git@github.com:$upstream_owner/$name.git"
+  git -C "$repo" branch -q -f main HEAD 2>/dev/null || git -C "$repo" checkout -q -B main
+}
+
 write_registry() {
   local home=$1
   mkdir -p "$home/data"
+  write_fork_clone "$home" direct-proj
   cat > "$home/data/projects.md" <<'EOF'
 - direct-proj [direct-PR] - fixture for direct-PR mode (added 2026-07-01)
 - push-proj [direct-push] - fixture for direct-push mode (added 2026-07-24)
@@ -129,7 +154,7 @@ test_direct_push_dod_semantics() {
     "direct-push brief did not tell the worker to run the pipeline itself"
   assert_no_grep "Firstmate will then instruct you to run /no-mistakes" "$brief" \
     "direct-push brief must not defer pipeline start to a firstmate steer"
-  assert_no_grep "open a PR" "$brief" \
+  assert_not_contains "$(dod_section "$brief")" "open a PR" \
     "direct-push brief must not tell the worker to open a PR"
   pass "fm-brief.sh: direct-push DOD runs the full pipeline then pushes to origin without a PR wait"
 }
@@ -187,7 +212,7 @@ test_direct_push_autoland_dod_semantics() {
   # It self-lands, so it must NOT keep the push-and-stop tail or open a PR.
   assert_no_grep "git push origin HEAD:fm/$id" "$brief" \
     "autoland brief must not keep the plain push-and-stop tail"
-  assert_no_grep "open a PR" "$brief" \
+  assert_not_contains "$(dod_section "$brief")" "open a PR" \
     "autoland brief must not tell the worker to open a PR"
   pass "fm-brief.sh: direct-push +autoland DOD self-lands the green branch with the baked-in guardrails"
 }
@@ -1074,8 +1099,144 @@ test_captain_rules_preserve_existing_brief_contracts() {
   pass "fm-brief.sh: captain rules coexist with the placeholder, isolation, and status contracts"
 }
 
+# --- PR target pinning (the four-incident upstream-PR bug) -------------------
+#
+# Captain rule 2026-09-02: never open a PR against an upstream repo we do not
+# own. The generated direct-PR definition of done used to emit a bare
+# `gh-axi pr create --body-file ...` with NO target, and `gh` defaults a PR base
+# to the fork PARENT. Four PRs were opened on upstream repos that way, one
+# sitting open for five days. The brief must now pin --repo/--base/--head from
+# the project clone's OWN origin at scaffold time.
+
+test_direct_pr_brief_pins_target_to_clone_origin() {
+  local home id brief
+  home="$TMP_ROOT/pr-target-home"
+  write_registry "$home"
+  id="brief-prtarget-e1"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" direct-proj >/dev/null 2>&1 \
+    || fail "direct-PR scaffold failed for a fork clone with origin and upstream"
+  brief="$home/data/$id/brief.md"
+  # The pinned target is origin's owner/repository, never the upstream parent.
+  assert_grep "--repo yjuyjuy/direct-proj" "$brief" \
+    "direct-PR brief must pin --repo to the clone's own origin owner/repository"
+  assert_no_grep "kunchenguid/direct-proj" "$brief" \
+    "direct-PR brief must never name the fork parent as a PR target"
+  assert_grep "--base main" "$brief" \
+    "direct-PR brief must pin the PR base to the clone's own default branch"
+  assert_grep "--head fm/$id" "$brief" \
+    "direct-PR brief must pin the PR head to the task branch"
+  # The whole command must be one pinned invocation, not a bare create.
+  assert_grep "gh-axi pr create --repo yjuyjuy/direct-proj --base main --head fm/$id --body-file" "$brief" \
+    "direct-PR brief must emit a fully pinned pr create command"
+  pass "fm-brief.sh: direct-PR brief pins the PR target to the fork clone's own origin"
+}
+
+# A clone whose origin cannot be resolved must fail the scaffold LOUDLY. An
+# unpinned brief is the exact defect being fixed, so emitting one is worse than
+# refusing: the worker would silently inherit gh's fork-parent default.
+test_direct_pr_scaffold_fails_loudly_without_resolvable_origin() {
+  local home id out rc
+  home="$TMP_ROOT/pr-target-noorigin-home"
+  mkdir -p "$home/data"
+  printf '%s\n' '- noorigin-proj [direct-PR] - fixture with no origin (added 2026-09-02)' \
+    > "$home/data/projects.md"
+  fm_git_init_commit "$home/projects/noorigin-proj"
+  id="brief-prtarget-e2"
+  out=$(FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" noorigin-proj 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "direct-PR scaffold must refuse a clone with no resolvable origin"
+  assert_contains "$out" "cannot resolve an origin owner/repository" \
+    "the refusal must name the unresolvable origin"
+  assert_contains "$out" "noorigin-proj" "the refusal must name the project"
+  assert_absent "$home/data/$id/brief.md" \
+    "a refused direct-PR scaffold must not leave an unpinned brief behind"
+  pass "fm-brief.sh: direct-PR scaffold refuses loudly when origin cannot be resolved"
+}
+
+# The missing clone case is the same hazard: no clone, no origin, no pin.
+test_direct_pr_scaffold_fails_loudly_without_a_clone() {
+  local home id out rc
+  home="$TMP_ROOT/pr-target-noclone-home"
+  mkdir -p "$home/data"
+  printf '%s\n' '- ghost-proj [direct-PR] - fixture with no clone (added 2026-09-02)' \
+    > "$home/data/projects.md"
+  id="brief-prtarget-e3"
+  out=$(FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" ghost-proj 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "direct-PR scaffold must refuse a project with no clone"
+  assert_contains "$out" "cannot resolve an origin owner/repository" \
+    "the refusal must name the unresolvable origin"
+  assert_absent "$home/data/$id/brief.md" \
+    "a refused direct-PR scaffold must not leave an unpinned brief behind"
+  pass "fm-brief.sh: direct-PR scaffold refuses loudly when the project clone is missing"
+}
+
+# C7 is the behavioral half of the same fix: it binds a worker opening a PR by
+# any route the generated command does not cover. Labels C1-C6 keep their exact
+# meanings, so a firstmate steer that names a rule number is never re-pointed.
+test_ship_and_scout_briefs_bind_the_pr_target_rule_as_c7() {
+  local home brief kind id
+  home="$TMP_ROOT/c7-home"
+  write_registry "$home"
+  for kind in ship scout; do
+    id="brief-c7-$kind"
+    if [ "$kind" = scout ]; then
+      FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" direct-proj --scout >/dev/null 2>&1
+    else
+      FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" direct-proj >/dev/null 2>&1
+    fi
+    brief="$home/data/$id/brief.md"
+    assert_present "$brief" "$kind: brief was not scaffolded"
+    assert_grep "C7. Never open a PR against a repo we do not own" "$brief" \
+      "$kind brief must bind the never-PR-upstream rule as C7"
+    # shellcheck disable=SC2016 # Literal backticks must remain unexpanded.
+    assert_grep '`upstream` remote' "$brief" \
+      "$kind C7 must name the upstream remote as the hazard"
+    assert_grep "fork PARENT" "$brief" \
+      "$kind C7 must explain that an unpinned pr create targets the fork parent"
+    assert_grep "--repo <owner>/<repo> --base <default-branch>" "$brief" \
+      "$kind C7 must require an explicitly passed PR target"
+    # Existing labels keep their exact meanings; C7 is additive, never a renumber.
+    assert_grep "C1. Never force anything" "$brief" "$kind: C1 must keep its label"
+    assert_grep "C2. Understand the WHY before acting" "$brief" "$kind: C2 must keep its label"
+    assert_grep "C3. Plan before you change code" "$brief" "$kind: C3 must keep its label"
+    assert_grep "C4. Write your prose in caveman ultra style" "$brief" "$kind: C4 must keep its label"
+    assert_grep "C5. Never bind port 443 or 3000" "$brief" "$kind: C5 must keep its label"
+    assert_grep "C6. If this task came from a Mattermost thread" "$brief" "$kind: C6 must keep its label"
+    assert_no_grep "C8." "$brief" "$kind: the captain-rules block must end at C7"
+  done
+  pass "fm-brief.sh: ship and scout briefs bind the PR-target rule as C7 without renumbering C1-C6"
+}
+
+# The charter mirrors C7 under the same label, because a secondmate supervises
+# lanes that open PRs on its own fork clones. The deliberate C3 gap stays.
+test_secondmate_charter_mirrors_the_pr_target_rule_as_c7() {
+  local home brief
+  home="$TMP_ROOT/c7-charter-home"
+  mkdir -p "$home/data"
+  FM_HOME="$home" FM_SECONDMATE_CHARTER='fork delivery domain' \
+    "$ROOT/bin/fm-brief.sh" c7-charter --secondmate alpha >/dev/null 2>&1 \
+    || fail "secondmate charter scaffold failed"
+  brief="$home/data/c7-charter/brief.md"
+  assert_grep "C7. Never open a PR against a repo we do not own" "$brief" \
+    "secondmate charter must mirror the PR-target rule under label C7"
+  assert_grep "never let a crewmate do it" "$brief" \
+    "charter C7 must bind the crewmates the secondmate dispatches"
+  assert_grep "C1. Never force anything" "$brief" "charter must keep C1"
+  assert_grep "C2. Understand the WHY before acting" "$brief" "charter must keep C2"
+  assert_grep "C4. Write your prose in caveman ultra style" "$brief" "charter must keep C4"
+  assert_no_grep "C3." "$brief" \
+    "secondmate charter must preserve the deliberate C3 gap"
+  assert_no_grep "C5." "$brief" "charter must not gain the ports rule"
+  assert_no_grep "C6." "$brief" "charter must not gain the Mattermost rule"
+  pass "fm-brief.sh: secondmate charter mirrors the PR-target rule as C7 and keeps the C3 gap"
+}
+
 test_script_parses
 test_help_includes_entire_header
+test_direct_pr_brief_pins_target_to_clone_origin
+test_direct_pr_scaffold_fails_loudly_without_resolvable_origin
+test_direct_pr_scaffold_fails_loudly_without_a_clone
+test_ship_and_scout_briefs_bind_the_pr_target_rule_as_c7
+test_secondmate_charter_mirrors_the_pr_target_rule_as_c7
 test_ship_and_scout_briefs_bind_the_standing_captain_rules
 test_ship_and_scout_briefs_keep_each_captain_rule_constraint
 test_secondmate_charter_binds_the_applicable_captain_rules

@@ -109,12 +109,21 @@
 # write prose in caveman ultra style - reports included, with their identifiers, paths,
 # commands, and error strings kept verbatim as evidence - while keeping code and tool-parsed
 # text normal, and bind
-# no server to port 443 or 3000. The Mattermost-sourced rule is written as a self-guarding
+# no server to port 443 or 3000, and never open a PR against a repo we do not own (C7: pass
+# --repo/--base/--head explicitly, resolved from the clone's own origin, because most clones here
+# are forks whose `upstream` remote makes an unpinned `pr create` target the fork parent).
+# The Mattermost-sourced rule is written as a self-guarding
 # conditional on the same section rather than behind a flag, because a rule firstmate can
 # forget to pass is worth nothing. The secondmate charter carries the subset that applies to a
-# supervising home: never force, understand the reason, and caveman ultra prose. The rules are
-# labelled C1-C6 so a steer referencing a rule number cannot collide with the brief's own
+# supervising home: never force, understand the reason, caveman ultra prose, and never open a PR
+# against a repo we do not own. The rules are
+# labelled C1-C7 so a steer referencing a rule number cannot collide with the brief's own
 # numbered Rules list.
+# The direct-PR definition of done PINS the PR target - `--repo <owner>/<repo> --base <default>
+# --head fm/<id>` - resolved from the project clone's OWN origin at scaffold time. A clone whose
+# origin or default branch cannot be resolved fails the scaffold loudly rather than emitting an
+# unpinned `pr create`, because an unpinned command inherits gh's fork-parent default and opens
+# the PR on a repository we do not own.
 # Refuses to overwrite an existing brief.
 set -eu
 
@@ -542,17 +551,92 @@ EOF
 : "${AUTOLAND:=off}"
 : "${NOCI:=off}"
 
+# --- PR target pinning (direct-PR) -------------------------------------------
+# Most clones here are forks that keep an `upstream` remote, and `gh`/`glab`
+# default a PR base to the fork PARENT. An unpinned `gh-axi pr create` therefore
+# opens the PR against a repository we do not own; that has happened four times,
+# once leaving a 91-file PR open on an upstream repo for five days. The generated
+# direct-PR definition of done pins the target explicitly instead, resolved from
+# the project clone's OWN `origin` at scaffold time - never from ambient remote
+# resolution inside the worktree.
+#
+# Resolution is deliberately host-agnostic: it takes the last two path segments
+# of origin's URL (owner/repository on GitHub and Bitbucket, and the trailing
+# namespace elsewhere), because the pin's job is to name THIS clone's own repo
+# rather than to validate a forge. `bin/fm-pr-check.sh` and `bin/fm-pr-merge.sh`
+# own the forge-aware refusal on the resulting PR URL (fm-pr-lib.sh).
+brief_origin_slug() {
+  local dir=$1 url rest owner repo
+  [ -n "$dir" ] && [ -d "$dir" ] || return 1
+  url=$(git -C "$dir" remote get-url origin 2>/dev/null) || return 1
+  [ -n "$url" ] || return 1
+  case "$url" in
+    *://*) rest=${url#*://}; rest=${rest#*@}; rest=${rest#*/} ;;
+    *:*)   rest=${url#*:} ;;
+    *)     rest=$url ;;
+  esac
+  rest=${rest%/}
+  rest=${rest%.git}
+  rest=${rest%/}
+  # Two segments are required: a single-segment path names no owner, so it
+  # cannot pin a target and must fail loudly rather than half-resolve.
+  case "$rest" in */*) : ;; *) return 1 ;; esac
+  repo=${rest##*/}
+  rest=${rest%/*}
+  owner=${rest##*/}
+  [ -n "$owner" ] && [ -n "$repo" ] || return 1
+  case "$owner$repo" in *[[:space:]]*) return 1 ;; esac
+  printf '%s/%s\n' "$owner" "$repo"
+}
+
+# The clone's default branch: origin's published HEAD when it exists, else the
+# first conventional default branch present. Used as the PR base, so an unpinned
+# base can never fall back to the fork parent's default branch.
+brief_default_branch() {
+  local dir=$1 ref branch
+  ref=$(git -C "$dir" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)
+  if [ -n "$ref" ]; then
+    printf '%s\n' "${ref#origin/}"
+    return 0
+  fi
+  for branch in main master dev; do
+    if git -C "$dir" show-ref --verify --quiet "refs/remotes/origin/$branch" \
+      || git -C "$dir" show-ref --verify --quiet "refs/heads/$branch"; then
+      printf '%s\n' "$branch"
+      return 0
+    fi
+  done
+  return 1
+}
+
 case "$MODE" in
   direct-PR)
     SETUP2=""
     RULE1='1. Never push to the default branch (push only your `fm/'"$ID"'` branch). Never merge a PR.'
+    # Fail loudly rather than emitting an unpinned PR command: a brief that
+    # silently targets the wrong repository is the exact failure being fixed.
+    PROJECTS_DIR="${FM_PROJECTS_OVERRIDE:-$FM_HOME/projects}"
+    PR_CLONE="$PROJECTS_DIR/$REPO"
+    if ! PR_SLUG=$(brief_origin_slug "$PR_CLONE"); then
+      echo "error: cannot resolve an origin owner/repository for direct-PR project '$REPO' at $PR_CLONE" >&2
+      echo "       a direct-PR brief must pin its PR target to this clone's OWN origin, or a fork clone with an 'upstream' remote opens the PR against a repository we do not own" >&2
+      echo "       fix: clone the project under $PROJECTS_DIR with a valid 'origin' remote (git -C $PR_CLONE remote -v), or correct the project's delivery mode in data/projects.md" >&2
+      exit 1
+    fi
+    if ! PR_BASE=$(brief_default_branch "$PR_CLONE"); then
+      echo "error: cannot resolve a default branch for direct-PR project '$REPO' at $PR_CLONE" >&2
+      echo "       a direct-PR brief must pin its PR base explicitly; fetch the clone so origin/HEAD or a main/master/dev branch resolves" >&2
+      exit 1
+    fi
     DOD=$(cat <<EOF
 # Definition of done
 This project ships **direct-PR**: you raise the PR yourself, without the no-mistakes pipeline.
 The task is complete only when committed on your branch.
 When it is implemented and committed, generate the PR description skeleton with \`$FM_ROOT/bin/fm-pr-description.sh $ID\`.
 It writes \`$DATA/$ID/pr-description.md\`. Fill in EVERY section substantively and re-read the result once before opening the PR: the PR description is long-run documentation, and a stub description is a defect. The filled, reviewed description is part of the definition of done.
-Then push your branch and open a PR with \`gh-axi\` using the completed body, e.g. \`gh-axi pr create --body-file "$DATA/$ID/pr-description.md"\`, then append \`done: PR {url}\` to the status file and stop.
+Then push your branch and open a PR with \`gh-axi\`, passing the target EXPLICITLY (rule C7 - this clone is a fork whenever it keeps an \`upstream\` remote, and an unpinned \`pr create\` would target the fork parent):
+  \`gh-axi pr create --repo $PR_SLUG --base $PR_BASE --head fm/$ID --body-file "$DATA/$ID/pr-description.md"\`
+The \`--repo $PR_SLUG\` target is this clone's own \`origin\`, resolved when this brief was written. Never drop those flags, and never substitute another repository. Then append \`done: PR {url}\` to the status file and stop.
 Do NOT run /no-mistakes. The configured merge authority decides whether to merge the PR; firstmate relays the outcome.
 EOF
 )
