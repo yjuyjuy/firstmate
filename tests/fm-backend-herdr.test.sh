@@ -1952,6 +1952,30 @@ test_composer_state_jcode_transcript_rows_are_not_a_composer() {
   pass "fm_backend_herdr_composer_state: jcode transcript and footer rows are not a composer row"
 }
 
+# herdr's `--format ansi` pane read pads the read to the pane's FULL viewport
+# height, and a freshly spawned jcode pane draws its welcome UI well above the
+# buffer bottom (verified live 2026-09-03, herdr 0.8.0 + jcode v0.81.69-dev: the
+# live "1> " composer sat ~30 rows above the bottom with blank rows below it).
+# Without trimming trailing blank rows BEFORE the bounded scan window, the
+# composer was cut off entirely and a LIVE pane read `unknown`. The ansi fixture
+# below is the real captured fresh-pane shape: content (including the composer
+# row with typed text) then 30 blank rows; the composer must still win the scan.
+test_composer_state_jcode_composer_above_trailing_blank_rows_is_found() {
+  local dir log resp fb out i
+  dir="$TMP_ROOT/composer-jcode-blank-tail"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  {
+    printf ' jcode M-bM-7 client M-bM-7 perf:minimal\n'
+    printf ' server: River M-pM-^_M-^ZM-# M-bM-7 v0.81.69-dev\n'
+    printf '\x1b[38;2;255;80;80m1\x1b[38;2;138;180;248m> \x1b[39m/effort medium        \x1b[38;2;255;193;7m\xe2\x8f\xb3\n'
+    for i in $(seq 1 30); do printf '\n'; done
+  } > "$resp/1.out"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_composer_state default:w1:p2' "$ROOT" )
+  [ "$out" = pending ] || fail "a jcode composer sitting above trailing blank viewport rows must still read pending for typed text, got '$out' (unknown was the live false verdict)"
+  pass "fm_backend_herdr_composer_state: a jcode composer above trailing blank viewport rows is found (pending), not cut off as unknown"
+}
+
 # jcode's WRAPPED composer: a long single-line message (the away daemon's
 # ~13k-char escalation digest) grows jcode's inline composer downward one wrapped
 # row at a time until the leading "NNN>" prompt row scrolls off the top of the
@@ -2209,10 +2233,16 @@ test_wait_for_working_treats_blocked_as_submit_active() {
 }
 
 # --- send_text_submit: native agent-state (agent get) verify-and-retry ------
-# Rewritten for the 2026-07-07 incident (docs/herdr-backend.md): confirmation
-# no longer reads composer content in the normal idle-baseline path, so a
-# harness whose IDLE composer shows dynamic tip text (real codex) can no
-# longer misread as "pending" and block/mis-confirm a send.
+# Rewritten for the 2026-07-07 incident (docs/herdr-backend.md): the NORMAL
+# confirmation no longer reads composer content in the idle-baseline path, so a
+# harness whose IDLE composer shows dynamic tip text (real codex) can no longer
+# misread as "pending" and block/mis-confirm a send. Task
+# r5-herdr-jcode-send-verdict (verified live 2026-09-03) re-added ONE narrow
+# composer fallback: when the whole agent-status budget passes with the agent
+# never submit-active (a LOCAL slash command never starts a model turn, so
+# working can never fire for it even when it DID land), the emptied composer
+# confirms delivery and a still-held composer keeps the retry loop honest. A
+# submit-active agent-status still short-circuits BEFORE any composer read.
 # FM_BACKEND_HERDR_SUBMIT_POLLS=1 pins most tests
 # below to exactly one agent-get sample per Enter attempt for simple,
 # deterministic call-count assertions; the multi-sample behavior itself is
@@ -2240,18 +2270,28 @@ test_send_text_submit_detects_landed_send() {
 }
 
 test_send_text_submit_detects_swallowed_enter() {
-  local dir log resp fb out
+  local dir log resp fb out enter_count read_count
   dir="$TMP_ROOT/submit-swallow"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
-  # Every post-Enter agent-get read still reports idle: the Enter never
-  # started a turn (swallowed), so wait_for_working never observes "busy".
+  # 2: agent get - pre-Enter baseline is idle
   printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/2.out"
+  # 4: agent get (Enter #1's confirmation poll) - still idle: the Enter never
+  #    started a turn (swallowed), so wait_for_working never observes "busy".
   printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/4.out"
-  printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/6.out"
+  # 5,8: pane read (ANSI) - the composer still holds the typed text after each
+  #    Enter, so each attempt reads pending and the loop retries Enter.
+  printf '\x1b[38;2;255;80;80m1\x1b[38;2;138;180;248m> \x1b[39mhello captain        \x1b[38;2;255;193;7m\xe2\x8f\xb3\n' > "$resp/5.out"
+  # 7: agent get (Enter #2's confirmation poll) - still idle.
+  printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/7.out"
+  printf '\x1b[38;2;255;80;80m1\x1b[38;2;138;180;248m> \x1b[39mhello captain        \x1b[38;2;255;193;7m\xe2\x8f\xb3\n' > "$resp/8.out"
   fb=$(make_herdr_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_BACKEND_HERDR_SUBMIT_POLLS=1 \
     bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_send_text_submit default:w1:p2 "hello captain" 2 0.01 0.01' "$ROOT" )
-  [ "$out" = pending ] || fail "send_text_submit should report pending once retries are exhausted with agent_status never going busy, got '$out'"
-  pass "fm_backend_herdr_send_text_submit: reports 'pending' when agent_status never reports working after retried Enters (swallowed)"
+  [ "$out" = pending ] || fail "send_text_submit should report pending once retries are exhausted with agent_status never going busy and the text still in the composer, got '$out'"
+  enter_count=$(grep -c $'\x1f''pane'$'\x1f''send-keys'$'\x1f''w1:p2'$'\x1f''enter' "$log")
+  [ "$enter_count" -eq 2 ] || fail "a swallowed Enter with the text still held must retry Enter, sent $enter_count Enter(s)"
+  read_count=$(grep -c $'\x1f''pane'$'\x1f''read' "$log")
+  [ "$read_count" -eq 2 ] || fail "each swallowed-Enter attempt must verify the composer once, made $read_count read(s)"
+  pass "fm_backend_herdr_send_text_submit: reports 'pending' when agent_status never reports working after retried Enters and the composer still holds the text"
 }
 
 # Regression coverage for the 2026-07-03 incident using the NEW mechanism: a
@@ -2269,9 +2309,12 @@ test_send_text_submit_popup_autocomplete_requires_second_enter() {
   # 4: agent get -> idle (not submitted yet)
   printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/2.out"
   printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/4.out"
-  # 5: send-keys enter (#2) - actually submits
-  # 6: agent get -> working (submitted)
-  printf '{"result":{"agent":{"agent_status":"working"}}}\n' > "$resp/6.out"
+  # 5: pane read (ANSI) -> the popup-fill left auto-completed text in the
+  #    composer, so the attempt reads pending and the loop sends Enter #2.
+  printf '\x1b[38;2;255;80;80m1\x1b[38;2;138;180;248m> \x1b[39m/compact compaction instructions        \x1b[38;2;255;193;7m\xe2\x8f\xb3\n' > "$resp/5.out"
+  # 6: send-keys enter (#2) - actually submits
+  # 7: agent get -> working (submitted)
+  printf '{"result":{"agent":{"agent_status":"working"}}}\n' > "$resp/7.out"
   fb=$(make_herdr_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_BACKEND_HERDR_SUBMIT_POLLS=1 \
     bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_send_text_submit default:w1:p2 "/compact" 3 0.01 1.2' "$ROOT" )
@@ -2496,6 +2539,63 @@ test_send_text_submit_jcode_unconfirmable_composer_read_fails_closed() {
   read_count=$(grep -c $'\x1f''pane'$'\x1f''read' "$log")
   [ "$read_count" -eq 2 ] || fail "expected the ANSI read plus its plain fallback, made $read_count read(s)"
   pass "fm_backend_herdr_send_text_submit: an unconfirmable jcode composer read fails closed (pending) - the exact false-success vector the fleet incident exposed"
+}
+
+# The r5-herdr-jcode-send-verdict core regression: a LOCAL slash command
+# (/effort, /model, /no-mistakes, /account, ...) never starts a model turn, so
+# agent_status NEVER flips to working even though the slash DID land and was
+# consumed (verified live 2026-09-03, jcode v0.81.69-dev + herdr 0.8.0: a
+# consumed /effort left agent_status AND state_change_seq frozen while the
+# command executed and the composer cleared). The old idle-baseline path waited
+# only for working, burned its budget, and reported pending - the false "Enter
+# swallowed; text left in composer" every slash steer and /effort spawn-nudge
+# hit while the text had actually landed. The truthful signal is the composer
+# EMPTYING: this test pins that an idle baseline with a never-working agent and
+# an emptied composer confirms delivery with exactly ONE Enter.
+test_send_text_submit_jcode_local_slash_confirms_via_emptied_composer() {
+  local dir log resp fb out enter_count read_count
+  dir="$TMP_ROOT/submit-jcode-local-slash"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  # 2: agent get - pre-Enter baseline is idle
+  printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/2.out"
+  # 4: agent get - the confirmation poll still reads idle: a local slash never
+  #    goes working even though Enter consumed it.
+  printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/4.out"
+  # 5: pane read (ANSI) - the composer CLEARED (idle "1> " row, no text): the
+  #    slash was consumed, so this is delivery confirmed.
+  printf '\x1b[38;2;255;80;80m1\x1b[38;2;138;180;248m> \x1b[39m        \x1b[38;2;255;193;7m\xe2\x8f\xb3\n' > "$resp/5.out"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_BACKEND_HERDR_SUBMIT_POLLS=1 \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_send_text_submit default:w1:p2 "/effort medium" 3 0.01 0.01' "$ROOT" )
+  [ "$out" = empty ] || fail "a consumed jcode local slash must confirm delivery (empty verdict) via its emptied composer, got '$out' - this was the false 'Enter swallowed'"
+  enter_count=$(grep -c $'\x1f''pane'$'\x1f''send-keys'$'\x1f''w1:p2'$'\x1f''enter' "$log")
+  [ "$enter_count" -eq 1 ] || fail "a consumed jcode local slash must not burn needless extra Enters, sent $enter_count Enter(s)"
+  read_count=$(grep -c $'\x1f''pane'$'\x1f''read' "$log")
+  [ "$read_count" -eq 1 ] || fail "one composer confirmation read after the never-working budget, made $read_count read(s)"
+  pass "fm_backend_herdr_send_text_submit: a consumed jcode local slash confirms delivery (empty) via its emptied composer - the false 'Enter swallowed' is closed"
+}
+
+# The fail-closed twin of the local-slash confirmation: a jcode local slash
+# whose post-Enter composer CANNOT be read must report pending immediately and
+# never throw another Enter at an unreadable pane (the
+# never-retry-past-unreadable invariant). A claimed success here would be the
+# false-positive the 2026-08-25 fleet incident exposed.
+test_send_text_submit_jcode_local_slash_unreadable_composer_fails_closed() {
+  local dir log resp fb out enter_count read_count
+  dir="$TMP_ROOT/submit-jcode-local-slash-unreadable"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/2.out"
+  printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/4.out"
+  # 5: ANSI pane read FAILS  6: plain pane read FAILS -> composer unconfirmable.
+  printf '1\n' > "$resp/5.exit"
+  printf '1\n' > "$resp/6.exit"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_BACKEND_HERDR_SUBMIT_POLLS=1 \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_send_text_submit default:w1:p2 "/effort medium" 3 0.01 0.01' "$ROOT" )
+  [ "$out" = pending ] || fail "an unreadable post-Enter composer on a local-slash send must fail closed (pending), never claim success, got '$out'"
+  enter_count=$(grep -c $'\x1f''pane'$'\x1f''send-keys'$'\x1f''w1:p2'$'\x1f''enter' "$log")
+  [ "$enter_count" -eq 1 ] || fail "never retry Enter past an unreadable composer, sent $enter_count Enter(s)"
+  read_count=$(grep -c $'\x1f''pane'$'\x1f''read' "$log")
+  [ "$read_count" -eq 2 ] || fail "expected the ANSI read plus its plain fallback, made $read_count read(s)"
+  pass "fm_backend_herdr_send_text_submit: a local-slash send with an unreadable composer fails closed (pending), never a false success"
 }
 
 # --- fm-backend.sh dispatch wiring -------------------------------------------
@@ -3207,6 +3307,7 @@ test_composer_state_jcode_future_glyph_empty_is_empty
 test_composer_state_jcode_future_glyph_with_text_is_pending
 test_composer_state_jcode_typed_text_is_pending
 test_composer_state_jcode_transcript_rows_are_not_a_composer
+test_composer_state_jcode_composer_above_trailing_blank_rows_is_found
 test_composer_state_jcode_wrapped_tail_is_pending
 test_agent_alive_no_agent_but_live_jcode_composer_is_alive
 test_agent_alive_no_agent_and_bare_shell_stays_dead
@@ -3236,6 +3337,8 @@ test_send_text_submit_jcode_swallowed_enter_retries_then_pending
 test_send_text_submit_jcode_swallowed_enter_retry_succeeds
 test_send_text_submit_jcode_clean_first_try_submit_confirms
 test_send_text_submit_jcode_unconfirmable_composer_read_fails_closed
+test_send_text_submit_jcode_local_slash_confirms_via_emptied_composer
+test_send_text_submit_jcode_local_slash_unreadable_composer_fails_closed
 test_dispatch_routes_herdr_backend
 test_dispatch_busy_state_unknown_for_tmux
 test_dispatch_composer_state_routes_by_backend

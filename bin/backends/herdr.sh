@@ -1420,6 +1420,29 @@ fm_backend_herdr_send_key() {  # <target> <key>
 # the composer-state guard/fallback reads around submit and injection). Workaround:
 # always request a generous fetch far above any realistic viewport height, then
 # trim to the caller's requested bound ourselves with `tail`.
+# fm_backend_herdr_trim_trailing_blank_rows: drop trailing whitespace-only rows
+# from a `pane read` capture before a caller's bounded tail window slices it.
+# herdr's `--format ansi` read pads the pane buffer to the full viewport height
+# (verified 2026-09-03, herdr 0.8.0 + jcode v0.81.69-dev), and a freshly spawned
+# jcode pane draws its UI well above the buffer bottom - the live composer row
+# sat ~30 rows above the bottom with blank rows below it. Without the trim, a
+# bounded tail window starting inside those blanks never reaches the composer
+# and fm_backend_herdr_composer_state reads `unknown` on a live pane (task
+# r5-herdr-jcode-send-verdict). A pane whose content already fills the viewport
+# has no trailing blank rows, so the trim is a no-op there. Trailing dead space
+# carries no information for any caller (composer scans, peeks, agent-alive
+# reads).
+fm_backend_herdr_trim_trailing_blank_rows() {  # <text>
+  awk '
+    { lines[NR] = $0 }
+    END {
+      e = NR
+      while (e > 0 && lines[e] ~ /^[[:space:]]*$/) e--
+      for (i = 1; i <= e; i++) print lines[i]
+    }
+  '
+}
+
 fm_backend_herdr_capture() {  # <target> <lines>
   fm_backend_herdr_target_ready "$1" || return 1
   local lines=${2:-200} fetch out
@@ -1427,6 +1450,7 @@ fm_backend_herdr_capture() {  # <target> <lines>
   fetch=$lines
   case "$fetch" in ''|*[!0-9]*) fetch=200 ;; *) [ "$fetch" -ge 200 ] || fetch=200 ;; esac
   out=$(fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane read "$FM_BACKEND_HERDR_PANE" --source recent --lines "$fetch" 2>/dev/null) || return 1
+  out=$(printf '%s' "$out" | fm_backend_herdr_trim_trailing_blank_rows)
   printf '%s' "$out" | tail -n "$lines"
 }
 
@@ -1437,6 +1461,7 @@ fm_backend_herdr_capture_ansi() {  # <target> <lines>
   fetch=$lines
   case "$fetch" in ''|*[!0-9]*) fetch=200 ;; *) [ "$fetch" -ge 200 ] || fetch=200 ;; esac
   out=$(fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane read "$FM_BACKEND_HERDR_PANE" --source recent --lines "$fetch" --format ansi 2>/dev/null) || return 1
+  out=$(printf '%s' "$out" | fm_backend_herdr_trim_trailing_blank_rows)
   printf '%s' "$out" | tail -n "$lines"
 }
 
@@ -1755,11 +1780,16 @@ EOF
 # Confirmation signal (rewritten for the 2026-07-07 incident below;
 # superseded a composer-content read that itself replaced a delta-based check
 # for the 2026-07-03 incident): when the target is legibly idle before Enter,
-# submission is confirmed by fm_backend_herdr_wait_for_working observing a
-# submit-active agent_status after Enter, NOT by reading the composer's own
-# row. This makes the normal confirmation path cross-agent: it is the same
-# semantic signal regardless of what text a harness's idle composer happens
-# to display.
+# submission is confirmed FIRST by fm_backend_herdr_wait_for_working observing
+# a submit-active agent_status after Enter - the cross-agent semantic signal,
+# regardless of what text a harness's idle composer happens to display. Only
+# when the whole budget passes with the agent never submit-active does the
+# path consult the composer (task r5-herdr-jcode-send-verdict, verified live
+# 2026-09-03): a LOCAL slash command never starts a model turn, so agent_status
+# can never flip to working for it even when it DID land, and the truthful
+# confirmation for that class is the composer emptying. See the in-loop comment
+# for the empty/pending/unknown contract and why the 2026-07-07 codex-idle-tip
+# hazard cannot regress.
 #
 # Incident (2026-07-07, followed up on 2026-07-08): a redelivery loop in the
 # away-mode daemon. Root cause: composer-content submit confirmation was too
@@ -1770,16 +1800,18 @@ EOF
 # native agent-state so delivery does not depend on composer text. Composer
 # content is retained for other callers (the away-mode daemon's PRE-injection
 # empty-box guard, still dispatched via fm_backend_composer_state /
-# fm_backend_herdr_composer_state) and for submit attempts whose pre-Enter
-# agent-state baseline is not legibly idle.
+# fm_backend_herdr_composer_state), for submit attempts whose pre-Enter
+# agent-state baseline is not legibly idle, and - since task
+# r5-herdr-jcode-send-verdict - as the LOCAL-slash confirmation when an idle
+# baseline's whole budget never observes a submit-active status.
 #
 # This also still correctly handles the earlier 2026-07-03 incident (a
 # slash-command popup selection/placeholder-fill on the FIRST Enter is not a
 # genuine submission) without any popup-specific logic at all: filling a
 # composer placeholder never starts a turn, so agent_status simply never
-# reports "working" for that Enter, and the retry loop below sends a second
-# Enter exactly as it did before - the fix generalizes instead of special-
-# casing the popup shape.
+# reports "working" for that Enter, the composer read holds the filled text as
+# pending, and the retry loop below sends a second Enter exactly as it did
+# before - the fix generalizes instead of special-casing the popup shape.
 #
 # Failure-mode analysis (the two directions the caller-facing contract must
 # not get wrong - see docs/herdr-backend.md "Native agent-state submit
@@ -1793,9 +1825,13 @@ EOF
 #     are packed into the budget; real claude/codex measured first-working
 #     at 90-490ms, comfortably inside a several-hundred-ms, multiply-sampled
 #     window, so this has not been observed in practice. On the (unobserved)
-#     residual chance it happens, the verdict is "pending" and the caller
-#     never retypes - only re-sends Enter, which lands on an already-empty
-#     composer and is a no-op, not a duplicate delivery of <text> (see
+#     residual chance it happens, the verdict used to be "pending"; since task
+#     r5-herdr-jcode-send-verdict the idle-baseline composer fallback reads the
+#     thus-emptied composer as `empty` and the caller confirms delivery instead
+#     of burning Enter retries on an already-submitted message. The caller
+#     still never retypes - only re-sends Enter, which lands on an
+#     already-empty composer and is a no-op, not a duplicate delivery of
+#     <text> (see
 #     fm-send.sh/fm-supervise-daemon.sh: retyping only happens if a caller
 #     re-invokes this function from scratch with the same text after seeing
 #     an error, which is a human/escalation decision, not an automatic
@@ -1840,6 +1876,36 @@ fm_backend_herdr_send_text_submit() {  # <target> <text> <retries> <enter-sleep>
     if [ "$baseline" = idle ]; then
       verdict=$(fm_backend_herdr_wait_for_working "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE" \
         "$confirm_sleep" "$FM_BACKEND_HERDR_SUBMIT_POLLS")
+      if [ "$verdict" = idle ]; then
+        # The whole confirmation budget passed with the agent legibly idle and
+        # never submit-active. A real text turn would have flipped agent_status
+        # to working (the 2026-07-07 contract); a LOCAL slash command (/model,
+        # /effort, /no-mistakes, /account, /compact, ...) NEVER starts a model
+        # turn, so working can never fire for it - verified live 2026-09-03
+        # (jcode v0.81.69-dev + herdr 0.8.0): a consumed /effort left both
+        # agent_status AND state_change_seq frozen at their pre-Enter values
+        # while the command executed and the composer cleared. The truthful
+        # confirmation for that class is the composer EMPTYING, so consult it:
+        #   empty   - the typed text left the composer: consumed by a local
+        #             slash or a turn too fast for the polls to catch. Either
+        #             way the text landed, so this confirms delivery (it also
+        #             closes the documented instant-round-trip gap, where a
+        #             turn starts AND finishes between two polls).
+        #   pending - the text is still held: this Enter genuinely did not
+        #             submit, so the loop retries Enter exactly as before.
+        #   unknown - the pane cannot be read: fail closed immediately, never
+        #             throw another Enter at an unreadable pane (the
+        #             never-retry-past-unreadable invariant).
+        # The codex-idle-tip hazard that moved this path OFF composer reads in
+        # 2026-07-07 cannot regress: the read only happens when native
+        # agent-state never observed a submit, and an EMPTY read still means
+        # the text is gone from the composer (a dim dynamic tip strips to
+        # empty exactly when it is NOT the typed steer, so the success verdict
+        # stays truthful; anything ambiguous reads pending and behaves like
+        # today).
+        sleep "$sleep_s"
+        verdict=$(fm_backend_herdr_composer_state "$target")
+      fi
     else
       sleep "$sleep_s"
       verdict=$(fm_backend_herdr_composer_state "$target")
