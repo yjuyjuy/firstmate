@@ -2024,19 +2024,22 @@ fm_super_main() {
   # that is still fresh keeps its real elapsed time. Startup-only stamp; the
   # main loop never touches these here. See task fm-afk-inject-catchall-race.
   _stamp_cadence_marker() {
-    local marker=$1 cadence=$2
+    local marker=$1 cadence=$2 fallback=$3
+    case "$cadence" in
+      ''|*[!0-9]*) cadence=$fallback ;;
+    esac
     if [ ! -e "$marker" ] || [ "$(_file_age "$marker")" -ge "$cadence" ]; then
       _now > "$marker"
     fi
   }
   _stamp_cadence_marker "$STATE/.subsuper-last-scan" \
-    "${FM_HEARTBEAT_SCAN_SECS:-$HEARTBEAT_SCAN_SECS_DEFAULT}"
+    "${FM_HEARTBEAT_SCAN_SECS:-$HEARTBEAT_SCAN_SECS_DEFAULT}" "$HEARTBEAT_SCAN_SECS_DEFAULT"
   _stamp_cadence_marker "$STATE/.subsuper-last-housekeep" \
-    "${FM_HOUSEKEEPING_TICK:-$HOUSEKEEPING_TICK_DEFAULT}"
+    "${FM_HOUSEKEEPING_TICK:-$HOUSEKEEPING_TICK_DEFAULT}" "$HOUSEKEEPING_TICK_DEFAULT"
   _stamp_cadence_marker "$STATE/.subsuper-last-driver" \
-    "${FM_AFK_DRIVER_TICK_SECS:-$AFK_DRIVER_TICK_SECS_DEFAULT}"
+    "${FM_AFK_DRIVER_TICK_SECS:-$AFK_DRIVER_TICK_SECS_DEFAULT}" "$AFK_DRIVER_TICK_SECS_DEFAULT"
   _stamp_cadence_marker "$STATE/.subsuper-last-context-stow" \
-    "${FM_CONTEXT_STOW_CHECK_SECS:-$CONTEXT_STOW_CHECK_SECS_DEFAULT}"
+    "${FM_CONTEXT_STOW_CHECK_SECS:-$CONTEXT_STOW_CHECK_SECS_DEFAULT}" "$CONTEXT_STOW_CHECK_SECS_DEFAULT"
 
   # --- shutdown: flush buffered escalations, reap child, release lock -------
   local WATCHER_PID="" CUR_TMP=""
