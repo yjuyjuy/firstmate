@@ -590,7 +590,7 @@ test_stale_terminal_status_overridden_by_active_run() {
 # a redraw that leaves the verdict unchanged is absorbed, and only a real verdict
 # change re-surfaces.
 test_terminal_stale_verdict_unchanged_absorbs_pane_redraw() {
-  local dir state fakebin out capture_file window key old_hash new_hash sig pid
+  local dir state fakebin out capture_file window key old_hash new_hash sig pid i
   dir=$(make_case terminal-verdict-churn); state="$dir/state"; fakebin="$dir/fakebin"
   out="$dir/watch.out"; capture_file="$dir/pane.txt"
   window="test:fm-done"
@@ -616,8 +616,12 @@ test_terminal_stale_verdict_unchanged_absorbs_pane_redraw() {
   pid=$!
   # Wait until the watcher has actually processed the stale scan (the suppressor
   # advances to the new hash) while it stays alive and never queues a wake.
+  # 200-tick (20s) ceiling like the suite's other absorb-path waits: under heavy
+  # host load the watcher's first cycle (sleep POLL + signal-coalesce linger +
+  # scan) takes ~4.4s, past the earlier 60-tick (6s) budget, so a tighter bound
+  # raced the watcher and flaked with no watcher defect.
   i=0
-  while [ "$i" -lt 60 ]; do
+  while [ "$i" -lt 200 ]; do
     kill -0 "$pid" 2>/dev/null || { reap "$pid"; fail "watcher exited on a footer-timer redraw of an already-surfaced done crew (should absorb): $(cat "$out")"; }
     [ "$(cat "$state/.stale-$key" 2>/dev/null || true)" = "$new_hash" ] && break
     sleep 0.1; i=$((i + 1))
@@ -1540,7 +1544,7 @@ test_wedge_escalation_marks_demand_deep_inspection_after_threshold() {
 }
 
 test_wedge_escalation_resets_when_pane_becomes_active() {
-  local dir state fakebin out capture_file window key pane_hash sig pid
+  local dir state fakebin out capture_file window key pane_hash sig pid i
   dir=$(make_case wedge-escalation-reset); state="$dir/state"; fakebin="$dir/fakebin"
   out="$dir/watch.out"; capture_file="$dir/pane.txt"
   window="test:fm-wedged-reset"
@@ -1565,9 +1569,18 @@ test_wedge_escalation_resets_when_pane_becomes_active() {
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
-  if ! wait_live "$pid" 30; then
-    reap "$pid"; fail "watcher exited on a fresh (changed) pane hash: $(cat "$out")"
-  fi
+  # Poll until the watcher's first cycle reconciles the changed pane hash
+  # (escalation counter and nudge marker cleared), rather than asserting after a
+  # fixed 3s wait_live window: under heavy host load the first cycle (sleep POLL
+  # + signal-coalesce linger + scan) can outlast 3s, so a fixed wait raced the
+  # reconcile and flaked with no watcher defect. The watcher must stay alive
+  # throughout (this is an absorb path); a death is the real regression.
+  i=0
+  while [ "$i" -lt 200 ]; do
+    kill -0 "$pid" 2>/dev/null || { reap "$pid"; fail "watcher exited on a fresh (changed) pane hash: $(cat "$out")"; }
+    [ ! -e "$state/.wedge-escalations-$key" ] && [ ! -e "$state/.stale-nudged-$key" ] && break
+    sleep 0.1; i=$((i + 1))
+  done
   [ ! -e "$state/.wedge-escalations-$key" ] || fail "a changed pane hash did not reset the wedge-escalation counter"
   [ ! -e "$state/.stale-nudged-$key" ] || fail "a changed pane hash did not reset the stale-nudge marker"
   reap "$pid"

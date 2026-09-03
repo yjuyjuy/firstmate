@@ -710,7 +710,10 @@ run_watcher_bounded() {
   local home=$1 fakebin=$2 check_interval=${FM_TEST_CHECK_INTERVAL:-0} watch_root=${FM_TEST_WATCH_ROOT:-$ROOT}
   shift 2
   # Integer-only cadence: a fractional FM_POLL falls back to 300s (fm-cadence-lib.sh).
-  perl -e 'my $pid=fork; die unless defined $pid; if (!$pid) { exec @ARGV } local $SIG{ALRM}=sub { kill "TERM", $pid; waitpid $pid, 0; exit 124 }; alarm 5; waitpid $pid, 0; alarm 0; exit($? >> 8)' \
+  # 20s ceiling (not 5s): every caller expects rc=0, so this alarm only guards against
+  # a genuinely hung watcher, not normal completion; a tight 5s bound raced fakebin
+  # delay shims (e.g. a 0.3s sleep x2) plus fork/exec overhead under host load.
+  perl -e 'my $pid=fork; die unless defined $pid; if (!$pid) { exec @ARGV } local $SIG{ALRM}=sub { kill "TERM", $pid; waitpid $pid, 0; exit 124 }; alarm 20; waitpid $pid, 0; alarm 0; exit($? >> 8)' \
     env FM_HOME="$home" FM_ROOT_OVERRIDE="$watch_root" FM_CHECK_INTERVAL="$check_interval" FM_CHECK_TIMEOUT=1 \
       FM_POLL=1 FM_HEARTBEAT=999999 FM_SIGNAL_GRACE=0 PATH="$fakebin:$BASE_PATH" "$WATCH" "$@"
 }
@@ -2684,11 +2687,15 @@ SH
       > "$dir/watch.out" 2> "$dir/watch.err" &
     watcher_pid=$!
     i=0
+    # 20s budget (not 4s): the watcher's slow-check block also runs
+    # context_stow_sweep, which shells out to fm-harness.sh and scans the
+    # host's real jcode session journals - genuinely slow on a loaded shared
+    # box, unrelated to the custom-check descendant behavior under test.
     while [ "$i" -lt 200 ]; do
       [ -s "$ready" ] && [ -s "$child_pid_file" ] && [ -e "$direct_done" ] \
         && [ -e "$state/.last-check" ] && break
       kill -0 "$watcher_pid" 2>/dev/null || break
-      sleep 0.02
+      sleep 0.1
       i=$((i + 1))
     done
     [ -s "$ready" ] && [ -s "$child_pid_file" ] && [ -e "$direct_done" ] \

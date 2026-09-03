@@ -526,6 +526,10 @@ EOF
 
 test_home_seed_refuses_projectless_home_with_uninspectable_projects() {
   local home sub err
+  if [ "$(id -u)" = 0 ]; then
+    pass "skipped: running as root, where chmod 311 does not deny directory inspection"
+    return 0
+  fi
   home="$TMP_ROOT/no-projects-uninspectable-home"
   sub="$TMP_ROOT/no-projects-uninspectable-subhome"
   err="$TMP_ROOT/no-projects-uninspectable.err"
@@ -623,6 +627,10 @@ test_home_seed_refuses_projectless_home_with_non_directory_projects() {
 
 test_home_seed_refuses_projectless_home_with_uninspectable_registry() {
   local home sub err registry_before
+  if [ "$(id -u)" = 0 ]; then
+    pass "skipped: running as root, where mode 000 does not deny a read"
+    return 0
+  fi
   home="$TMP_ROOT/no-projects-uninspectable-registry-home"
   sub="$TMP_ROOT/no-projects-uninspectable-registry-subhome"
   err="$TMP_ROOT/no-projects-uninspectable-registry.err"

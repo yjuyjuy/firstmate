@@ -68,6 +68,10 @@ assert_secondmate_write_fails() {
 
 test_first_copy_readonly_and_local_files_preserved() {
   local rec primary second report out
+  if [ "$(id -u)" = 0 ]; then
+    pass "skipped: running as root, where the read-only shared-file mode does not deny a write"
+    return 0
+  fi
   rec=$(new_home_pair first-copy)
   primary=${rec%%|*}
   second=${rec#*|}
@@ -191,6 +195,10 @@ test_unsafe_artifacts_and_failure_restore_readonly_mode() {
 
   write_shared "$second/data/captain-shared.md" "permission drift"
   chmod "$FM_SHARED_CAPTAIN_MODE" "$second/data/captain-shared.md"
+  if [ "$(id -u)" = 0 ]; then
+    pass "unsafe shared captain artifacts are rejected; skipped the unwritable-directory case, running as root where chmod 500 does not deny a write"
+    return 0
+  fi
   before_mode=$(file_mode "$second/data/captain-shared.md")
   chmod 500 "$second/data"
   err="$TMP_ROOT/restore-readonly.err"
