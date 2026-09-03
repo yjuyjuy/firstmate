@@ -2016,6 +2016,47 @@ fm_super_main() {
   log "daemon starting (pid $$); delivery=$DELIVERY; target=${TARGET:-none}; target_source=$target_source; backend=$BACKEND; backend_source=$backend_source; afk=$afk_status; inject_skip='${FM_INJECT_SKIP:-$INJECT_SKIP_DEFAULT}'; stale_escalate=${FM_STALE_ESCALATE_SECS:-$STALE_ESCALATE_SECS_DEFAULT}s; batch=${FM_ESCALATE_BATCH_SECS:-$ESCALATE_BATCH_SECS_DEFAULT}s"
   migrate_watcher_pause_markers "$STATE"
 
+  # Ownership fix (task fm-afk-inject-catchall-race): stamp the catch-all scan's
+  # cadence marker at daemon startup instead of leaving it to the first
+  # housekeeping tick. _file_age reads a MISSING marker as effectively infinite
+  # age, so a fresh (or reset) state dir made the catch-all scan (3) below think
+  # its HEARTBEAT_SCAN_SECS cadence was already overdue and fire on the daemon's
+  # very FIRST housekeeping tick - seconds after startup - racing ahead of the
+  # per-wake signal path (bin/fm-watch.sh -> handle_wake -> classify_signal/
+  # classify_stale) for any event that arrived in that startup window. The
+  # catch-all then marked the event seen first, so the signal path self-handled
+  # it as "signal already escalated (catch-all scan)" and firstmate had to wait
+  # for the next slow housekeeping flush - the double-book this task fixes.
+  # Per-wake signal is this daemon's PRIMARY escalation owner; the catch-all is
+  # a BACKSTOP for events the signal path genuinely missed, on its own slower
+  # cadence. Create-if-absent (not an unconditional stamp): a daemon restart
+  # with a durable, still-fresh marker keeps its real elapsed time rather than
+  # being pushed out again.
+  [ -e "$STATE/.subsuper-last-scan" ] || _now > "$STATE/.subsuper-last-scan"
+
+  # Same bug, same fix, for every OTHER housekeeping cadence marker gated the
+  # identical way ([ "$(_file_age "$marker")" -ge "$cadence" ]): a missing
+  # marker reads as infinitely overdue, so each of these also fired on the very
+  # first tick instead of waiting out its real cadence. Two of the four are
+  # cheap (last-scan above, last-housekeep, ~0ms) and firing early is harmless
+  # noise; the other two are NOT cheap and firing early is exactly the race
+  # this task fixes, just via a different marker than the one first diagnosed:
+  #   - .subsuper-last-driver gates afk_driver_tick, which shells out to
+  #     fm-afk-driver.sh (git ls-remote / tasks-axi calls) - genuinely slow.
+  #   - .subsuper-last-context-stow gates context_stow_check, which shells out
+  #     to firstmate_own_context_tokens -> fm_sm_context_tokens; the jcode
+  #     reader scans every session journal under $JCODE_HOME/sessions with jq,
+  #     which measured ~6s against this environment's real session directory
+  #     (241 journals) - long enough to block the main loop past a wake it
+  #     should have consumed, reproducing the exact "signal missed" symptom
+  #     this task targets, just via housekeeping (4)/(5) instead of (3).
+  # Stamping all four at startup makes every cadence start its clock at daemon
+  # start, not at "however long the first tick takes to reach it", closing the
+  # whole class rather than only the one marker first found.
+  [ -e "$STATE/.subsuper-last-housekeep" ] || _now > "$STATE/.subsuper-last-housekeep"
+  [ -e "$STATE/.subsuper-last-driver" ] || _now > "$STATE/.subsuper-last-driver"
+  [ -e "$STATE/.subsuper-last-context-stow" ] || _now > "$STATE/.subsuper-last-context-stow"
+
   # --- shutdown: flush buffered escalations, reap child, release lock -------
   local WATCHER_PID="" CUR_TMP=""
   cleanup() {
