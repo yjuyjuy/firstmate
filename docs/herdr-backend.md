@@ -555,6 +555,7 @@ Before the workaround, an early version of the real-herdr smoke test flaked inte
 **Workaround:** `fm_backend_herdr_capture` never passes a caller's small requested line count straight through to herdr's own `--lines` flag.
 It always requests a generous floor (>= 200 lines, comfortably above any realistic pane viewport) from herdr, then trims to the caller's actual requested bound locally with `tail -n N`.
 Verified this eliminates the flake across repeated full smoke-test runs.
+Since 2026-09-03 both capture helpers also drop trailing whitespace-only rows before that local `tail`, because herdr 0.8.0 pads a read to the full viewport height and a pane can draw its bottom-most content well above the buffer bottom; see "Local-slash confirmation and the blank-tail composer read".
 
 ## Verified gap: `agent.get` reads idle during a long foreground tool call
 
@@ -958,7 +959,8 @@ Task r5-herdr-jcode-send-verdict verified the JCODE side of submit confirmation 
 
 ### Regression coverage
 
-`tests/fm-backend-herdr.test.sh`'s "wait_for_working" and "send_text_submit" sections cover both failure directions (a slow transition caught mid-window, an unreadable target that never retries), endpoint-spread timing with no final trailing sleep, the submit-specific `blocked` mapping, the popup-placeholder-fill case using the new mechanism, the already-submit-active baseline fallback, and `test_send_text_submit_confirms_despite_codex_idle_tip_composer`, which asserts a confirmed `empty` verdict AND that `pane read` is never called on an idle baseline.
+`tests/fm-backend-herdr.test.sh`'s "wait_for_working" and "send_text_submit" sections cover both failure directions (a slow transition caught mid-window, an unreadable target that never retries), endpoint-spread timing with no final trailing sleep, the submit-specific `blocked` mapping, the popup-placeholder-fill case using the new mechanism, the already-submit-active baseline fallback, and `test_send_text_submit_confirms_despite_codex_idle_tip_composer`, which asserts a confirmed `empty` verdict AND that `pane read` is never called on an idle baseline whose agent goes submit-active.
+The local-slash fallback added on 2026-09-03 is covered by `test_send_text_submit_jcode_local_slash_confirms_via_emptied_composer` (never-working agent + emptied composer confirms delivery with exactly one Enter), `test_send_text_submit_jcode_local_slash_unreadable_composer_fails_closed` (unreadable composer reports `pending` without another Enter), and the updated swallowed-Enter test (a still-held composer keeps retrying Enter); the capture trim is covered by `test_composer_state_jcode_composer_above_trailing_blank_rows_is_found`.
 The composer-guard regression for the 2026-07-08 AFK delivery bug lives in `test_composer_state_codex_dynamic_idle_tip_reads_empty_when_faint`.
 `test_composer_state_guard_still_refuses_real_pending_text_after_submit_confirmation_change` is a regression guard for the pre-injection empty-box guard itself, confirming it still refuses genuine pending composer text after this change.
 
@@ -971,8 +973,8 @@ With that fix, all four scenarios (A: partial-input deferral, B: swallowed-Enter
 Task herdr-send-submit-gap. Real fleet incident: `bin/fm-send.sh` reported success for a steer to lane `penny-rounding-row-autofold` (herdr pane `w41:p9`, jcode harness), while the steer text sat UNSUBMITTED in the jcode composer; a manual `herdr pane send-keys w41:p9 Enter` submitted it fine afterward.
 The observed context was jcode mid-retry or rate-limited: the Enter keystroke was issued, the harness never consumed it, and the confirmation logic still declared success - a false positive that strands the steer until a human or the watcher notices.
 
-Root cause. jcode is not in herdr's integration list, so `agent get <pane>` returns `agent_not_found` for every live jcode pane (see "jcode corroboration for the no-agent verdict" above).
-`fm_backend_herdr_send_text_submit` therefore never has a legible idle baseline for a jcode target, and confirmation runs through the composer-content path.
+Root cause. On the jcode build of the day, `agent get <pane>` returned `agent_not_found` for every live jcode pane (superseded for jcode >= 0.68.7 by the 2026-09-03 correction in "jcode corroboration for the no-agent verdict" above, which records a real registered `agent_status`).
+`fm_backend_herdr_send_text_submit` therefore never had a legible idle baseline for a jcode target, and confirmation ran through the composer-content path.
 Two false-positive directions existed in that path:
 - An indeterminate read declared success. A pane that cannot be read, a composer row the shared recognizers do not match, or a transient capture failure made the composer read report `unknown`, and `fm-send.sh`'s lenient policy ("an unreadable pane is assumed sent") treated `unknown` as delivered.
 - A busy-empty read is inherently ambiguous across jcode builds. jcode's busy composer row ("4…  ⏳") correctly reads `empty`, and on a jcode build where Enter-while-busy is accepted-and-queued that empty IS the cleared composer (verified below).
