@@ -1,37 +1,31 @@
 # One-shot import artifacts
 
-This directory holds frozen source data and generated artifacts for one-off imports of fleet data into an external tracker. It is deliberately separate from `docs/`'s narrative documents: these files are evidence for a specific migration, not instructions that stay true forever.
+This directory documents one-off imports of fleet data into an external tracker. It holds the reusable, publishable half of such an import: the converter's documentation and the contract its output satisfies. The data itself does not live here.
 
 ## DEV-46: firstmate done-archive to Linear
 
-| File | What it is |
-| --- | --- |
-| `dev-46-done-archive.md` | Frozen snapshot of one fleet home's `data/done-archive.md`, taken 2026-09-04 |
-| `dev-46-linear-import.csv` | The Linear import CSV generated from that snapshot |
-| `dev-46-dry-run.md` | Generated dry-run summary: counts, date range, label distribution, unparsed lines |
-
 The converter is [`bin/fm-linear-archive-csv.py`](../../bin/fm-linear-archive-csv.py); its header is the authoritative description of the grammar it parses, the columns it emits, and the date semantics it chose. Its behavior tests are `tests/fm-linear-archive-csv.test.sh`.
 
-Regenerate both artifacts from the frozen snapshot with:
+### Where the data lives, and why not here
+
+A fleet home's `data/` holds that captain's private operational history. For DEV-46 the source archive is a fleet's complete record of completed engineering work, which names internal systems, source locations, and identifiers belonging to the projects the fleet worked on. This repository is a shared, public template, so committing one fleet's archive here would publish that history permanently and irreversibly to everyone who clones the template.
+
+So the frozen snapshot, the generated CSV, and the generated dry-run summary all stay in the operating home under `data/dev-46-prep/`, alongside the runbook and the spot-check evidence. Only the converter, its tests, and this document are shared.
+
+The same rule applies to any future import: publish the tool, keep the payload in the home that owns it.
+
+### Running the conversion
+
+From a fleet home, against that home's own archive:
 
 ```sh
-python3 bin/fm-linear-archive-csv.py docs/imports/dev-46-done-archive.md \
-  --csv docs/imports/dev-46-linear-import.csv \
-  --summary docs/imports/dev-46-dry-run.md \
+python3 bin/fm-linear-archive-csv.py <home>/data/done-archive.md \
+  --csv <home>/data/<task>/linear-import.csv \
+  --summary <home>/data/<task>/dry-run.md \
   --strict
 ```
 
-The output is deterministic, so a regeneration on an unchanged snapshot produces byte-identical files and shows an empty diff.
-
-### Why the archive is frozen here
-
-A fleet home's `data/` is gitignored personal state, so the live archive is not reviewable and keeps growing while the import is being prepared. Copying it here makes the import auditable: the pull request that adds the converter also carries the exact bytes the CSV was generated from, so a reviewer can regenerate the CSV and compare, and a future question about an imported issue resolves against a file that has not moved. `docs/` is the natural home because this is reviewable documentation of a migration rather than tooling configuration; nothing here is read at runtime by any fleet script.
-
-This snapshot is not tracked personal fleet state in the sense the CI invariant guards: it is a deliberate, one-time, content-reviewed copy committed under `docs/`, not a live `data/` path wired into a running home.
-
-### Why the CSV is committed
-
-The CSV is generated, and a generated artifact usually does not belong in git. It is committed here anyway for two reasons specific to this import. First, the captain uploads it from a phone or another machine, so it must be reachable as a raw download from the repository rather than as a path on the fleet host. Second, the import is a one-shot action over 1,409 issues that is tedious to undo, so the exact bytes that were uploaded should be recoverable afterwards.
+`--strict` exits non-zero if any input line could not be classified as an archive header, a task, or a task continuation, so a silent drop cannot pass unnoticed. The output is deterministic: a regeneration over an unchanged archive produces byte-identical files, which is what makes a dry run meaningful before a one-shot import that would be tedious to undo.
 
 ### Duplicate detection
 
@@ -41,10 +35,20 @@ Every generated description carries a marker line:
 fm-meta: v1 id=<task-id> line=<line-in-snapshot> archived=<YYYY-MM-DD> digest=<sha256-prefix>
 ```
 
-The digest covers the task id, the archive date, and the full body, so a task id that appears twice in the archive still yields two distinct markers. Searching Linear for a digest answers whether that specific archived task is already imported, which is what makes a second import safe to reason about.
+The digest covers the task id, the archive date, and the full body, so a task id that appears twice in the archive still yields two distinct markers. Searching the tracker for a digest answers whether that specific archived task is already imported, which is what makes a second import safe to reason about.
 
 Print every marker without generating a CSV:
 
 ```sh
-python3 bin/fm-linear-archive-csv.py docs/imports/dev-46-done-archive.md --keys
+python3 bin/fm-linear-archive-csv.py <home>/data/done-archive.md --keys
 ```
+
+### Verifying against a real archive
+
+The behavior tests run entirely on generated fixtures, so they pass in CI with no fleet data present. To additionally exercise the converter against a real archive, point `FM_DEV46_ARCHIVE` at one:
+
+```sh
+FM_DEV46_ARCHIVE=<home>/data/done-archive.md tests/fm-linear-archive-csv.test.sh
+```
+
+That case asserts the real file converts with zero unparsed lines and no malformed row. It is skipped, not failed, when the variable is unset.

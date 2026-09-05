@@ -20,14 +20,16 @@
 #   (g) determinism: two runs over the same input produce byte-identical CSV
 #   (h) CSV safety: embedded commas, quotes, and newlines round-trip through a
 #       real CSV reader, and a formula-leading cell is escaped Linear-style
-#   (i) the frozen in-repo archive still converts clean under --strict
+#   (i) an optional pass over a REAL archive when FM_DEV46_ARCHIVE points at
+#       one. The archive is a fleet's private operational history and is never
+#       committed here, so this case is skipped rather than failed when unset;
+#       every other case runs on generated fixtures and needs no fleet data.
 set -u
 
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 CONV="$ROOT/bin/fm-linear-archive-csv.py"
-FROZEN="$ROOT/docs/imports/dev-46-done-archive.md"
 TMP_ROOT=$(fm_test_tmproot fm-linear-archive-csv)
 
 if ! command -v python3 >/dev/null 2>&1; then
@@ -390,16 +392,21 @@ test_usage_errors() {
   pass "usage errors are explicit and exit non-zero"
 }
 
-# --- (i) the frozen archive itself ------------------------------------------
+# --- (i) an optional real archive -------------------------------------------
 
-test_frozen_archive_converts_clean() {
-  [ -f "$FROZEN" ] || fail "the frozen archive $FROZEN is missing"
-  local dir=$TMP_ROOT/frozen out rc
+test_real_archive_converts_clean() {
+  local archive=${FM_DEV46_ARCHIVE:-}
+  if [ -z "$archive" ]; then
+    pass "real-archive pass skipped (set FM_DEV46_ARCHIVE to a done-archive to run it)"
+    return 0
+  fi
+  [ -f "$archive" ] || fail "FM_DEV46_ARCHIVE points at a missing file: $archive"
+  local dir=$TMP_ROOT/real out rc
   mkdir -p "$dir"
-  out=$(python3 "$CONV" "$FROZEN" --csv "$dir/out.csv" --summary "$dir/sum.md" --strict 2>&1)
+  out=$(python3 "$CONV" "$archive" --csv "$dir/out.csv" --summary "$dir/sum.md" --strict 2>&1)
   rc=$?
-  expect_code 0 "$rc" "the frozen archive must convert with zero unparsed lines"
-  assert_contains "$out" '0 unparsed lines' "the frozen archive must report no unparsed lines"
+  expect_code 0 "$rc" "the real archive must convert with zero unparsed lines"
+  assert_contains "$out" '0 unparsed lines' "the real archive must report no unparsed lines"
 
   local checks
   checks=$(python3 - "$dir/out.csv" <<'PY'
@@ -416,10 +423,10 @@ PY
   count=$(printf '%s' "$checks" | cut -d' ' -f1)
   uniq=$(printf '%s' "$checks" | cut -d' ' -f2)
   bad=$(printf '%s' "$checks" | cut -d' ' -f3)
-  [ "$count" -gt 1000 ] || fail "the frozen archive should yield over 1000 issues, got $count"
+  [ "$count" -gt 0 ] || fail "the real archive yielded no issues"
   [ "$count" = "$uniq" ] || fail "row Ids must be unique ($count rows, $uniq unique)"
-  [ "$bad" = 0 ] || fail "$bad frozen-archive rows are missing a title, marker, or date"
-  pass "the frozen archive converts clean: $count issues, unique ids, no malformed row"
+  [ "$bad" = 0 ] || fail "$bad real-archive rows are missing a title, marker, or date"
+  pass "the real archive converts clean: $count issues, unique ids, no malformed row"
 }
 
 test_basic_shape
@@ -436,6 +443,6 @@ test_labels_and_titles
 test_long_title_is_truncated
 test_status_and_project_overrides
 test_usage_errors
-test_frozen_archive_converts_clean
+test_real_archive_converts_clean
 
 echo "all fm-linear-archive-csv tests passed"
