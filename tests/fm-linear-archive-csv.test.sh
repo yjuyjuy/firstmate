@@ -41,11 +41,11 @@ fi
 write_sample() {  # <path>
   cat > "$1" <<'MD'
 ## Archived 2026-07-13
-- [x] alpha-task - Ship the alpha thing (repo: hyfin) (kind: ship) (done 2026-07-11)
+- [x] alpha-task - Ship the alpha thing (repo: alpha-repo) (kind: ship) (done 2026-07-11)
   follow-up note on the alpha thing
 
 ## Archived 2026-07-14
-- [x] beta-task - Investigate, "quoted", and comma, separated (repo: hyfin-server) (kind: scout) (reported 2026-07-12)
+- [x] beta-task - Investigate, "quoted", and comma, separated (repo: beta-repo) (kind: scout) (reported 2026-07-12)
 
 ## Archived 2026-07-15
 
@@ -316,7 +316,7 @@ print(by["alpha-task"]["Title"])
 print(by["alpha-task"]["Status"])
 PY
 )
-  assert_contains "$out" 'fm-archive, repo:hyfin, kind:ship' "labels must carry repo and kind"
+  assert_contains "$out" 'fm-archive, repo:alpha-repo, kind:ship' "labels must carry repo and kind"
   assert_contains "$out" 'alpha-task: Ship the alpha thing' "the title must prefix the task id"
   assert_not_contains "$out" 'alpha-task: Ship the alpha thing (repo' \
     "trailing metadata parens must be stripped from the title"
