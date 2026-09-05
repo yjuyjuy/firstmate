@@ -7,7 +7,15 @@
 # when the task genuinely deviates (e.g. working an existing external PR instead
 # of shipping a new one).
 # Usage: fm-brief.sh <task-id> <repo-name> [--scout|--interactive] [--herdr-lab]
+#                    [--unregistered]
 #        fm-brief.sh <task-id> --secondmate {<project>...|--no-projects}
+#   <repo-name> is the REGISTRY NAME from data/projects.md, not a path
+#   (bin/fm-spawn.sh is the one that takes the project PATH). A ship scaffold
+#   resolves the delivery mode strictly, so a name the registry cannot resolve
+#   refuses the scaffold and writes no brief instead of silently emitting a
+#   no-mistakes contract for a project the captain configured otherwise.
+#   --unregistered is the deliberate opt-in for a project that genuinely is not
+#   registered: it keeps the old behavior and takes the safe no-mistakes default.
 #   --scout writes the scout contract instead: the deliverable is a report at
 #   data/<task-id>/report.md (no branch, no push, no PR) and the worktree is scratch.
 #   The scout report must open with a mandatory TL;DR header block (<=5 lines:
@@ -155,6 +163,7 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 KIND=ship
 HERDR_LAB=0
 NO_PROJECTS=0
+UNREGISTERED=0
 POS=()
 for a in "$@"; do
   case "$a" in
@@ -163,6 +172,7 @@ for a in "$@"; do
     --secondmate) KIND=secondmate ;;
     --herdr-lab) HERDR_LAB=1 ;;
     --no-projects) NO_PROJECTS=1 ;;
+    --unregistered) UNREGISTERED=1 ;;
     *) POS+=("$a") ;;
   esac
 done
@@ -180,6 +190,11 @@ fi
 
 if [ "$NO_PROJECTS" -eq 1 ] && [ "$KIND" != secondmate ]; then
   echo "error: --no-projects applies only to --secondmate charters" >&2
+  exit 1
+fi
+
+if [ "$UNREGISTERED" -eq 1 ] && [ "$KIND" != ship ]; then
+  echo "error: --unregistered applies only to ship briefs, whose Definition of done is shaped by the delivery mode" >&2
   exit 1
 fi
 
@@ -545,8 +560,28 @@ fi
 # no-ci DOES affect the brief: a fork-no-CI / no-merge-authority repo can never report
 # "CI green", so the no-mistakes DoD tells the crew to park on a clean+mergeable PR with an
 # explicit `paused: ... awaiting captain merge (no CI on fork)` terminal line instead.
+#
+# The resolution is STRICT (bin/fm-project-mode.sh --strict): a project the registry
+# cannot resolve refuses the scaffold instead of silently defaulting to no-mistakes.
+# A brief's Definition of done IS the delivery contract the crewmate follows, so a
+# path-versus-name mistake (`projects/tasks-axi` where `tasks-axi` is required) used to
+# send a crewmate down a whole pipeline the captain did not configure, with nothing but
+# a stderr warning any scripted caller discards. --unregistered is the deliberate way
+# through for a genuinely unregistered project, which still gets the safe no-mistakes
+# default.
+if [ "$UNREGISTERED" -eq 1 ]; then
+  MODE_LINE=$("$FM_ROOT/bin/fm-project-mode.sh" "$REPO")
+else
+  # rmdir removes only the empty directory this scaffold just created; a refusal
+  # must leave nothing behind that a later run would mistake for a real brief.
+  MODE_LINE=$("$FM_ROOT/bin/fm-project-mode.sh" --strict "$REPO") || {
+    rc=$?
+    rmdir "$DATA/$ID" 2>/dev/null || true
+    exit "$rc"
+  }
+fi
 read -r MODE _YOLO AUTOLAND NOCI _ <<EOF
-$("$FM_ROOT/bin/fm-project-mode.sh" "$REPO")
+$MODE_LINE
 EOF
 : "${AUTOLAND:=off}"
 : "${NOCI:=off}"
