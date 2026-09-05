@@ -90,8 +90,62 @@ test_unknown_mode_falls_back_to_safe_default() {
   pass "fm-project-mode.sh: unknown mode and absent project fall back safely"
 }
 
+# --strict is the form a caller whose output is a delivery CONTRACT must use.
+# The default fallback is a stderr warning a scripted caller never sees, so a
+# strict caller gets a refusal (exit 3, nothing on stdout) instead of a mode the
+# registry never authorized.
+test_strict_refuses_an_unresolvable_project() {
+  local out err rc
+  out=$(FM_HOME="$HOME_DIR" "$ROOT/bin/fm-project-mode.sh" --strict not-registered 2>/dev/null); rc=$?
+  expect_code 3 "$rc" "--strict must refuse an absent project"
+  [ -z "$out" ] || fail "--strict must print no mode on stdout when it refuses (got [$out])"
+  err=$(FM_HOME="$HOME_DIR" "$ROOT/bin/fm-project-mode.sh" --strict not-registered 2>&1 >/dev/null)
+  assert_contains "$err" "cannot resolve a delivery mode" "--strict refusal must say what failed"
+  assert_contains "$err" "registered projects:" "--strict refusal must list the registered names"
+
+  out=$(FM_HOME="$HOME_DIR" "$ROOT/bin/fm-project-mode.sh" --strict bogus-proj 2>/dev/null); rc=$?
+  expect_code 3 "$rc" "--strict must refuse an unknown mode instead of silently defaulting"
+  [ -z "$out" ] || fail "--strict must print no mode for an unknown registry mode (got [$out])"
+  pass "fm-project-mode.sh: --strict refuses instead of falling back to the default"
+}
+
+# The path-versus-name mistake is the whole reason --strict exists: this script
+# and fm-brief.sh take a registry NAME while fm-spawn.sh takes a PATH, so
+# "projects/<name>" resolved to a silent no-mistakes default. When the basename
+# IS registered the refusal must say so and name the correct argument.
+test_strict_names_the_path_versus_name_mistake() {
+  local err rc
+  err=$(FM_HOME="$HOME_DIR" "$ROOT/bin/fm-project-mode.sh" --strict projects/pr-proj 2>&1 >/dev/null); rc=$?
+  expect_code 3 "$rc" "--strict must refuse a path-shaped argument"
+  assert_contains "$err" "looks like a PATH" "the refusal must name the path-versus-name cause"
+  assert_contains "$err" '"pr-proj" IS registered' "the refusal must say the basename is registered"
+  assert_contains "$err" "fm-spawn.sh takes the project PATH" "the refusal must name which script takes a path"
+
+  # A path whose basename is NOT registered still gets the path hint, but must
+  # not claim a registry entry that does not exist.
+  err=$(FM_HOME="$HOME_DIR" "$ROOT/bin/fm-project-mode.sh" --strict projects/ghost-proj 2>&1 >/dev/null)
+  assert_contains "$err" "looks like a PATH" "an unregistered path must still get the path hint"
+  case "$err" in *"IS registered"*) fail "an unregistered basename must not be claimed as registered" ;; esac
+  pass "fm-project-mode.sh: --strict names the path-versus-name mistake actionably"
+}
+
+# The default (non-strict) form is used by callers that legitimately want a
+# fallback (bin/fm-fleet-sync.sh, bin/fm-spawn.sh, bin/fm-home-seed.sh), so it
+# must keep behaving exactly as before.
+test_default_form_is_unchanged() {
+  local out rc
+  out=$(FM_HOME="$HOME_DIR" "$ROOT/bin/fm-project-mode.sh" not-registered 2>/dev/null); rc=$?
+  expect_code 0 "$rc" "the default form must still exit 0 for an absent project"
+  assert_equals "no-mistakes off off off" "$out" "the default form must still fall back"
+  assert_equals "direct-PR off off off" "$(mode_of pr-proj)" "the default form must still resolve a registered project"
+  pass "fm-project-mode.sh: the default fallback form is unchanged for its existing callers"
+}
+
 test_known_modes_resolve
 test_direct_push_carries_yolo
 test_autoland_flag_resolves
 test_noci_flag_resolves
 test_unknown_mode_falls_back_to_safe_default
+test_strict_refuses_an_unresolvable_project
+test_strict_names_the_path_versus_name_mistake
+test_default_form_is_unchanged

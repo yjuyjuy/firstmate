@@ -67,6 +67,7 @@ write_registry() {
   mkdir -p "$home/data"
   write_fork_clone "$home" direct-proj
   cat > "$home/data/projects.md" <<'EOF'
+- nm-proj [no-mistakes] - fixture for no-mistakes mode (added 2026-09-05)
 - direct-proj [direct-PR] - fixture for direct-PR mode (added 2026-07-01)
 - push-proj [direct-push] - fixture for direct-push mode (added 2026-07-24)
 - push-autoland-proj [direct-push +autoland] - fixture for direct-push self-land (added 2026-07-26)
@@ -87,7 +88,7 @@ test_ship_modes_generate_clean_briefs() {
   home="$TMP_ROOT/ship-home"
   write_registry "$home"
 
-  for id_proj in "brief-nomistakes-a1:no-registry-proj" "brief-directpr-a2:direct-proj" "brief-directpush-a2b:push-proj" "brief-autoland-a2c:push-autoland-proj" "brief-localonly-a3:local-proj"; do
+  for id_proj in "brief-nomistakes-a1:nm-proj" "brief-directpr-a2:direct-proj" "brief-directpush-a2b:push-proj" "brief-autoland-a2c:push-autoland-proj" "brief-localonly-a3:local-proj"; do
     id=${id_proj%%:*}
     proj=${id_proj##*:}
     FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" "$proj" >/dev/null 2>&1; status=$?
@@ -228,9 +229,8 @@ test_ship_brief_carries_no_bypass_stop_rule() {
   home="$TMP_ROOT/no-bypass-home"
   write_registry "$home"
   # Assert across every ship delivery mode: the rule is in the shared ship Rules
-  # list, so it must appear whatever the project's mode. An unregistered name
-  # (nm-default-proj) exercises the no-mistakes default path.
-  for mode in nm-default-proj push-autoland-proj push-proj local-proj; do
+  # list, so it must appear whatever the project's mode.
+  for mode in nm-proj push-autoland-proj push-proj local-proj; do
     FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "nb-$mode" "$mode" >/dev/null 2>&1
     brief="$home/data/nb-$mode/brief.md"
     assert_present "$brief" "ship brief for $mode was not scaffolded"
@@ -244,7 +244,7 @@ test_ship_brief_carries_no_bypass_stop_rule() {
       "ship brief ($mode) must point at the enforcing pre-push guard"
   done
   # A scout never pushes, so it does not carry the ship push-bypass rule.
-  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" nb-scout nm-default-proj --scout >/dev/null 2>&1
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" nb-scout nm-proj --scout >/dev/null 2>&1
   brief="$home/data/nb-scout/brief.md"
   assert_no_grep 'no-mistakes axi sync --recover' "$brief" \
     "scout brief must not carry the ship push-bypass rule"
@@ -362,7 +362,7 @@ test_no_mistakes_dod_wording() {
   home="$TMP_ROOT/wording-home"
   mkdir -p "$home/data"
   id="brief-wording-b1"
-  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj >/dev/null 2>&1
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj --unregistered >/dev/null 2>&1
   brief="$home/data/$id/brief.md"
   assert_present "$brief" "brief was not scaffolded"
   assert_grep "no-mistakes itself provides for the mechanics" "$brief" \
@@ -390,7 +390,7 @@ test_no_mistakes_dod_requires_preflight() {
   home="$TMP_ROOT/preflight-home"
   mkdir -p "$home/data"
   id="brief-preflight-b2"
-  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj >/dev/null 2>&1
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj --unregistered >/dev/null 2>&1
   brief="$home/data/$id/brief.md"
   assert_present "$brief" "brief was not scaffolded"
   assert_grep "$ROOT/bin/fm-nm-preflight.sh" "$brief" \
@@ -456,7 +456,7 @@ test_ship_project_memory_wording() {
   home="$TMP_ROOT/project-memory-home"
   mkdir -p "$home/data"
   id="brief-memory-c1"
-  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj >/dev/null 2>&1
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj --unregistered >/dev/null 2>&1
   brief="$home/data/$id/brief.md"
   assert_present "$brief" "brief was not scaffolded"
   assert_grep "Record only project knowledge useful to almost every future session." "$brief" \
@@ -473,7 +473,7 @@ test_herdr_lab_contract_is_explicit_and_complete() {
   home="$TMP_ROOT/herdr-lab-home"
   mkdir -p "$home/data"
   id="brief-herdr-lab-d1"
-  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" firstmate --herdr-lab >/dev/null 2>&1
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" firstmate --unregistered --herdr-lab >/dev/null 2>&1
   brief="$home/data/$id/brief.md"
   assert_present "$brief" "Herdr lab brief was not scaffolded"
   assert_grep "# Herdr isolation - HARD SAFETY CONTRACT" "$brief" \
@@ -525,7 +525,7 @@ test_herdr_lab_omission_is_loud_for_ship_and_scout() {
     if [ "$kind" = scout ]; then
       FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" firstmate --scout >/dev/null 2>&1
     else
-      FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" firstmate >/dev/null 2>&1
+      FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" firstmate --unregistered >/dev/null 2>&1
     fi
     brief="$home/data/$id/brief.md"
     assert_grep "# Herdr lifecycle declaration - NOT ENABLED" "$brief" \
@@ -608,7 +608,7 @@ test_pause_verb_override_renders_all_brief_scaffolds() {
     case "$kind" in
       ship)
         FM_HOME="$home" FM_CLASSIFY_PAUSED_VERB=awaiting \
-          "$ROOT/bin/fm-brief.sh" "$id" firstmate >/dev/null 2>&1
+          "$ROOT/bin/fm-brief.sh" "$id" firstmate --unregistered >/dev/null 2>&1
         ;;
       scout)
         FM_HOME="$home" FM_CLASSIFY_PAUSED_VERB=awaiting \
@@ -719,7 +719,7 @@ test_briefs_route_heavy_runs_through_the_runner() {
   local home brief
   home="$TMP_ROOT/heavy-run-home"
   mkdir -p "$home/data"
-  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" brief-heavy-ship some-proj >/dev/null 2>&1 \
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" brief-heavy-ship some-proj --unregistered >/dev/null 2>&1 \
     || fail "fm-brief.sh ship scaffold exited non-zero"
   brief="$home/data/brief-heavy-ship/brief.md"
   assert_grep "bin/fm-heavy-run.sh --task brief-heavy-ship --" "$brief" \
@@ -750,7 +750,7 @@ test_briefs_carry_rtk_token_efficiency_section() {
   # rtk PRESENT: ship and scout both prefer rtk and keep it under fm-heavy-run.
   for kind in ship scout; do
     if [ "$kind" = ship ]; then
-      FM_HOME="$home" FM_BRIEF_RTK=1 "$ROOT/bin/fm-brief.sh" brief-rtk-on-ship some-proj >/dev/null 2>&1 \
+      FM_HOME="$home" FM_BRIEF_RTK=1 "$ROOT/bin/fm-brief.sh" brief-rtk-on-ship some-proj --unregistered >/dev/null 2>&1 \
         || fail "fm-brief.sh ship scaffold (rtk on) exited non-zero"
       brief="$home/data/brief-rtk-on-ship/brief.md"
     else
@@ -779,7 +779,7 @@ test_briefs_carry_rtk_token_efficiency_section() {
   # rtk ABSENT: ship and scout both say plain commands are fine and do NOT push rtk.
   for kind in ship scout; do
     if [ "$kind" = ship ]; then
-      FM_HOME="$home" FM_BRIEF_RTK=0 "$ROOT/bin/fm-brief.sh" brief-rtk-off-ship some-proj >/dev/null 2>&1 \
+      FM_HOME="$home" FM_BRIEF_RTK=0 "$ROOT/bin/fm-brief.sh" brief-rtk-off-ship some-proj --unregistered >/dev/null 2>&1 \
         || fail "fm-brief.sh ship scaffold (rtk off) exited non-zero"
       brief="$home/data/brief-rtk-off-ship/brief.md"
     else
@@ -815,7 +815,7 @@ test_briefs_bind_the_shared_machine_rules() {
   mkdir -p "$home/data"
   for kind in ship scout; do
     if [ "$kind" = ship ]; then
-      FM_HOME="$home" "$ROOT/bin/fm-brief.sh" brief-rules-ship some-proj >/dev/null 2>&1 \
+      FM_HOME="$home" "$ROOT/bin/fm-brief.sh" brief-rules-ship some-proj --unregistered >/dev/null 2>&1 \
         || fail "fm-brief.sh ship scaffold exited non-zero"
       brief="$home/data/brief-rules-ship/brief.md"
     else
@@ -878,7 +878,7 @@ test_briefs_route_status_through_the_capped_helper() {
   mkdir -p "$home/data"
   for kind in ship scout interactive; do
     case "$kind" in
-      ship) FM_HOME="$home" "$ROOT/bin/fm-brief.sh" cap-ship some-proj >/dev/null 2>&1 \
+      ship) FM_HOME="$home" "$ROOT/bin/fm-brief.sh" cap-ship some-proj --unregistered >/dev/null 2>&1 \
               || fail "fm-brief.sh ship scaffold exited non-zero"
             brief="$home/data/cap-ship/brief.md" ;;
       scout) FM_HOME="$home" "$ROOT/bin/fm-brief.sh" cap-scout some-proj --scout >/dev/null 2>&1 \
@@ -908,7 +908,7 @@ test_ship_and_scout_briefs_bind_the_standing_captain_rules() {
   local home brief kind
   home="$TMP_ROOT/captain-rules-home"
   mkdir -p "$home/data"
-  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" brief-captain-ship some-proj >/dev/null 2>&1 \
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" brief-captain-ship some-proj --unregistered >/dev/null 2>&1 \
     || fail "fm-brief.sh ship scaffold exited non-zero"
   FM_HOME="$home" "$ROOT/bin/fm-brief.sh" brief-captain-scout some-proj --scout >/dev/null 2>&1 \
     || fail "fm-brief.sh scout scaffold exited non-zero"
@@ -991,7 +991,7 @@ test_ship_and_scout_briefs_keep_each_captain_rule_constraint() {
   local home brief kind
   home="$TMP_ROOT/captain-rules-constraint-home"
   mkdir -p "$home/data"
-  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" brief-cc-ship some-proj >/dev/null 2>&1 \
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" brief-cc-ship some-proj --unregistered >/dev/null 2>&1 \
     || fail "fm-brief.sh ship scaffold exited non-zero"
   FM_HOME="$home" "$ROOT/bin/fm-brief.sh" brief-cc-scout some-proj --scout >/dev/null 2>&1 \
     || fail "fm-brief.sh scout scaffold exited non-zero"
@@ -1082,7 +1082,7 @@ test_captain_rules_preserve_existing_brief_contracts() {
   local home brief
   home="$TMP_ROOT/captain-rules-coexist-home"
   mkdir -p "$home/data"
-  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" brief-captain-coexist some-proj >/dev/null 2>&1 \
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" brief-captain-coexist some-proj --unregistered >/dev/null 2>&1 \
     || fail "fm-brief.sh ship scaffold exited non-zero"
   brief="$home/data/brief-captain-coexist/brief.md"
   assert_no_grep "^1\\. \\*\\*Never force anything" "$brief" \
@@ -1230,11 +1230,70 @@ test_secondmate_charter_mirrors_the_pr_target_rule_as_c7() {
   pass "fm-brief.sh: secondmate charter mirrors the PR-target rule as C7 and keeps the C3 gap"
 }
 
+# A ship brief's Definition of done IS the delivery contract the crewmate follows,
+# so an unresolvable project must refuse the scaffold rather than emit a
+# no-mistakes contract for a project registered otherwise. The observed failure was
+# a PATH passed where a registry NAME is required: `fm-brief.sh <id> projects/<name>`
+# warned only to stderr and then produced a full no-mistakes brief for a direct-PR
+# project, which a scripted or piped caller never sees.
+test_ship_scaffold_refuses_a_path_where_a_registry_name_is_required() {
+  local home id out rc
+  home="$TMP_ROOT/strict-mode-path-home"
+  write_registry "$home"
+  id="brief-strict-s1"
+  out=$(FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" projects/direct-proj 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "a path-shaped project argument must refuse the scaffold"
+  assert_contains "$out" "looks like a PATH" "the refusal must name the path-versus-name cause"
+  assert_contains "$out" '"direct-proj" IS registered' \
+    "the refusal must say the basename is itself a registry entry"
+  assert_absent "$home/data/$id/brief.md" \
+    "a refused scaffold must not leave a wrong-mode brief behind"
+  assert_absent "$home/data/$id" "a refused scaffold must not leave its task directory behind"
+
+  # The correct name still resolves its real mode, unchanged.
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" brief-strict-s1-ok direct-proj >/dev/null 2>&1 \
+    || fail "the registry name must still scaffold"
+  assert_grep "ships **direct-PR**" "$home/data/brief-strict-s1-ok/brief.md" \
+    "the registry name must still resolve direct-PR"
+  pass "fm-brief.sh: a path-versus-name mistake refuses instead of emitting a wrong-mode brief"
+}
+
+# A genuinely unregistered project stays possible, deliberately and explicitly,
+# so the strict default never blocks legitimate work.
+test_unregistered_opt_in_keeps_the_safe_default() {
+  local home id out rc
+  home="$TMP_ROOT/strict-mode-unregistered-home"
+  write_registry "$home"
+
+  id="brief-strict-s2"
+  out=$(FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" never-registered-proj 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "an unregistered project must refuse without the opt-in"
+  assert_contains "$out" "registered projects:" "the refusal must list the registered names"
+  assert_absent "$home/data/$id/brief.md" "a refused scaffold must write no brief"
+
+  id="brief-strict-s3"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" never-registered-proj --unregistered >/dev/null 2>&1 \
+    || fail "--unregistered must scaffold an unregistered project"
+  assert_present "$home/data/$id/brief.md" "--unregistered must write the brief"
+  assert_grep "Firstmate will then instruct you to run /no-mistakes" "$home/data/$id/brief.md" \
+    "--unregistered must take the safe no-mistakes default"
+
+  # The opt-in is a ship-brief affordance only: scout and interactive briefs are
+  # not shaped by the delivery mode at all.
+  out=$(FM_HOME="$home" "$ROOT/bin/fm-brief.sh" brief-strict-s4 never-registered-proj --scout --unregistered 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "--unregistered must be rejected on a scout brief"
+  assert_contains "$out" "--unregistered applies only to ship briefs" \
+    "the rejection must explain the ship-only scope"
+  pass "fm-brief.sh: --unregistered is the documented way through for an unregistered project"
+}
+
 test_script_parses
 test_help_includes_entire_header
 test_direct_pr_brief_pins_target_to_clone_origin
 test_direct_pr_scaffold_fails_loudly_without_resolvable_origin
 test_direct_pr_scaffold_fails_loudly_without_a_clone
+test_ship_scaffold_refuses_a_path_where_a_registry_name_is_required
+test_unregistered_opt_in_keeps_the_safe_default
 test_ship_and_scout_briefs_bind_the_pr_target_rule_as_c7
 test_secondmate_charter_mirrors_the_pr_target_rule_as_c7
 test_ship_and_scout_briefs_bind_the_standing_captain_rules
